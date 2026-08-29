@@ -1,4 +1,3 @@
-Imports System.Text
 Imports System.Text.Json.Nodes
 Imports Tokenizers.Internal
 
@@ -27,30 +26,33 @@ Namespace PreTokenizers
         End Sub
 
         Public Sub PreTokenize(pretokenized As PreTokenizedString) Implements IPreTokenizer.PreTokenize
-            pretokenized.SplitByFunction(
-                Function(i As Integer, normalized As NormalizedString) As IEnumerable(Of NormalizedString)
-                    If _addPrefixSpace AndAlso Not normalized.Get.StartsWith(" "c) Then
-                        normalized.Prepend(" ")
-                    End If
-                    If _useRegex Then
-                        Dim pattern As Pattern = ManualPatternFactory.TryCreate(Gpt2ByteLevelPattern.Canonical)
-                        If pattern Is Nothing Then pattern = New RegexPattern(Gpt2ByteLevelPattern.Canonical)
-                        Return normalized.Split(pattern, SplitDelimiterBehavior.Isolated)
-                    Else
-                        Return New List(Of NormalizedString) From {normalized}
-                    End If
-                End Function)
+            ' Skip the SplitByFunction pass entirely when it is an identity transform (no prefix
+            ' space, no regex): rebuilding the splits list would allocate a fresh Split object per
+            ' piece for no observable change.
+            If _addPrefixSpace OrElse _useRegex Then
+                pretokenized.SplitByFunction(
+                    Function(i As Integer, normalized As NormalizedString) As IEnumerable(Of NormalizedString)
+                        If _addPrefixSpace AndAlso Not normalized.Get.StartsWith(" "c) Then
+                            normalized.Prepend(" ")
+                        End If
+                        If _useRegex Then
+                            Dim pattern As Pattern = ManualPatternFactory.TryCreate(Gpt2ByteLevelPattern.Canonical)
+                            If pattern Is Nothing Then pattern = New RegexPattern(Gpt2ByteLevelPattern.Canonical)
+                            Return normalized.Split(pattern, SplitDelimiterBehavior.Isolated)
+                        Else
+                            Return New List(Of NormalizedString) From {normalized}
+                        End If
+                    End Function)
+            End If
 
             pretokenized.Normalize(
                 Sub(normalized As NormalizedString)
                     Dim s As String = normalized.Get
-                    Dim transformations As New List(Of (String, Integer))()
+                    ' Each source scalar produces exactly its UTF-8 byte count of (Char, Integer)
+                    ' items, so the list is pre-sized to the source's UTF-8 byte length.
+                    Dim transformations As New List(Of (Char, Integer))(Utf8Helpers.Utf8Length(s))
                     For Each sc In Utf8Helpers.EnumerateScalars(s)
-                        Dim bytes As Byte() = Global.System.Text.Encoding.UTF8.GetBytes(sc.Value)
-                        For j As Integer = 0 To bytes.Length - 1
-                            Dim ch As Char = BytesToUnicodeTable.GetBytesToChar()(bytes(j))
-                            transformations.Add((ch.ToString(), If(j > 0, 1, 0)))
-                        Next
+                        BytesToUnicodeTable.AppendByteTransform(transformations, sc.CodePoint)
                     Next
                     normalized.Transform(transformations, 0)
                 End Sub)

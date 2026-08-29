@@ -21,7 +21,7 @@ Namespace PreTokenizers
                     Dim ranges As New List(Of Integer)()
 
                     For Each sc In Utf8Helpers.EnumerateScalars(text)
-                        Dim cp As Integer = UnicodePredicates.ScalarCodePoint(text, sc.NetStart)
+                        Dim cp As Integer = sc.CodePoint
                         Dim script As Script = UnicodeScripts.FixedScript(cp)
                         If script <> Script.Any AndAlso
                            (Not lastScript.HasValue OrElse

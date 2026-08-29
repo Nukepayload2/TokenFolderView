@@ -1,4 +1,3 @@
-Imports System.Text
 Imports System.Text.Json.Nodes
 Imports Tokenizers.Internal
 
@@ -17,13 +16,11 @@ Namespace Normalizers
         Public Sub Normalize(normalized As Internal.NormalizedString) Implements INormalizer.Normalize
             If Not normalized.IsEmpty() Then
                 Dim s As String = normalized.Get
-                Dim transformations As New List(Of (String, Integer))()
+                ' Each source scalar produces exactly its UTF-8 byte count of (Char, Integer)
+                ' items, so the list is pre-sized to the source's UTF-8 byte length.
+                Dim transformations As New List(Of (Char, Integer))(Utf8Helpers.Utf8Length(s))
                 For Each sc In Utf8Helpers.EnumerateScalars(s)
-                    Dim bytes As Byte() = Global.System.Text.Encoding.UTF8.GetBytes(sc.Value)
-                    For i As Integer = 0 To bytes.Length - 1
-                        Dim ch As Char = BytesToUnicodeTable.GetBytesToChar()(bytes(i))
-                        transformations.Add((ch.ToString(), If(i > 0, 1, 0)))
-                    Next
+                    BytesToUnicodeTable.AppendByteTransform(transformations, sc.CodePoint)
                 Next
                 normalized.Transform(transformations, 0)
             End If

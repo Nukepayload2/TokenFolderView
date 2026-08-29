@@ -122,7 +122,7 @@ Namespace Internal
             Dim pending As New List(Of NormChar)()
 
             For Each sc In Utf8Helpers.EnumerateScalars(text)
-                Dim raw As List(Of String) = GetRawDecomposition(sc.Value, compat)
+                Dim raw As List(Of String) = GetRawDecomposition(Utf8Helpers.ScalarToString(sc.CodePoint), compat)
                 For i As Integer = 0 To raw.Count - 1
                     Dim d As String = raw(i)
                     Dim change As Integer = If(i = 0, 0, 1)
@@ -157,7 +157,11 @@ Namespace Internal
             If middle = scalar Then
                 Return New List(Of String) From {scalar}
             End If
-            Return Utf8Helpers.EnumerateScalars(middle).Select(Function(m) m.Value).ToList()
+            Dim result As New List(Of String)()
+            For Each m In Utf8Helpers.EnumerateScalars(middle)
+                result.Add(Utf8Helpers.ScalarToString(m.CodePoint))
+            Next
+            Return result
         End Function
 
         ' ------------------------------------------------------------------

@@ -70,13 +70,13 @@ Namespace Normalizers
             Dim newChars As New List(Of (String, Integer))()
             Dim s As String = normalized.Get
             For Each sc In Utf8Helpers.EnumerateScalars(s)
-                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(s, sc.NetStart)
+                Dim cp As Integer = sc.CodePoint
                 If IsChineseChar(cp) Then
                     newChars.Add((" ", 0))
-                    newChars.Add((sc.Value, 1))
+                    newChars.Add((Utf8Helpers.ScalarToString(sc.CodePoint), 1))
                     newChars.Add((" ", 1))
                 Else
-                    newChars.Add((sc.Value, 0))
+                    newChars.Add((Utf8Helpers.ScalarToString(sc.CodePoint), 0))
                 End If
             Next
             normalized.Transform(newChars, 0)

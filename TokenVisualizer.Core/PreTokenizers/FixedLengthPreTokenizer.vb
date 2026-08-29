@@ -29,12 +29,17 @@ Namespace PreTokenizers
                     If text.Length = 0 OrElse _length <= 0 Then
                         Return result
                     End If
-                    Dim scalars As List(Of ScalarInfo) = Utf8Helpers.EnumerateScalars(text).ToList()
-                    For chunkStart As Integer = 0 To scalars.Count - 1 Step _length
-                        Dim chunkEnd As Integer = Math.Min(chunkStart + _length, scalars.Count)
-                        Dim start As Integer = scalars(chunkStart).Utf8Start
-                        Dim lastIdx As Integer = chunkEnd - 1
-                        Dim [end] As Integer = scalars(lastIdx).Utf8Start + scalars(lastIdx).Utf8Len
+                    ' Collect the UTF-8 byte offset of each scalar start plus the final end
+                    ' (a plain Int32 list; no ScalarInfo/string materialization).
+                    Dim boundaryBytes As New List(Of Integer)()
+                    For Each sc In Utf8Helpers.EnumerateScalars(text)
+                        boundaryBytes.Add(sc.Utf8Start)
+                    Next
+                    boundaryBytes.Add(Utf8Helpers.Utf8Length(text))
+                    For chunkStart As Integer = 0 To boundaryBytes.Count - 2 Step _length
+                        Dim chunkEnd As Integer = Math.Min(chunkStart + _length, boundaryBytes.Count - 1)
+                        Dim start As Integer = boundaryBytes(chunkStart)
+                        Dim [end] As Integer = boundaryBytes(chunkEnd)
                         result.Add(normalized.Slice(New OffsetRange(False, start, [end])))
                     Next
                     Return result

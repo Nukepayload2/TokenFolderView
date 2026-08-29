@@ -15,12 +15,16 @@ Namespace Internal
     ''' supplementary number IS <c>\p{N}</c>. Predicates delegate to
     ''' <see cref="UnicodePredicates"/> which is surrogate-pair aware via
     ''' <c>CharUnicodeInfo.GetUnicodeCategory(text, netIndex)</c>.
+    '''
+    ''' Scanners iterate the input by .NET index and maintain the running UTF-8 byte offset
+    ''' incrementally (<see cref="AdvanceOne"/>); no <c>List(Of ScalarInfo)</c> is materialized,
+    ''' so a scan is allocation-free apart from the match list itself.
     ''' </summary>
     Public MustInherit Class ManualPatternBase
         Inherits Pattern
 
-        ''' <summary>Emits all match spans for <paramref name="inside"/> into <paramref name="matches"/>.</summary>
-        Protected MustOverride Sub Scan(inside As String, scalars As List(Of ScalarInfo), matches As List(Of (Integer, Integer)))
+        ''' <summary>Emits all match spans for <paramref name="inside"/> into <paramref name="result"/>.</summary>
+        Protected MustOverride Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
 
         Public Overrides Function FindMatches(inside As String) As List(Of MatchInfo)
             If inside Is Nothing Then inside = String.Empty
@@ -28,19 +32,11 @@ Namespace Internal
                 Return New List(Of MatchInfo) From {New MatchInfo(0, 0, False)}
             End If
 
-            Dim scalars As List(Of ScalarInfo) = Utf8Helpers.EnumerateScalars(inside).ToList()
-            Dim matches As New List(Of (Integer, Integer))()
-            Me.Scan(inside, scalars, matches)
-
+            ' The scanner emits MatchInfo entries directly (with implicit gap filling via
+            ' <see cref="EmitMatch"/>), so no intermediate (start,end) span list is materialized.
             Dim result As New List(Of MatchInfo)()
             Dim prev As Integer = 0
-            For Each m In matches
-                If prev < m.Item1 Then
-                    result.Add(New MatchInfo(prev, m.Item1, False))
-                End If
-                result.Add(New MatchInfo(m.Item1, m.Item2, True))
-                prev = m.Item2
-            Next
+            Me.Scan(inside, result, prev)
             Dim total As Integer = Utf8Helpers.Utf8Length(inside)
             If prev < total Then
                 result.Add(New MatchInfo(prev, total, False))
@@ -48,15 +44,33 @@ Namespace Internal
             Return result
         End Function
 
+        ''' <summary>
+        ''' Appends a match span, first filling any gap between <paramref name="prev"/> (the end of
+        ''' the previous emitted span) and <paramref name="startByte"/> with a non-match segment.
+        ''' Mirrors the base <c>find_matches</c> gap-filling contract.
+        ''' </summary>
+        Protected Shared Sub EmitMatch(result As List(Of MatchInfo), ByRef prev As Integer, startByte As Integer, endByte As Integer)
+            If prev < startByte Then
+                result.Add(New MatchInfo(prev, startByte, False))
+            End If
+            result.Add(New MatchInfo(startByte, endByte, True))
+            prev = endByte
+        End Sub
+
         ' ------------------------------------------------------------------
         ' Shared helpers
         ' ------------------------------------------------------------------
 
-        ''' <summary>UTF-8 byte offset just past the scalar at <paramref name="lastIndex"/>.</summary>
-        Protected Shared Function ByteEnd(scalars As List(Of ScalarInfo), lastIndex As Integer) As Integer
-            Dim sc As ScalarInfo = scalars(lastIndex)
-            Return sc.Utf8Start + sc.Utf8Len
-        End Function
+        ''' <summary>
+        ''' Advances <paramref name="net"/> (UTF-16 index) and <paramref name="byteOff"/> (UTF-8
+        ''' byte offset) past the scalar currently starting at <paramref name="net"/>. Caller
+        ''' guarantees <c>net &lt; text.Length</c>.
+        ''' </summary>
+        Protected Shared Sub AdvanceOne(text As String, ByRef net As Integer, ByRef byteOff As Integer)
+            Dim cp As Integer = UnicodePredicates.ScalarCodePoint(text, net)
+            byteOff += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+            net += Utf8Helpers.NetLengthOfCodePoint(cp)
+        End Sub
 
         ''' <summary>Whether the text at <paramref name="startNet"/> equals the literal <paramref name="lit"/>.</summary>
         Protected Shared Function MatchLiteral(inside As String, startNet As Integer, lit As String) As Boolean
@@ -73,43 +87,43 @@ Namespace Internal
         ' UTF-16 code-unit concept here.
         ' ------------------------------------------------------------------
 
-        Protected Shared Function IsLetter(text As String, sc As ScalarInfo) As Boolean
-            Return UnicodePredicates.IsLetter(text, sc.NetStart)
+        Protected Shared Function IsLetter(text As String, net As Integer) As Boolean
+            Return UnicodePredicates.IsLetter(text, net)
         End Function
 
-        Protected Shared Function IsNumber(text As String, sc As ScalarInfo) As Boolean
-            Return UnicodePredicates.IsNumber(text, sc.NetStart)
+        Protected Shared Function IsNumber(text As String, net As Integer) As Boolean
+            Return UnicodePredicates.IsNumber(text, net)
         End Function
 
-        Protected Shared Function IsPunctuation(text As String, sc As ScalarInfo) As Boolean
-            Return UnicodePredicates.IsPunctuation(text, sc.NetStart)
+        Protected Shared Function IsPunctuation(text As String, net As Integer) As Boolean
+            Return UnicodePredicates.IsPunctuation(text, net)
         End Function
 
-        Protected Shared Function IsSymbol(text As String, sc As ScalarInfo) As Boolean
-            Return UnicodePredicates.IsSymbol(text, sc.NetStart)
+        Protected Shared Function IsSymbol(text As String, net As Integer) As Boolean
+            Return UnicodePredicates.IsSymbol(text, net)
         End Function
 
-        Protected Shared Function IsMark(text As String, sc As ScalarInfo) As Boolean
-            Return UnicodePredicates.IsMark(text, sc.NetStart)
+        Protected Shared Function IsMark(text As String, net As Integer) As Boolean
+            Return UnicodePredicates.IsMark(text, net)
         End Function
 
         ''' <summary><c>\s</c>: scalar-aware; on net10 <c>Char.IsWhiteSpace</c> matches the Rust set (excludes U+FEFF).</summary>
-        Protected Shared Function IsWhiteSpace(text As String, sc As ScalarInfo) As Boolean
-            Return UnicodePredicates.IsWhiteSpace(text, sc.NetStart)
+        Protected Shared Function IsWhiteSpace(text As String, net As Integer) As Boolean
+            Return UnicodePredicates.IsWhiteSpace(text, net)
         End Function
 
         ''' <summary>Rust <c>\w</c> = [\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\p{Join_Control}].</summary>
-        Protected Shared Function IsWord(text As String, sc As ScalarInfo) As Boolean
-            Return UnicodePredicates.IsWord(text, sc.NetStart)
+        Protected Shared Function IsWord(text As String, net As Integer) As Boolean
+            Return UnicodePredicates.IsWord(text, net)
         End Function
 
         ''' <summary><c>[A-Za-z]</c>: ASCII letters only (a supplementary scalar is never ASCII).</summary>
-        Protected Shared Function IsAsciiLetter(text As String, sc As ScalarInfo) As Boolean
-            Return UnicodePredicates.IsAsciiLetter(text(sc.NetStart))
+        Protected Shared Function IsAsciiLetter(text As String, net As Integer) As Boolean
+            Return UnicodePredicates.IsAsciiLetter(text(net))
         End Function
 
-        Protected Shared Function IsCrLf(text As String, sc As ScalarInfo) As Boolean
-            Dim c As Char = text(sc.NetStart)
+        Protected Shared Function IsCrLf(text As String, net As Integer) As Boolean
+            Dim c As Char = text(net)
             Return c = ControlChars.Cr OrElse c = ControlChars.Lf
         End Function
 
@@ -127,20 +141,21 @@ Namespace Internal
 
         Private Shared ReadOnly Contractions As String() = {"s", "t", "re", "ve", "m", "ll", "d"}
 
-        Protected Overrides Sub Scan(inside As String, scalars As List(Of ScalarInfo), matches As List(Of (Integer, Integer)))
-            Dim n As Integer = scalars.Count
-            Dim i As Integer = 0
-            While i < n
-                Dim sc As ScalarInfo = scalars(i)
-                Dim startByte As Integer = sc.Utf8Start
+        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
+            Dim n As Integer = inside.Length
+            Dim net As Integer = 0
+            Dim byteOff As Integer = 0
+            While net < n
+                Dim startByte As Integer = byteOff
 
                 ' Alt 1: contractions, in order.
-                If inside(sc.NetStart) = "'"c Then
+                If inside(net) = "'"c Then
                     Dim matchedContraction As Boolean = False
                     For Each lit In Contractions
-                        If i + 1 + lit.Length <= n AndAlso MatchLiteral(inside, sc.NetStart + 1, lit) Then
-                            matches.Add((startByte, startByte + 1 + lit.Length))
-                            i += 1 + lit.Length
+                        If net + 1 + lit.Length <= n AndAlso MatchLiteral(inside, net + 1, lit) Then
+                            EmitMatch(result, prev, startByte, startByte + 1 + lit.Length)
+                            net += 1 + lit.Length
+                            byteOff += 1 + lit.Length
                             matchedContraction = True
                             Exit For
                         End If
@@ -149,85 +164,144 @@ Namespace Internal
                 End If
 
                 ' Alt 2: ?\p{L}+
-                If inside(sc.NetStart) = " "c Then
-                    If i + 1 < n AndAlso IsLetter(inside, scalars(i + 1)) Then
-                        Dim j As Integer = i + 1
-                        While j < n AndAlso IsLetter(inside, scalars(j)) : j += 1 : End While
-                        matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                        i = j
+                If inside(net) = " "c Then
+                    Dim nextNet As Integer = net
+                    Dim nextByte As Integer = byteOff
+                    AdvanceOne(inside, nextNet, nextByte)
+                    If nextNet < n AndAlso IsLetter(inside, nextNet) Then
+                        Dim jNet As Integer = nextNet
+                        Dim jByte As Integer = nextByte
+                        Dim endByte As Integer = nextByte
+                        While jNet < n AndAlso IsLetter(inside, jNet)
+                            AdvanceOne(inside, jNet, jByte)
+                            endByte = jByte
+                        End While
+                        EmitMatch(result, prev, startByte, endByte)
+                        net = jNet
+                        byteOff = jByte
                         Continue While
                     End If
-                ElseIf IsLetter(inside, sc) Then
-                    Dim j As Integer = i
-                    While j < n AndAlso IsLetter(inside, scalars(j)) : j += 1 : End While
-                    matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                    i = j
+                ElseIf IsLetter(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
+                    While jNet < n AndAlso IsLetter(inside, jNet)
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
+                    End While
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = jNet
+                    byteOff = jByte
                     Continue While
                 End If
 
                 ' Alt 3: ?\p{N}+
-                If inside(sc.NetStart) = " "c Then
-                    If i + 1 < n AndAlso IsNumber(inside, scalars(i + 1)) Then
-                        Dim j As Integer = i + 1
-                        While j < n AndAlso IsNumber(inside, scalars(j)) : j += 1 : End While
-                        matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                        i = j
+                If inside(net) = " "c Then
+                    Dim nextNet As Integer = net
+                    Dim nextByte As Integer = byteOff
+                    AdvanceOne(inside, nextNet, nextByte)
+                    If nextNet < n AndAlso IsNumber(inside, nextNet) Then
+                        Dim jNet As Integer = nextNet
+                        Dim jByte As Integer = nextByte
+                        Dim endByte As Integer = nextByte
+                        While jNet < n AndAlso IsNumber(inside, jNet)
+                            AdvanceOne(inside, jNet, jByte)
+                            endByte = jByte
+                        End While
+                        EmitMatch(result, prev, startByte, endByte)
+                        net = jNet
+                        byteOff = jByte
                         Continue While
                     End If
-                ElseIf IsNumber(inside, sc) Then
-                    Dim j As Integer = i
-                    While j < n AndAlso IsNumber(inside, scalars(j)) : j += 1 : End While
-                    matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                    i = j
+                ElseIf IsNumber(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
+                    While jNet < n AndAlso IsNumber(inside, jNet)
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
+                    End While
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = jNet
+                    byteOff = jByte
                     Continue While
                 End If
 
                 ' Alt 4: ?[^\s\p{L}\p{N}]+
-                If inside(sc.NetStart) = " "c Then
-                    If i + 1 < n AndAlso IsNotWsLetterNumber(inside, scalars(i + 1)) Then
-                        Dim j As Integer = i + 1
-                        While j < n AndAlso IsNotWsLetterNumber(inside, scalars(j)) : j += 1 : End While
-                        matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                        i = j
+                If inside(net) = " "c Then
+                    Dim nextNet As Integer = net
+                    Dim nextByte As Integer = byteOff
+                    AdvanceOne(inside, nextNet, nextByte)
+                    If nextNet < n AndAlso IsNotWsLetterNumber(inside, nextNet) Then
+                        Dim jNet As Integer = nextNet
+                        Dim jByte As Integer = nextByte
+                        Dim endByte As Integer = nextByte
+                        While jNet < n AndAlso IsNotWsLetterNumber(inside, jNet)
+                            AdvanceOne(inside, jNet, jByte)
+                            endByte = jByte
+                        End While
+                        EmitMatch(result, prev, startByte, endByte)
+                        net = jNet
+                        byteOff = jByte
                         Continue While
                     End If
-                ElseIf IsNotWsLetterNumber(inside, sc) Then
-                    Dim j As Integer = i
-                    While j < n AndAlso IsNotWsLetterNumber(inside, scalars(j)) : j += 1 : End While
-                    matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                    i = j
+                ElseIf IsNotWsLetterNumber(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
+                    While jNet < n AndAlso IsNotWsLetterNumber(inside, jNet)
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
+                    End While
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = jNet
+                    byteOff = jByte
                     Continue While
                 End If
 
                 ' Alt 5 then Alt 6: \s+(?!\S)  then  \s+
-                If IsWhiteSpace(inside, sc) Then
-                    Dim q As Integer = i
-                    While q < n AndAlso IsWhiteSpace(inside, scalars(q)) : q += 1 : End While
-                    If q = n Then
+                If IsWhiteSpace(inside, net) Then
+                    Dim qNet As Integer = net
+                    Dim qByte As Integer = byteOff
+                    Dim lastNet As Integer = net
+                    Dim lastByte As Integer = byteOff
+                    Dim runCount As Integer = 0
+                    While qNet < n AndAlso IsWhiteSpace(inside, qNet)
+                        If runCount >= 1 Then
+                            lastNet = qNet
+                            lastByte = qByte
+                        End If
+                        AdvanceOne(inside, qNet, qByte)
+                        runCount += 1
+                    End While
+                    If qNet = n Then
                         ' \s+(?!\S) matches the run to end of string.
-                        matches.Add((startByte, ByteEnd(scalars, q - 1)))
-                        i = q
+                        EmitMatch(result, prev, startByte, qByte)
+                        net = qNet
+                        byteOff = qByte
                         Continue While
-                    ElseIf q - i >= 2 Then
+                    ElseIf runCount >= 2 Then
                         ' \s+(?!\S) backtracks: drop the last whitespace scalar.
-                        matches.Add((startByte, ByteEnd(scalars, q - 2)))
-                        i = q - 1
+                        EmitMatch(result, prev, startByte, lastByte)
+                        net = lastNet
+                        byteOff = lastByte
                         Continue While
                     Else
                         ' \s+(?!\S) fails (single space before non-space); \s+ matches it.
-                        matches.Add((startByte, ByteEnd(scalars, i)))
-                        i = q
+                        EmitMatch(result, prev, startByte, qByte)
+                        net = qNet
+                        byteOff = qByte
                         Continue While
                     End If
                 End If
 
                 ' No alternative matched: one-scalar gap.
-                i += 1
+                AdvanceOne(inside, net, byteOff)
             End While
         End Sub
 
-        Private Shared Function IsNotWsLetterNumber(text As String, sc As ScalarInfo) As Boolean
-            Return Not (IsWhiteSpace(text, sc) OrElse IsLetter(text, sc) OrElse IsNumber(text, sc))
+        Private Shared Function IsNotWsLetterNumber(text As String, net As Integer) As Boolean
+            Return Not (IsWhiteSpace(text, net) OrElse IsLetter(text, net) OrElse IsNumber(text, net))
         End Function
     End Class
 
@@ -240,22 +314,27 @@ Namespace Internal
 
         Public Const Canonical As String = "\p{N}{1,3}"
 
-        Protected Overrides Sub Scan(inside As String, scalars As List(Of ScalarInfo), matches As List(Of (Integer, Integer)))
-            Dim n As Integer = scalars.Count
-            Dim i As Integer = 0
-            While i < n
-                Dim sc As ScalarInfo = scalars(i)
-                If IsNumber(inside, sc) Then
-                    Dim j As Integer = i
+        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
+            Dim n As Integer = inside.Length
+            Dim net As Integer = 0
+            Dim byteOff As Integer = 0
+            While net < n
+                Dim startByte As Integer = byteOff
+                If IsNumber(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
                     Dim count As Integer = 0
-                    While j < n AndAlso count < 3 AndAlso IsNumber(inside, scalars(j))
-                        j += 1
+                    While jNet < n AndAlso count < 3 AndAlso IsNumber(inside, jNet)
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
                         count += 1
                     End While
-                    matches.Add((sc.Utf8Start, ByteEnd(scalars, j - 1)))
-                    i = j
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = jNet
+                    byteOff = jByte
                 Else
-                    i += 1
+                    AdvanceOne(inside, net, byteOff)
                 End If
             End While
         End Sub
@@ -271,24 +350,31 @@ Namespace Internal
 
         Public Const Canonical As String = "[一-龥぀-ゟ゠-ヿ]+"
 
-        Protected Overrides Sub Scan(inside As String, scalars As List(Of ScalarInfo), matches As List(Of (Integer, Integer)))
-            Dim n As Integer = scalars.Count
-            Dim i As Integer = 0
-            While i < n
-                Dim sc As ScalarInfo = scalars(i)
-                If IsCjkScalar(inside, sc) Then
-                    Dim j As Integer = i
-                    While j < n AndAlso IsCjkScalar(inside, scalars(j)) : j += 1 : End While
-                    matches.Add((sc.Utf8Start, ByteEnd(scalars, j - 1)))
-                    i = j
+        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
+            Dim n As Integer = inside.Length
+            Dim net As Integer = 0
+            Dim byteOff As Integer = 0
+            While net < n
+                Dim startByte As Integer = byteOff
+                If IsCjkScalar(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
+                    While jNet < n AndAlso IsCjkScalar(inside, jNet)
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
+                    End While
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = jNet
+                    byteOff = jByte
                 Else
-                    i += 1
+                    AdvanceOne(inside, net, byteOff)
                 End If
             End While
         End Sub
 
-        Private Shared Function IsCjkScalar(text As String, sc As ScalarInfo) As Boolean
-            Dim cp As Integer = UnicodePredicates.ScalarCodePoint(text, sc.NetStart)
+        Private Shared Function IsCjkScalar(text As String, net As Integer) As Boolean
+            Dim cp As Integer = UnicodePredicates.ScalarCodePoint(text, net)
             Return (cp >= &H4E00 AndAlso cp <= &H9FA5) OrElse
                    (cp >= &H3040 AndAlso cp <= &H309F) OrElse
                    (cp >= &H30A0 AndAlso cp <= &H30FF)
@@ -312,102 +398,167 @@ Namespace Internal
             "| ?[\p{P}\p{S}]+[" & ControlChars.Cr & ControlChars.Lf & "]*" &
             "|\s*[" & ControlChars.Cr & ControlChars.Lf & "]+|\s+(?!\S)|\s+"
 
-        Protected Overrides Sub Scan(inside As String, scalars As List(Of ScalarInfo), matches As List(Of (Integer, Integer)))
-            Dim n As Integer = scalars.Count
-            Dim i As Integer = 0
-            While i < n
-                Dim sc As ScalarInfo = scalars(i)
-                Dim startByte As Integer = sc.Utf8Start
+        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
+            Dim n As Integer = inside.Length
+            Dim net As Integer = 0
+            Dim byteOff As Integer = 0
+            While net < n
+                Dim startByte As Integer = byteOff
 
                 ' Alt 1: [punct][A-Za-z]+  (ASCII punctuation set, then 1+ ASCII letters)
-                If IsDg2Punct(UnicodePredicates.ScalarCodePoint(inside, sc.NetStart)) Then
-                    If i + 1 < n AndAlso IsAsciiLetter(inside, scalars(i + 1)) Then
-                        Dim j As Integer = i + 1
-                        While j < n AndAlso IsAsciiLetter(inside, scalars(j)) : j += 1 : End While
-                        matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                        i = j
+                If IsDg2Punct(UnicodePredicates.ScalarCodePoint(inside, net)) Then
+                    Dim nextNet As Integer = net
+                    Dim nextByte As Integer = byteOff
+                    AdvanceOne(inside, nextNet, nextByte)
+                    If nextNet < n AndAlso IsAsciiLetter(inside, nextNet) Then
+                        Dim jNet As Integer = nextNet
+                        Dim jByte As Integer = nextByte
+                        Dim endByte As Integer = nextByte
+                        While jNet < n AndAlso IsAsciiLetter(inside, jNet)
+                            AdvanceOne(inside, jNet, jByte)
+                            endByte = jByte
+                        End While
+                        EmitMatch(result, prev, startByte, endByte)
+                        net = jNet
+                        byteOff = jByte
                         Continue While
                     End If
                 End If
 
                 ' Alt 2: [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
-                If IsLetter(inside, sc) OrElse IsMark(inside, sc) Then
-                    Dim j As Integer = i
-                    While j < n AndAlso (IsLetter(inside, scalars(j)) OrElse IsMark(inside, scalars(j))) : j += 1 : End While
-                    matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                    i = j
+                If IsLetter(inside, net) OrElse IsMark(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
+                    While jNet < n AndAlso (IsLetter(inside, jNet) OrElse IsMark(inside, jNet))
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
+                    End While
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = jNet
+                    byteOff = jByte
                     Continue While
-                ElseIf IsValidOptional(inside, sc) AndAlso i + 1 < n AndAlso (IsLetter(inside, scalars(i + 1)) OrElse IsMark(inside, scalars(i + 1))) Then
-                    Dim j As Integer = i + 1
-                    While j < n AndAlso (IsLetter(inside, scalars(j)) OrElse IsMark(inside, scalars(j))) : j += 1 : End While
-                    matches.Add((startByte, ByteEnd(scalars, j - 1)))
-                    i = j
-                    Continue While
+                ElseIf IsValidOptional(inside, net) Then
+                    Dim nextNet As Integer = net
+                    Dim nextByte As Integer = byteOff
+                    AdvanceOne(inside, nextNet, nextByte)
+                    If nextNet < n AndAlso (IsLetter(inside, nextNet) OrElse IsMark(inside, nextNet)) Then
+                        Dim jNet As Integer = nextNet
+                        Dim jByte As Integer = nextByte
+                        Dim endByte As Integer = nextByte
+                        While jNet < n AndAlso (IsLetter(inside, jNet) OrElse IsMark(inside, jNet))
+                            AdvanceOne(inside, jNet, jByte)
+                            endByte = jByte
+                        End While
+                        EmitMatch(result, prev, startByte, endByte)
+                        net = jNet
+                        byteOff = jByte
+                        Continue While
+                    End If
                 End If
 
                 ' Alt 3: ?[\p{P}\p{S}]+[\r\n]*
-                If inside(sc.NetStart) = " "c Then
-                    If i + 1 < n AndAlso (IsPunctuation(inside, scalars(i + 1)) OrElse IsSymbol(inside, scalars(i + 1))) Then
-                        Dim j As Integer = i + 1
-                        While j < n AndAlso (IsPunctuation(inside, scalars(j)) OrElse IsSymbol(inside, scalars(j))) : j += 1 : End While
-                        Dim k As Integer = j
-                        While k < n AndAlso IsCrLf(inside, scalars(k)) : k += 1 : End While
-                        matches.Add((startByte, ByteEnd(scalars, k - 1)))
-                        i = k
+                If inside(net) = " "c Then
+                    Dim nextNet As Integer = net
+                    Dim nextByte As Integer = byteOff
+                    AdvanceOne(inside, nextNet, nextByte)
+                    If nextNet < n AndAlso (IsPunctuation(inside, nextNet) OrElse IsSymbol(inside, nextNet)) Then
+                        Dim jNet As Integer = nextNet
+                        Dim jByte As Integer = nextByte
+                        Dim endByte As Integer = nextByte
+                        While jNet < n AndAlso (IsPunctuation(inside, jNet) OrElse IsSymbol(inside, jNet))
+                            AdvanceOne(inside, jNet, jByte)
+                            endByte = jByte
+                        End While
+                        Dim kNet As Integer = jNet
+                        Dim kByte As Integer = jByte
+                        While kNet < n AndAlso IsCrLf(inside, kNet)
+                            AdvanceOne(inside, kNet, kByte)
+                            endByte = kByte
+                        End While
+                        EmitMatch(result, prev, startByte, endByte)
+                        net = kNet
+                        byteOff = kByte
                         Continue While
                     End If
-                ElseIf IsPunctuation(inside, sc) OrElse IsSymbol(inside, sc) Then
-                    Dim j As Integer = i
-                    While j < n AndAlso (IsPunctuation(inside, scalars(j)) OrElse IsSymbol(inside, scalars(j))) : j += 1 : End While
-                    Dim k As Integer = j
-                    While k < n AndAlso IsCrLf(inside, scalars(k)) : k += 1 : End While
-                    matches.Add((startByte, ByteEnd(scalars, k - 1)))
-                    i = k
+                ElseIf IsPunctuation(inside, net) OrElse IsSymbol(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
+                    While jNet < n AndAlso (IsPunctuation(inside, jNet) OrElse IsSymbol(inside, jNet))
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
+                    End While
+                    Dim kNet As Integer = jNet
+                    Dim kByte As Integer = jByte
+                    While kNet < n AndAlso IsCrLf(inside, kNet)
+                        AdvanceOne(inside, kNet, kByte)
+                        endByte = kByte
+                    End While
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = kNet
+                    byteOff = kByte
                     Continue While
                 End If
 
                 ' Alt 4: \s*[\r\n]+  (greedy \s* backtracking: the match ends at the newline run
                 ' starting at the last newline scalar inside the whitespace run).
-                If IsWhiteSpace(inside, sc) Then
-                    Dim q As Integer = i
-                    While q < n AndAlso IsWhiteSpace(inside, scalars(q)) : q += 1 : End While
-                    Dim p As Integer = -1
-                    For idx As Integer = q - 1 To i Step -1
-                        If IsCrLf(inside, scalars(idx)) Then
-                            p = idx
-                            Exit For
+                If IsWhiteSpace(inside, net) Then
+                    Dim qNet As Integer = net
+                    Dim qByte As Integer = byteOff
+                    Dim lastCrLfEndNet As Integer = -1
+                    Dim lastCrLfEndByte As Integer = 0
+                    While qNet < n AndAlso IsWhiteSpace(inside, qNet)
+                        If IsCrLf(inside, qNet) Then
+                            Dim cp As Integer = UnicodePredicates.ScalarCodePoint(inside, qNet)
+                            lastCrLfEndNet = qNet + Utf8Helpers.NetLengthOfCodePoint(cp)
+                            lastCrLfEndByte = qByte + Utf8Helpers.Utf8LengthOfCodePoint(cp)
                         End If
-                    Next
-                    If p >= 0 Then
-                        Dim k As Integer = p
-                        While k < n AndAlso IsCrLf(inside, scalars(k)) : k += 1 : End While
-                        matches.Add((startByte, ByteEnd(scalars, k - 1)))
-                        i = k
+                        AdvanceOne(inside, qNet, qByte)
+                    End While
+                    If lastCrLfEndNet >= 0 Then
+                        EmitMatch(result, prev, startByte, lastCrLfEndByte)
+                        net = lastCrLfEndNet
+                        byteOff = lastCrLfEndByte
                         Continue While
                     End If
                 End If
 
                 ' Alt 5 then Alt 6: \s+(?!\S)  then  \s+
-                If IsWhiteSpace(inside, sc) Then
-                    Dim q As Integer = i
-                    While q < n AndAlso IsWhiteSpace(inside, scalars(q)) : q += 1 : End While
-                    If q = n Then
-                        matches.Add((startByte, ByteEnd(scalars, q - 1)))
-                        i = q
+                If IsWhiteSpace(inside, net) Then
+                    Dim qNet As Integer = net
+                    Dim qByte As Integer = byteOff
+                    Dim lastNet As Integer = net
+                    Dim lastByte As Integer = byteOff
+                    Dim runCount As Integer = 0
+                    While qNet < n AndAlso IsWhiteSpace(inside, qNet)
+                        If runCount >= 1 Then
+                            lastNet = qNet
+                            lastByte = qByte
+                        End If
+                        AdvanceOne(inside, qNet, qByte)
+                        runCount += 1
+                    End While
+                    If qNet = n Then
+                        EmitMatch(result, prev, startByte, qByte)
+                        net = qNet
+                        byteOff = qByte
                         Continue While
-                    ElseIf q - i >= 2 Then
-                        matches.Add((startByte, ByteEnd(scalars, q - 2)))
-                        i = q - 1
+                    ElseIf runCount >= 2 Then
+                        EmitMatch(result, prev, startByte, lastByte)
+                        net = lastNet
+                        byteOff = lastByte
                         Continue While
                     Else
-                        matches.Add((startByte, ByteEnd(scalars, i)))
-                        i = q
+                        EmitMatch(result, prev, startByte, qByte)
+                        net = qNet
+                        byteOff = qByte
                         Continue While
                     End If
                 End If
 
                 ' No alternative matched: one-scalar gap.
-                i += 1
+                AdvanceOne(inside, net, byteOff)
             End While
         End Sub
 
@@ -420,11 +571,11 @@ Namespace Internal
         End Function
 
         ''' <summary>Whether the scalar is a valid <c>[^\r\n\p{L}\p{P}\p{S}]</c> optional char.</summary>
-        Private Shared Function IsValidOptional(text As String, sc As ScalarInfo) As Boolean
-            If IsCrLf(text, sc) Then Return False
-            If IsLetter(text, sc) Then Return False
-            If IsPunctuation(text, sc) Then Return False
-            If IsSymbol(text, sc) Then Return False
+        Private Shared Function IsValidOptional(text As String, net As Integer) As Boolean
+            If IsCrLf(text, net) Then Return False
+            If IsLetter(text, net) Then Return False
+            If IsPunctuation(text, net) Then Return False
+            If IsSymbol(text, net) Then Return False
             Return True
         End Function
     End Class
@@ -437,23 +588,36 @@ Namespace Internal
 
         Public Const Canonical As String = "\w+|[^\w\s]+"
 
-        Protected Overrides Sub Scan(inside As String, scalars As List(Of ScalarInfo), matches As List(Of (Integer, Integer)))
-            Dim n As Integer = scalars.Count
-            Dim i As Integer = 0
-            While i < n
-                Dim sc As ScalarInfo = scalars(i)
-                If IsWord(inside, sc) Then
-                    Dim j As Integer = i
-                    While j < n AndAlso IsWord(inside, scalars(j)) : j += 1 : End While
-                    matches.Add((sc.Utf8Start, ByteEnd(scalars, j - 1)))
-                    i = j
-                ElseIf Not IsWhiteSpace(inside, sc) Then
-                    Dim j As Integer = i
-                    While j < n AndAlso (Not IsWord(inside, scalars(j))) AndAlso (Not IsWhiteSpace(inside, scalars(j))) : j += 1 : End While
-                    matches.Add((sc.Utf8Start, ByteEnd(scalars, j - 1)))
-                    i = j
+        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
+            Dim n As Integer = inside.Length
+            Dim net As Integer = 0
+            Dim byteOff As Integer = 0
+            While net < n
+                Dim startByte As Integer = byteOff
+                If IsWord(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
+                    While jNet < n AndAlso IsWord(inside, jNet)
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
+                    End While
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = jNet
+                    byteOff = jByte
+                ElseIf Not IsWhiteSpace(inside, net) Then
+                    Dim jNet As Integer = net
+                    Dim jByte As Integer = byteOff
+                    Dim endByte As Integer = byteOff
+                    While jNet < n AndAlso (Not IsWord(inside, jNet)) AndAlso (Not IsWhiteSpace(inside, jNet))
+                        AdvanceOne(inside, jNet, jByte)
+                        endByte = jByte
+                    End While
+                    EmitMatch(result, prev, startByte, endByte)
+                    net = jNet
+                    byteOff = jByte
                 Else
-                    i += 1
+                    AdvanceOne(inside, net, byteOff)
                 End If
             End While
         End Sub

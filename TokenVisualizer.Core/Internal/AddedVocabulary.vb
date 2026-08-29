@@ -359,7 +359,17 @@ Namespace Internal
 
         ''' <summary>Appends the slices corresponding to <paramref name="matches"/> to <paramref name="newSplits"/>.</summary>
         Private Shared Sub AppendMatches(split As Split, matches As List(Of (Integer?, (Integer, Integer))), newSplits As List(Of Split))
+            Dim wholeLen As Integer = Utf8Helpers.Utf8Length(split.Normalized.Get)
             For Each m In matches
+                ' Fast path: a non-token match covering the whole normalized string (the common
+                ' "no added token found" case) is reused as-is instead of being copied through a
+                ' full-range Slice, which would rebuild the 2M-entry alignment list and the
+                ' scalar-boundary index arrays for the whole text.
+                If m.Item2.Item1 = 0 AndAlso m.Item2.Item2 = wholeLen AndAlso Not m.Item1.HasValue Then
+                    newSplits.Add(Split.FromNormalizedString(split.Normalized))
+                    Continue For
+                End If
+
                 Dim slice As NormalizedString = split.Normalized.Slice(New OffsetRange(False, m.Item2.Item1, m.Item2.Item2))
                 If slice.IsEmpty() Then Continue For
                 If m.Item1.HasValue Then

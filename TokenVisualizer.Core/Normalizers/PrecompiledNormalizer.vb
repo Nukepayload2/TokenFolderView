@@ -42,7 +42,7 @@ Namespace Normalizers
             ' scalar is at most 4 UTF-8 bytes, so the < 6 byte fast path always applies. The
             ' per-char fallback below is retained to mirror precompiled.rs exactly.
             For Each sc In Utf8Helpers.EnumerateScalars(normalized.Get)
-                Dim grapheme As String = sc.Value
+                Dim grapheme As String = Utf8Helpers.ScalarToString(sc.CodePoint)
                 Dim norm As String = Nothing
                 If Utf8Helpers.Utf8Length(grapheme) < 6 AndAlso _mapping.TryGetValue(grapheme, norm) Then
                     modified = True
@@ -88,7 +88,7 @@ Namespace Normalizers
 
             ' If we are just replacing characters, all changes should be == 0.
             For Each sc In Utf8Helpers.EnumerateScalars(newPart)
-                transformations.Add((sc.Value, 0))
+                transformations.Add((Utf8Helpers.ScalarToString(sc.CodePoint), 0))
             Next
 
             If diff > 0 Then

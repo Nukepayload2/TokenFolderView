@@ -1,5 +1,6 @@
 Imports System.Linq
 Imports System.Text
+Imports System.Threading
 
 Namespace Internal
 
@@ -22,11 +23,33 @@ Namespace Internal
         ' NormalizedString.Slice is called once per pre-tokenizer piece (O(n) pieces), so the
         ' static Utf8Helpers.ByteToNetIndex / IsUtf8CharBoundary (each O(n) from the string
         ' start) made splitting an O(n^2) operation. These caches turn those lookups into
-        ' O(log n) binary searches, built once per NormalizedString.
-        Private _originalScalars As List(Of ScalarInfo)
-        Private _normalizedScalars As List(Of ScalarInfo)
-        Private _originalUtf8Len As Integer?
-        Private _normalizedUtf8Len As Integer?
+        ' O(log n) binary searches, built once per NormalizedString. The cache stores plain
+        ' integer arrays (scalar-start byte offsets and net indices), NOT ScalarInfo lists, so
+        ' building it never allocates per-scalar strings.
+        '
+        ' A NormalizedString is created per-Encode and not shared across threads, but the
+        ' check-then-act lazy build is hardened anyway (reference-typed index + Volatile reads/
+        ' writes + an Interlocked publish) so a concurrent reader can never observe a partially
+        ' published cache or tear a multi-word struct. Building is idempotent (derived purely
+        ' from the immutable string), so a lost compare-exchange is harmless.
+        Private NotInheritable Class ScalarBoundaryIndex
+            Public ReadOnly Utf8Starts As Integer()
+            Public ReadOnly NetStarts As Integer()
+            Public ReadOnly Utf8Len As Integer
+
+            Public Sub New(utf8Starts As Integer(), netStarts As Integer(), utf8Len As Integer)
+                Me.Utf8Starts = utf8Starts
+                Me.NetStarts = netStarts
+                Me.Utf8Len = utf8Len
+            End Sub
+        End Class
+
+        Private _originalIndex As ScalarBoundaryIndex
+        Private _normalizedIndex As ScalarBoundaryIndex
+        ''' <summary>Utf8 length of the original string, or -1 when not yet computed.</summary>
+        Private _originalUtf8Len As Integer = -1
+        ''' <summary>Utf8 length of the normalized string, or -1 when not yet computed.</summary>
+        Private _normalizedUtf8Len As Integer = -1
 
         Private Sub New()
             _original = String.Empty
@@ -45,7 +68,7 @@ Namespace Internal
             n._original = s
             n._normalized = s
             n._originalShift = 0
-            n._alignments = New List(Of (Integer, Integer))()
+            n._alignments = New List(Of (Integer, Integer))(Utf8Helpers.Utf8Length(s))
             For Each sc In Utf8Helpers.EnumerateScalars(s)
                 Dim start As Integer = sc.Utf8Start
                 Dim [end] As Integer = sc.Utf8Start + sc.Utf8Len
@@ -110,76 +133,109 @@ Namespace Internal
         #Region "Cached byte<->net conversions (hot paths)"
         ' ------------------------------------------------------------------
 
-        ''' <summary>Lazily materialized scalar info for the original string.</summary>
-        Private Function OriginalScalars() As List(Of ScalarInfo)
-            If _originalScalars Is Nothing Then
-                _originalScalars = Utf8Helpers.EnumerateScalars(_original).ToList()
+        ''' <summary>Builds a scalar boundary index (byte and net offsets of each scalar start) for <paramref name="s"/>.</summary>
+        Private Shared Function BuildScalarIndex(s As String) As ScalarBoundaryIndex
+            If s Is Nothing OrElse s.Length = 0 Then
+                Return New ScalarBoundaryIndex(Array.Empty(Of Integer)(), Array.Empty(Of Integer)(), 0)
             End If
-            Return _originalScalars
+            Dim count As Integer = Utf8Helpers.ScalarCount(s)
+            Dim utf8Starts(count - 1) As Integer
+            Dim netStarts(count - 1) As Integer
+            Dim net As Integer = 0
+            Dim byteOff As Integer = 0
+            Dim idx As Integer = 0
+            While net < s.Length
+                utf8Starts(idx) = byteOff
+                netStarts(idx) = net
+                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(s, net)
+                byteOff += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                net += Utf8Helpers.NetLengthOfCodePoint(cp)
+                idx += 1
+            End While
+            Return New ScalarBoundaryIndex(utf8Starts, netStarts, byteOff)
         End Function
 
-        ''' <summary>Lazily materialized scalar info for the normalized string.</summary>
-        Private Function NormalizedScalars() As List(Of ScalarInfo)
-            If _normalizedScalars Is Nothing Then
-                _normalizedScalars = Utf8Helpers.EnumerateScalars(_normalized).ToList()
+        ''' <summary>Lazily built scalar boundary index for the original string (never mutates).</summary>
+        Private Function OriginalIndex() As ScalarBoundaryIndex
+            Dim idx As ScalarBoundaryIndex = Volatile.Read(_originalIndex)
+            If idx Is Nothing Then
+                Dim built As ScalarBoundaryIndex = BuildScalarIndex(_original)
+                Dim existing As ScalarBoundaryIndex = Interlocked.CompareExchange(_originalIndex, built, Nothing)
+                If existing IsNot Nothing Then Return existing
+                idx = built
             End If
-            Return _normalizedScalars
+            Return idx
+        End Function
+
+        ''' <summary>Lazily built scalar boundary index for the normalized string (invalidated on transform).</summary>
+        Private Function NormalizedIndex() As ScalarBoundaryIndex
+            Dim idx As ScalarBoundaryIndex = Volatile.Read(_normalizedIndex)
+            If idx Is Nothing Then
+                Dim built As ScalarBoundaryIndex = BuildScalarIndex(_normalized)
+                Dim existing As ScalarBoundaryIndex = Interlocked.CompareExchange(_normalizedIndex, built, Nothing)
+                If existing IsNot Nothing Then Return existing
+                idx = built
+            End If
+            Return idx
         End Function
 
         Private Function OriginalUtf8LenCached() As Integer
-            If Not _originalUtf8Len.HasValue Then
-                _originalUtf8Len = Utf8Helpers.Utf8Length(_original)
+            Dim v As Integer = Volatile.Read(_originalUtf8Len)
+            If v < 0 Then
+                v = Utf8Helpers.Utf8Length(_original)
+                Volatile.Write(_originalUtf8Len, v)
             End If
-            Return _originalUtf8Len.Value
+            Return v
         End Function
 
         Private Function NormalizedUtf8LenCached() As Integer
-            If Not _normalizedUtf8Len.HasValue Then
-                _normalizedUtf8Len = Utf8Helpers.Utf8Length(_normalized)
+            Dim v As Integer = Volatile.Read(_normalizedUtf8Len)
+            If v < 0 Then
+                v = Utf8Helpers.Utf8Length(_normalized)
+                Volatile.Write(_normalizedUtf8Len, v)
             End If
-            Return _normalizedUtf8Len.Value
+            Return v
         End Function
 
         ''' <summary>Invalidates the normalized-side caches (the original side never mutates).</summary>
         Private Sub InvalidateNormalizedCaches()
-            _normalizedScalars = Nothing
-            _normalizedUtf8Len = Nothing
+            Volatile.Write(_normalizedIndex, Nothing)
+            Volatile.Write(_normalizedUtf8Len, -1)
         End Sub
 
         ''' <summary>
-        ''' Converts a UTF-8 byte offset to a .NET string index using a cached scalar list.
+        ''' Converts a UTF-8 byte offset to a .NET string index using a cached boundary index.
         ''' Semantics match <see cref="Utf8Helpers.ByteToNetIndex"/>.
         ''' </summary>
-        Private Shared Function ByteToNetCached(scalars As List(Of ScalarInfo), utf8Len As Integer, byteOffset As Integer) As Integer
+        Private Shared Function ByteToNetCached(index As ScalarBoundaryIndex, s As String, byteOffset As Integer) As Integer
             If byteOffset <= 0 Then Return 0
-            If byteOffset >= utf8Len Then Return scalars(scalars.Count - 1).NetEnd
+            If byteOffset >= index.Utf8Len Then Return s.Length
             Dim lo As Integer = 0
-            Dim hi As Integer = scalars.Count - 1
+            Dim hi As Integer = index.Utf8Starts.Length - 1
+            Dim result As Integer = 0
             While lo <= hi
                 Dim mid As Integer = (lo + hi) \ 2
-                Dim sc As ScalarInfo = scalars(mid)
-                If byteOffset < sc.Utf8Start Then
-                    hi = mid - 1
-                ElseIf byteOffset >= sc.Utf8Start + sc.Utf8Len Then
+                If index.Utf8Starts(mid) <= byteOffset Then
+                    result = index.NetStarts(mid)
                     lo = mid + 1
                 Else
-                    Return sc.NetStart
+                    hi = mid - 1
                 End If
             End While
-            Return 0
+            Return result
         End Function
 
         ''' <summary>
-        ''' Whether the given UTF-8 byte offset lies on a scalar boundary, using a cached scalar list.
+        ''' Whether the given UTF-8 byte offset lies on a scalar boundary, using a cached boundary index.
         ''' Semantics match <see cref="Utf8Helpers.IsUtf8CharBoundary"/>.
         ''' </summary>
-        Private Shared Function IsBoundaryCached(scalars As List(Of ScalarInfo), utf8Len As Integer, byteOffset As Integer) As Boolean
-            If byteOffset <= 0 OrElse byteOffset >= utf8Len Then Return True
+        Private Shared Function IsBoundaryCached(index As ScalarBoundaryIndex, byteOffset As Integer) As Boolean
+            If byteOffset <= 0 OrElse byteOffset >= index.Utf8Len Then Return True
             Dim lo As Integer = 0
-            Dim hi As Integer = scalars.Count - 1
+            Dim hi As Integer = index.Utf8Starts.Length - 1
             While lo <= hi
                 Dim mid As Integer = (lo + hi) \ 2
-                Dim start As Integer = scalars(mid).Utf8Start
+                Dim start As Integer = index.Utf8Starts(mid)
                 If start < byteOffset Then
                     lo = mid + 1
                 ElseIf start > byteOffset Then
@@ -192,12 +248,12 @@ Namespace Internal
         End Function
 
         ''' <summary>
-        ''' Slices the string by a UTF-8 byte range using a cached scalar list.
+        ''' Slices the string by a UTF-8 byte range using a cached boundary index.
         ''' Semantics match <see cref="Utf8Helpers.SliceByUtf8"/>.
         ''' </summary>
-        Private Shared Function SliceByUtf8Cached(scalars As List(Of ScalarInfo), utf8Len As Integer, s As String, startByte As Integer, endByte As Integer) As String
-            Dim startNet As Integer = ByteToNetCached(scalars, utf8Len, startByte)
-            Dim endNet As Integer = ByteToNetCached(scalars, utf8Len, endByte)
+        Private Shared Function SliceByUtf8Cached(index As ScalarBoundaryIndex, s As String, startByte As Integer, endByte As Integer) As String
+            Dim startNet As Integer = ByteToNetCached(index, s, startByte)
+            Dim endNet As Integer = ByteToNetCached(index, s, endByte)
             If endNet <= startNet Then Return String.Empty
             Return s.Substring(startNet, endNet - startNet)
         End Function
@@ -318,16 +374,16 @@ Namespace Internal
             If range.IsOriginal Then
                 Dim len As Integer = OriginalUtf8LenCached()
                 Dim r = range.IntoFullRange(len)
-                If Not IsBoundaryCached(OriginalScalars(), len, r.Item1) OrElse
-                   Not IsBoundaryCached(OriginalScalars(), len, r.Item2) Then
+                If Not IsBoundaryCached(OriginalIndex(), r.Item1) OrElse
+                   Not IsBoundaryCached(OriginalIndex(), r.Item2) Then
                     Return Nothing
                 End If
                 Return New OffsetRange(True, r.Item1, r.Item2)
             Else
                 Dim len As Integer = NormalizedUtf8LenCached()
                 Dim r = range.IntoFullRange(len)
-                If Not IsBoundaryCached(NormalizedScalars(), len, r.Item1) OrElse
-                   Not IsBoundaryCached(NormalizedScalars(), len, r.Item2) Then
+                If Not IsBoundaryCached(NormalizedIndex(), r.Item1) OrElse
+                   Not IsBoundaryCached(NormalizedIndex(), r.Item2) Then
                     Return Nothing
                 End If
                 Return New OffsetRange(False, r.Item1, r.Item2)
@@ -366,9 +422,13 @@ Namespace Internal
             Dim nShift As Integer = originalRange.Item1
 
             Dim result As New NormalizedString()
-            result._original = SliceByUtf8Cached(OriginalScalars(), OriginalUtf8LenCached(), _original, originalRange.Item1, originalRange.Item2)
-            result._normalized = SliceByUtf8Cached(NormalizedScalars(), NormalizedUtf8LenCached(), _normalized, normalizedRange.Item1, normalizedRange.Item2)
-            result._alignments = New List(Of (Integer, Integer))()
+            result._original = SliceByUtf8Cached(OriginalIndex(), _original, originalRange.Item1, originalRange.Item2)
+            result._normalized = SliceByUtf8Cached(NormalizedIndex(), _normalized, normalizedRange.Item1, normalizedRange.Item2)
+            ' Pre-size the piece's alignment list to the slice's normalized byte length so the
+            ' per-piece rebuild (the pre-tokenizer Split hot path) never pays List growth
+            ' doubling.
+            Dim pieceLen As Integer = normalizedRange.Item2 - normalizedRange.Item1
+            result._alignments = New List(Of (Integer, Integer))(pieceLen)
             For i As Integer = normalizedRange.Item1 To normalizedRange.Item2 - 1
                 result._alignments.Add((_alignments(i).Item1 - nShift, _alignments(i).Item2 - nShift))
             Next
@@ -405,25 +465,51 @@ Namespace Internal
                 nRange = converted.Value
             End If
 
-            ' Retrieve the original characters that are being replaced.
-            Dim replacedNormalized As List(Of String) =
-                Utf8Helpers.EnumerateScalars(Utf8Helpers.SliceByUtf8(_normalized, nRange.Item1, nRange.Item2)).
-                Select(Function(sc) sc.Value).ToList()
-            Dim replacedIdx As Integer = 0
+            Dim netStart As Integer = Utf8Helpers.ByteToNetIndex(_normalized, nRange.Item1)
+            Dim netEnd As Integer = Utf8Helpers.ByteToNetIndex(_normalized, nRange.Item2)
 
-            Dim initialRemoved As Integer = 0
-            For k As Integer = 0 To initialOffset - 1
-                If k < replacedNormalized.Count Then
-                    initialRemoved += Utf8Helpers.Utf8Length(replacedNormalized(k))
-                End If
-            Next
+            ' The replaced range's scalars are scanned ON DEMAND as the stream is consumed, so no
+            ' replaced-bytes list is materialized.
+            Dim scanNet As Integer = netStart
+            Dim scalarCountInRange As Integer = 0
+            While scanNet < netEnd
+                scanNet += Utf8Helpers.NetLengthOfCodePoint(UnicodePredicates.ScalarCodePoint(_normalized, scanNet))
+                scalarCountInRange += 1
+            End While
+
             ' Mirrors the Rust `(&mut iter).take(initial_offset)` call: the first
-            ' `initial_offset` characters of the replaced range are dropped before the loop,
-            ' so the per-character iterator must be positioned past them.
-            replacedIdx = Math.Min(initialOffset, replacedNormalized.Count)
+            ' `initial_offset` characters of the replaced range are dropped before the loop.
+            Dim replacedNet As Integer = netStart
+            Dim initialRemoved As Integer = 0
+            Dim toSkip As Integer = Math.Min(initialOffset, scalarCountInRange)
+            For k As Integer = 0 To toSkip - 1
+                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
+                initialRemoved += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
+            Next
 
             Dim offset As Integer = initialRemoved + nRange.Item1
-            Dim newAlignments As New List(Of (Integer, Integer))()
+
+            ' Build ONE alignment list for the result: a whole-range transform publishes it
+            ' directly (no List.InsertRange temporary array); a partial transform pre-copies the
+            ' prefix and appends the suffix. The new part cannot be pre-sized because dest is a
+            ' single-pass IEnumerable.
+            Dim oldAlignments As List(Of (Integer, Integer)) = _alignments
+            Dim spliceStart As Integer = nRange.Item1
+            Dim spliceEnd As Integer = nRange.Item2
+            If spliceStart < 0 OrElse spliceEnd > oldAlignments.Count OrElse spliceStart > spliceEnd Then
+                Throw New InvalidOperationException("NormalizedString bad transform range.")
+            End If
+            Dim isWholeRange As Boolean = (spliceStart = 0) AndAlso (spliceEnd = oldAlignments.Count)
+            Dim target As List(Of (Integer, Integer))
+            If isWholeRange Then
+                target = New List(Of (Integer, Integer))()
+            Else
+                target = New List(Of (Integer, Integer))(spliceStart + (oldAlignments.Count - spliceEnd))
+                For i As Integer = 0 To spliceStart - 1
+                    target.Add(oldAlignments(i))
+                Next
+            End If
             Dim normalizedBuilder As New StringBuilder()
 
             For Each item In dest
@@ -436,29 +522,30 @@ Namespace Internal
                     If idx < 1 Then
                         align = (0, 0)
                     Else
-                        align = _alignments(idx - 1)
+                        align = oldAlignments(idx - 1)
                     End If
                 Else
-                    align = _alignments(idx)
+                    align = oldAlignments(idx)
                 End If
 
                 ' If we are replacing a character, find it and compute the change in size.
-                Dim replacedChar As String = Nothing
+                Dim replacedCharSize As Integer = 0
                 If changes <= 0 Then
-                    If replacedIdx < replacedNormalized.Count Then
-                        replacedChar = replacedNormalized(replacedIdx)
-                        replacedIdx += 1
+                    If replacedNet < netEnd Then
+                        Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
+                        replacedCharSize = Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                        replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
                     End If
                 End If
-                Dim replacedCharSize As Integer = If(replacedChar Is Nothing, 0, Utf8Helpers.Utf8Length(replacedChar))
 
                 ' If we are removing some characters, find them too.
                 Dim totalBytesToRemove As Integer = 0
                 If changes < 0 Then
                     For k As Integer = 0 To (-changes) - 1
-                        If replacedIdx < replacedNormalized.Count Then
-                            totalBytesToRemove += Utf8Helpers.Utf8Length(replacedNormalized(replacedIdx))
-                            replacedIdx += 1
+                        If replacedNet < netEnd Then
+                            Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
+                            totalBytesToRemove += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                            replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
                         End If
                     Next
                 End If
@@ -469,24 +556,197 @@ Namespace Internal
                 ' New normalized alignment entries.
                 Dim cLen As Integer = Utf8Helpers.Utf8Length(c)
                 For k As Integer = 0 To cLen - 1
-                    newAlignments.Add(align)
+                    target.Add(align)
                 Next
                 normalizedBuilder.Append(c)
             Next
 
-            ' Splice alignments.
+            ' Publish the spliced alignments.
+            If Not isWholeRange Then
+                For i As Integer = spliceEnd To oldAlignments.Count - 1
+                    target.Add(oldAlignments(i))
+                Next
+            End If
+            _alignments = target
+
+            ' Splice normalized string without intermediate String.Concat: a whole-range
+            ' transform uses the builder directly; a partial transform appends the untouched
+            ' prefix/suffix ranges of _normalized into one pre-sized StringBuilder.
+            If isWholeRange Then
+                _normalized = normalizedBuilder.ToString()
+            Else
+                Dim prefixLen As Integer = netStart
+                Dim suffixNetStart As Integer = netEnd
+                Dim builder As New StringBuilder(prefixLen + normalizedBuilder.Length + (_normalized.Length - suffixNetStart))
+                builder.Append(_normalized, 0, prefixLen)
+                builder.Append(normalizedBuilder.ToString())
+                builder.Append(_normalized, suffixNetStart, _normalized.Length - suffixNetStart)
+                _normalized = builder.ToString()
+            End If
+            InvalidateNormalizedCaches()
+        End Sub
+
+        ''' <summary>
+        ''' Applies transformations to the current normalized version of the string while
+        ''' updating the alignments, exactly like the <c>(String, Integer)</c> overload, but
+        ''' reading each emitted character as a single <see cref="Char"/>. The hot paths
+        ''' (ByteLevel byte→unicode) use this overload so no per-character <see cref="String"/> is
+        ''' ever allocated for the transform stream. The stream is accessed by index (an
+        ''' <see cref="IReadOnlyList(Of (Char, Integer))"/>), so enumeration allocates nothing.
+        ''' </summary>
+        Public Sub Transform(dest As IReadOnlyList(Of (Char, Integer)), initialOffset As Integer)
+            Me.TransformRange(OffsetRange.WholeOriginal(), dest, initialOffset)
+        End Sub
+
+        ''' <summary>Applies a <c>(Char, Integer)</c> transform stream over a specific byte range.</summary>
+        Public Sub TransformRange(range As OffsetRange, dest As IReadOnlyList(Of (Char, Integer)), initialOffset As Integer)
+            Dim nRange As (Integer, Integer)
+            If Not range.IsOriginal Then
+                nRange = range.IntoFullRange(Utf8Helpers.Utf8Length(_normalized))
+            Else
+                Dim converted = ConvertOffsets(range)
+                If Not converted.HasValue Then Return
+                nRange = converted.Value
+            End If
+
+            Dim netStart As Integer = Utf8Helpers.ByteToNetIndex(_normalized, nRange.Item1)
+            Dim netEnd As Integer = Utf8Helpers.ByteToNetIndex(_normalized, nRange.Item2)
+
+            ' The replaced range's scalars are scanned ON DEMAND as the stream is consumed, so no
+            ' replaced-bytes list is materialized (saves a list + its population pass). Count the
+            ' scalars in the range up front so the initial-offset skip can be bounded.
+            Dim scanNet As Integer = netStart
+            Dim scalarCountInRange As Integer = 0
+            While scanNet < netEnd
+                scanNet += Utf8Helpers.NetLengthOfCodePoint(UnicodePredicates.ScalarCodePoint(_normalized, scanNet))
+                scalarCountInRange += 1
+            End While
+
+            ' Mirrors the Rust `(&mut iter).take(initial_offset)` call: the first
+            ' `initial_offset` characters of the replaced range are dropped before the loop, so
+            ' the on-demand scalar cursor is positioned past them and their byte length is
+            ' accumulated into the initial byte offset.
+            Dim replacedNet As Integer = netStart
+            Dim initialRemoved As Integer = 0
+            Dim toSkip As Integer = Math.Min(initialOffset, scalarCountInRange)
+            For k As Integer = 0 To toSkip - 1
+                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
+                initialRemoved += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
+            Next
+
+            Dim offset As Integer = initialRemoved + nRange.Item1
+
+            ' Pre-size the alignment list and the normalized-text builder so the hot Char
+            ' transform does not pay List/StringBuilder growth doubling. The alignment list has
+            ' one entry per UTF-8 byte of the emitted text; the normalized string is exactly one
+            ' UTF-16 char per stream item.
+            Dim destByteLen As Integer = 0
+            For i As Integer = 0 To dest.Count - 1
+                destByteLen += Utf8Helpers.Utf8LengthOfCodePoint(AscW(dest(i).Item1))
+            Next
+            Dim normalizedBuilder As New StringBuilder(dest.Count)
+
+            ' Splice range validation.
             Dim spliceStart As Integer = nRange.Item1
             Dim spliceEnd As Integer = nRange.Item2
             If spliceStart < 0 OrElse spliceEnd > _alignments.Count OrElse spliceStart > spliceEnd Then
                 Throw New InvalidOperationException("NormalizedString bad transform range.")
             End If
-            _alignments.RemoveRange(spliceStart, spliceEnd - spliceStart)
-            _alignments.InsertRange(spliceStart, newAlignments)
 
-            ' Splice normalized string.
-            Dim prefix As String = Utf8Helpers.SliceByUtf8(_normalized, 0, spliceStart)
-            Dim suffix As String = Utf8Helpers.SliceByUtf8(_normalized, spliceEnd, Utf8Helpers.Utf8Length(_normalized))
-            _normalized = prefix & normalizedBuilder.ToString() & suffix
+            ' Build ONE pre-sized alignment list for the result. A whole-range transform (the
+            ' common ByteLevel hot path) allocates only this list and publishes it directly,
+            ' avoiding the separate newAlignments list plus the internal temporary array that
+            ' List.InsertRange allocates (each ~the full output size). A partial transform
+            ' pre-copies the prefix into the same list and appends the suffix afterwards.
+            Dim oldAlignments As List(Of (Integer, Integer)) = _alignments
+            Dim isWholeRange As Boolean = (spliceStart = 0) AndAlso (spliceEnd = oldAlignments.Count)
+            Dim suffixCount As Integer = oldAlignments.Count - spliceEnd
+            Dim target As List(Of (Integer, Integer))
+            If isWholeRange Then
+                target = New List(Of (Integer, Integer))(destByteLen)
+            Else
+                target = New List(Of (Integer, Integer))(spliceStart + destByteLen + suffixCount)
+                For i As Integer = 0 To spliceStart - 1
+                    target.Add(oldAlignments(i))
+                Next
+            End If
+
+            For i As Integer = 0 To dest.Count - 1
+                Dim item As (Char, Integer) = dest(i)
+                Dim c As Char = item.Item1
+                Dim changes As Integer = item.Item2
+
+                Dim idx As Integer = offset
+                Dim align As (Integer, Integer)
+                If changes > 0 Then
+                    If idx < 1 Then
+                        align = (0, 0)
+                    Else
+                        align = oldAlignments(idx - 1)
+                    End If
+                Else
+                    align = oldAlignments(idx)
+                End If
+
+                ' If we are replacing a character, find it and compute the change in size.
+                Dim replacedCharSize As Integer = 0
+                If changes <= 0 Then
+                    If replacedNet < netEnd Then
+                        Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
+                        replacedCharSize = Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                        replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
+                    End If
+                End If
+
+                ' If we are removing some characters, find them too.
+                Dim totalBytesToRemove As Integer = 0
+                If changes < 0 Then
+                    For k As Integer = 0 To (-changes) - 1
+                        If replacedNet < netEnd Then
+                            Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
+                            totalBytesToRemove += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                            replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
+                        End If
+                    Next
+                End If
+
+                ' Keep track of the changes for next offsets.
+                offset += replacedCharSize + totalBytesToRemove
+
+                ' New normalized alignment entries: one per UTF-8 byte the emitted char
+                ' occupies. For a Char this is pure arithmetic (a lone surrogate counts as the
+                ' 3-byte U+FFFD replacement, matching Utf8Helpers.Utf8Length of the same char).
+                Dim cLen As Integer = Utf8Helpers.Utf8LengthOfCodePoint(AscW(c))
+                For k As Integer = 0 To cLen - 1
+                    target.Add(align)
+                Next
+                normalizedBuilder.Append(c)
+            Next
+
+            ' Publish the spliced alignments.
+            If Not isWholeRange Then
+                For i As Integer = spliceEnd To oldAlignments.Count - 1
+                    target.Add(oldAlignments(i))
+                Next
+            End If
+            _alignments = target
+
+            ' Splice normalized string without intermediate String.Concat: a whole-range
+            ' transform uses the builder directly; a partial transform appends the untouched
+            ' prefix/suffix ranges of _normalized into one pre-sized StringBuilder (no
+            ' SliceByUtf8 substring copies).
+            If isWholeRange Then
+                _normalized = normalizedBuilder.ToString()
+            Else
+                Dim prefixLen As Integer = netStart
+                Dim suffixNetStart As Integer = netEnd
+                Dim builder As New StringBuilder(prefixLen + normalizedBuilder.Length + (_normalized.Length - suffixNetStart))
+                builder.Append(_normalized, 0, prefixLen)
+                builder.Append(normalizedBuilder.ToString())
+                builder.Append(_normalized, suffixNetStart, _normalized.Length - suffixNetStart)
+                _normalized = builder.ToString()
+            End If
             InvalidateNormalizedCaches()
         End Sub
 
@@ -505,13 +765,13 @@ Namespace Internal
             Dim transforms As New List(Of (String, Integer))()
             Dim lastC As String = Nothing
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
-                If keep(sc.Value(0)) Then
+                If keep(Utf8Helpers.ScalarFirstChar(sc.CodePoint)) Then
                     If lastC Is Nothing Then
                         removedStart = removed
                     Else
                         transforms.Add((lastC, -removed))
                     End If
-                    lastC = sc.Value
+                    lastC = Utf8Helpers.ScalarToString(sc.CodePoint)
                     removed = 0
                 Else
                     removed += 1
@@ -537,9 +797,9 @@ Namespace Internal
             Dim transforms As New List(Of (String, Integer))()
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
                 If sc.NetLen = 1 Then
-                    transforms.Add((func(sc.Value(0)).ToString(), 0))
+                    transforms.Add((func(Utf8Helpers.ScalarFirstChar(sc.CodePoint)).ToString(), 0))
                 Else
-                    transforms.Add((sc.Value, 0))
+                    transforms.Add((Utf8Helpers.ScalarToString(sc.CodePoint), 0))
                 End If
             Next
             Me.Transform(transforms, 0)
@@ -550,10 +810,10 @@ Namespace Internal
         Public Function Lowercase() As NormalizedString
             Dim newChars As New List(Of (String, Integer))()
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
-                Dim lowered As String = sc.Value.ToLowerInvariant()
+                Dim lowered As String = Utf8Helpers.ScalarToString(sc.CodePoint).ToLowerInvariant()
                 Dim first As Boolean = True
                 For Each lc In Utf8Helpers.EnumerateScalars(lowered)
-                    newChars.Add((lc.Value, If(first, 0, 1)))
+                    newChars.Add((Utf8Helpers.ScalarToString(lc.CodePoint), If(first, 0, 1)))
                     first = False
                 Next
             Next
@@ -565,10 +825,10 @@ Namespace Internal
         Public Function Uppercase() As NormalizedString
             Dim newChars As New List(Of (String, Integer))()
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
-                Dim upper As String = sc.Value.ToUpperInvariant()
+                Dim upper As String = Utf8Helpers.ScalarToString(sc.CodePoint).ToUpperInvariant()
                 Dim first As Boolean = True
                 For Each uc In Utf8Helpers.EnumerateScalars(upper)
-                    newChars.Add((uc.Value, If(first, 0, 1)))
+                    newChars.Add((Utf8Helpers.ScalarToString(uc.CodePoint), If(first, 0, 1)))
                     first = False
                 Next
             Next
@@ -578,34 +838,43 @@ Namespace Internal
 
         ''' <summary>Prepends the given string to the normalized string.</summary>
         Public Function Prepend(s As String) As NormalizedString
-            Dim firstScalar As ScalarInfo = Utf8Helpers.EnumerateScalars(_normalized).FirstOrDefault()
-            If firstScalar.Value IsNot Nothing Then
+            Dim firstScalar As ScalarInfo? = Nothing
+            For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
+                firstScalar = sc
+                Exit For
+            Next
+            If firstScalar.HasValue Then
+                Dim fs As ScalarInfo = firstScalar.Value
                 Dim transformations As New List(Of (String, Integer))()
                 Dim first As Boolean = True
                 For Each sc In Utf8Helpers.EnumerateScalars(s)
-                    transformations.Add((sc.Value, If(first, 0, 1)))
+                    transformations.Add((Utf8Helpers.ScalarToString(sc.CodePoint), If(first, 0, 1)))
                     first = False
                 Next
-                transformations.Add((firstScalar.Value, 1))
-                Me.TransformRange(New OffsetRange(False, 0, firstScalar.Utf8Len), transformations, 0)
+                transformations.Add((Utf8Helpers.ScalarToString(fs.CodePoint), 1))
+                Me.TransformRange(New OffsetRange(False, 0, fs.Utf8Len), transformations, 0)
             End If
             Return Me
         End Function
 
         ''' <summary>Appends the given string to the normalized string.</summary>
         Public Function Append(s As String) As NormalizedString
-            Dim lastScalar As ScalarInfo = Utf8Helpers.EnumerateScalars(_normalized).LastOrDefault()
-            If lastScalar.Value IsNot Nothing Then
+            Dim lastScalar As ScalarInfo? = Nothing
+            For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
+                lastScalar = sc
+            Next
+            If lastScalar.HasValue Then
+                Dim ls As ScalarInfo = lastScalar.Value
                 Dim transformations As New List(Of (String, Integer))()
-                transformations.Add((lastScalar.Value, 0))
+                transformations.Add((Utf8Helpers.ScalarToString(ls.CodePoint), 0))
                 For Each sc In Utf8Helpers.EnumerateScalars(s)
-                    transformations.Add((sc.Value, 1))
+                    transformations.Add((Utf8Helpers.ScalarToString(sc.CodePoint), 1))
                 Next
-                Me.TransformRange(New OffsetRange(False, lastScalar.Utf8Start, -1), transformations, 0)
+                Me.TransformRange(New OffsetRange(False, ls.Utf8Start, -1), transformations, 0)
             Else
                 Dim transformations As New List(Of (String, Integer))()
                 For Each sc In Utf8Helpers.EnumerateScalars(s)
-                    transformations.Add((sc.Value, 1))
+                    transformations.Add((Utf8Helpers.ScalarToString(sc.CodePoint), 1))
                 Next
                 Me.TransformRange(OffsetRange.WholeNormalized(), transformations, 0)
             End If
@@ -622,7 +891,9 @@ Namespace Internal
         ''' <summary>Replaces anything that matches the pattern with the given content.</summary>
         Public Function Replace(pattern As Pattern, content As String) As NormalizedString
             Dim newNormalized As New StringBuilder()
-            Dim newAlignments As New List(Of (Integer, Integer))()
+            ' Pre-size to the current alignment count: a typical replace keeps the text size
+            ' roughly stable, so the common case never pays List growth doubling.
+            Dim newAlignments As New List(Of (Integer, Integer))(_alignments.Count)
             Dim lastEnd As Integer = 0
 
             For Each m In pattern.FindMatches(_normalized)
@@ -637,13 +908,19 @@ Namespace Internal
                     Next
 
                     ' Compute the replacement, mirroring the optimized Rust replace().
-                    Dim replacedNormalized As List(Of String) =
-                        Utf8Helpers.EnumerateScalars(Utf8Helpers.SliceByUtf8(_normalized, start, [end])).
-                        Select(Function(sc) sc.Value).ToList()
-                    Dim removedChars As Integer = replacedNormalized.Count
+                    Dim replacedBytes As New List(Of Integer)()
+                    Dim netStart As Integer = Utf8Helpers.ByteToNetIndex(_normalized, start)
+                    Dim netEnd As Integer = Utf8Helpers.ByteToNetIndex(_normalized, [end])
+                    Dim scanNet As Integer = netStart
+                    While scanNet < netEnd
+                        Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, scanNet)
+                        replacedBytes.Add(Utf8Helpers.Utf8LengthOfCodePoint(cp))
+                        scanNet += Utf8Helpers.NetLengthOfCodePoint(cp)
+                    End While
+                    Dim removedChars As Integer = replacedBytes.Count
                     Dim initialRemoved As Integer = 0
                     For k As Integer = 0 To removedChars - 1
-                        initialRemoved += Utf8Helpers.Utf8Length(replacedNormalized(k))
+                        initialRemoved += replacedBytes(k)
                     Next
                     Dim offset As Integer = initialRemoved + start
 
@@ -658,7 +935,7 @@ Namespace Internal
                         For k As Integer = 0 To sc.Utf8Len - 1
                             newAlignments.Add(align)
                         Next
-                        newNormalized.Append(sc.Value)
+                        newNormalized.Append(Utf8Helpers.ScalarToString(sc.CodePoint))
                     Next
 
                     lastEnd = [end]
@@ -696,18 +973,22 @@ Namespace Internal
             Dim leadingSpaces As Integer = 0
             If left Then
                 For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
-                    If Not Char.IsWhiteSpace(sc.Value(0)) Then Exit For
+                    If Not IsWhitespaceScalar(sc.CodePoint) Then Exit For
                     leadingSpaces += 1
                 Next
             End If
 
             Dim trailingSpaces As Integer = 0
             If right Then
-                Dim scalars As List(Of ScalarInfo) = Utf8Helpers.EnumerateScalars(_normalized).ToList()
-                For i As Integer = scalars.Count - 1 To 0 Step -1
-                    If Not Char.IsWhiteSpace(scalars(i).Value(0)) Then Exit For
-                    trailingSpaces += 1
+                Dim currentTrailing As Integer = 0
+                For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
+                    If IsWhitespaceScalar(sc.CodePoint) Then
+                        currentTrailing += 1
+                    Else
+                        currentTrailing = 0
+                    End If
                 Next
+                trailingSpaces = currentTrailing
             End If
 
             If leadingSpaces > 0 OrElse trailingSpaces > 0 Then
@@ -718,15 +999,20 @@ Namespace Internal
                     If i < leadingSpaces OrElse i >= count - trailingSpaces Then
                         ' Dropped char.
                     ElseIf i = Utf8Helpers.Utf8Length(_normalized) - trailingSpaces - 1 Then
-                        transformation.Add((sc.Value, -trailingSpaces))
+                        transformation.Add((Utf8Helpers.ScalarToString(sc.CodePoint), -trailingSpaces))
                     Else
-                        transformation.Add((sc.Value, 0))
+                        transformation.Add((Utf8Helpers.ScalarToString(sc.CodePoint), 0))
                     End If
                     i += 1
                 Next
                 Me.Transform(transformation, leadingSpaces)
             End If
             Return Me
+        End Function
+
+        ''' <summary>Whether the scalar is whitespace (a supplementary scalar is never whitespace).</summary>
+        Private Shared Function IsWhitespaceScalar(cp As Integer) As Boolean
+            Return cp < &H10000 AndAlso Char.IsWhiteSpace(ChrW(cp))
         End Function
 
         #End Region
@@ -786,14 +1072,21 @@ Namespace Internal
         ''' </summary>
         Public Function Split(pattern As Pattern, behavior As SplitDelimiterBehavior) As List(Of NormalizedString)
             Dim matches As List(Of MatchInfo) = pattern.FindMatches(_normalized)
+
+            ' Isolated (the pre-tokenizer hot path): every match becomes a piece and no
+            ' delimiter handling is applied, so slice directly from the matches list (pre-sized,
+            ' no intermediate SplitEntry list).
+            If behavior = SplitDelimiterBehavior.Isolated Then
+                Dim isolatedResult As New List(Of NormalizedString)(matches.Count)
+                For Each m In matches
+                    isolatedResult.Add(Me.Slice(New OffsetRange(False, m.Start, m.End)))
+                Next
+                Return isolatedResult
+            End If
+
             Dim splits As New List(Of SplitEntry)()
 
             Select Case behavior
-                Case SplitDelimiterBehavior.Isolated
-                    For Each m In matches
-                        splits.Add(New SplitEntry(m, False))
-                    Next
-
                 Case SplitDelimiterBehavior.Removed
                     For Each m In matches
                         splits.Add(New SplitEntry(m, m.IsMatch))
@@ -876,7 +1169,9 @@ Namespace Internal
         ''' corresponding (offset, length) range into the normalized string.
         ''' </summary>
         Public Function AlignmentsOriginal() As List(Of (Integer, Integer))
-            Dim result As New List(Of (Integer, Integer))()
+            ' Pre-size to the original byte length: the output has exactly one entry per original
+            ' byte, so the common case never pays List growth doubling.
+            Dim result As New List(Of (Integer, Integer))(Utf8Helpers.Utf8Length(_original))
             If _alignments.Count = 0 Then Return result
 
             ' Eventual gap before the first group.

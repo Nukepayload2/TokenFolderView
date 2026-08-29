@@ -22,16 +22,14 @@ Namespace TokenVisualizer.Core.Tests
         ''' <summary>
         ''' Builds the byte-level transform stream for the given string: each scalar is mapped to
         ''' its UTF-8 bytes and each byte is mapped through the GPT-2 byte-to-char table, with
-        ''' change 0 for the first byte and 1 for the following bytes.
+        ''' change 0 for the first byte and 1 for the following bytes. Produces a
+        ''' <c>(Char, Integer)</c> stream (zero per-char String allocation) so the tests exercise
+        ''' the Char-based <c>NormalizedString.Transform</c> overload used by the hot paths.
         ''' </summary>
-        Public Function ByteLevelTransform(s As String) As List(Of (String, Integer))
-            Dim result As New List(Of (String, Integer))()
+        Public Function ByteLevelTransform(s As String) As List(Of (Char, Integer))
+            Dim result As New List(Of (Char, Integer))(Utf8Helpers.Utf8Length(s))
             For Each sc In Utf8Helpers.EnumerateScalars(s)
-                Dim bytes As Byte() = Global.System.Text.Encoding.UTF8.GetBytes(sc.Value)
-                For i As Integer = 0 To bytes.Length - 1
-                    Dim ch As Char = BytesToUnicodeTable.GetBytesToChar()(bytes(i))
-                    result.Add((ch.ToString(), If(i = 0, 0, 1)))
-                Next
+                BytesToUnicodeTable.AppendByteTransform(result, sc.CodePoint)
             Next
             Return result
         End Function

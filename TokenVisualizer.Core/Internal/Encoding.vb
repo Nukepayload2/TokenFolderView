@@ -80,6 +80,20 @@ Namespace Internal
         ''' </summary>
         Public Shared Function FromTuples(items As IEnumerable(Of (Integer, String, (Integer, Integer), Integer?, Integer))) As Encoding
             Dim e As New Encoding()
+            ' Pre-size every parallel list to the source count so the hot EncodeCount path
+            ' (hundreds of thousands of tokens) never pays List growth doubling. The source is
+            ' virtually always a List, so the ICollection path is taken.
+            Dim count As Integer = 0
+            Dim collection As ICollection(Of (Integer, String, (Integer, Integer), Integer?, Integer)) =
+                TryCast(items, ICollection(Of (Integer, String, (Integer, Integer), Integer?, Integer)))
+            If collection IsNot Nothing Then count = collection.Count
+            e.Ids = New List(Of Integer)(count)
+            e.Tokens = New List(Of String)(count)
+            e.Offsets = New List(Of (Integer, Integer))(count)
+            e.TypeIds = New List(Of Integer)(count)
+            e.Words = New List(Of Integer?)(count)
+            e.SpecialTokensMask = New List(Of Integer)(count)
+            e.AttentionMask = New List(Of Integer)(count)
             For Each item In items
                 e.Ids.Add(item.Item1)
                 e.Tokens.Add(item.Item2)

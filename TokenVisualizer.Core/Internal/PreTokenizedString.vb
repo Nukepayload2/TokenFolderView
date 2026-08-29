@@ -211,10 +211,14 @@ Namespace Internal
             Next
 
             Dim offsetConverter As BytesToCharOffsetConverter = Nothing
+            Dim totalTokenCount As Integer = 0
+            For Each s As Split In Me.Splits
+                totalTokenCount += s.Tokens.Count
+            Next
             If offsetType = OffsetType.Char Then
                 offsetConverter = New BytesToCharOffsetConverter(Me.Original)
             ElseIf offsetType = OffsetType.None Then
-                Dim tuples As New List(Of (Integer, String, (Integer, Integer), Integer?, Integer))()
+                Dim tuples As New List(Of (Integer, String, (Integer, Integer), Integer?, Integer))(totalTokenCount)
                 For Each s In Me.Splits
                     For Each token In s.Tokens
                         tuples.Add((token.Id, "", (0, 0), Nothing, typeId))
@@ -223,7 +227,7 @@ Namespace Internal
                 Return Encoding.FromTuples(tuples)
             End If
 
-            Dim items As New List(Of (Integer, String, (Integer, Integer), Integer?, Integer))()
+            Dim items As New List(Of (Integer, String, (Integer, Integer), Integer?, Integer))(totalTokenCount)
             For idx As Integer = 0 To Me.Splits.Count - 1
                 Dim split As Split = Me.Splits(idx)
                 Dim normalized As NormalizedString = split.Normalized

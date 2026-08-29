@@ -2,6 +2,7 @@ Imports System.Collections.Generic
 Imports System.Linq
 Imports System.Text
 Imports System.Text.Json.Nodes
+Imports System.Threading
 Imports Tokenizers.Internal
 
 Namespace Models
@@ -21,7 +22,13 @@ Namespace Models
         Private ReadOnly _vocab As IReadOnlyDictionary(Of String, Integer)
         Private ReadOnly _vocabR As IReadOnlyDictionary(Of Integer, String)
         Private ReadOnly _merges As Dictionary(Of (Integer, Integer), (Integer, Integer))
-        Private ReadOnly _cache As Cache(Of String, List(Of (Integer, Integer)))
+        ''' <summary>
+        ''' Thread-local word→merged-symbols cache. Mirrors the Rust <c>thread_local!</c> cache
+        ''' semantics: each thread gets its own independent bounded FIFO cache, so concurrent
+        ''' <c>EncodeCount</c> callers (e.g. the scanner's <c>Parallel.ForEach</c>) never contend on
+        ''' shared mutable state. <c>Nothing</c> when the cache is disabled (capacity &lt;= 0).
+        ''' </summary>
+        Private ReadOnly _cache As ThreadLocal(Of Cache(Of String, List(Of (Integer, Integer))))
         Private ReadOnly _dropout As Double?
         Private ReadOnly _unkToken As String
         Private ReadOnly _continuingSubwordPrefix As String
@@ -30,6 +37,19 @@ Namespace Models
         Private ReadOnly _byteFallback As Boolean
         Private ReadOnly _ignoreMerges As Boolean
         Private ReadOnly _random As Func(Of Double)
+        ''' <summary>
+        ''' Pre-built "<c>0xNN</c>" byte-token strings for byte-fallback, indexed by byte value.
+        ''' Only built when byte-fallback is enabled; read-only after construction, so it is safe
+        ''' to share across concurrent readers.
+        ''' </summary>
+        Private ReadOnly _byteTokenStrings As String()
+        ''' <summary>
+        ''' Code point → id map for vocab keys that are exactly one Unicode scalar. Lets
+        ''' <c>BuildSymbols</c> resolve a scalar to its token id without allocating a per-scalar
+        ''' <see cref="String"/> for the dictionary lookup (only valid when no subword
+        ''' prefix/suffix is applied to that scalar). Read-only after construction.
+        ''' </summary>
+        Private ReadOnly _singleCharVocab As Dictionary(Of Integer, Integer)
 
         ''' <summary>
         ''' A single linked-list node used by <see cref="MergeAllSymbols"/>. Mirrors the
@@ -121,6 +141,16 @@ Namespace Models
             _dropout = dropout
             _ignoreMerges = ignoreMerges
 
+            If byteFallback Then
+                Dim byteTokens As String() = New String(255) {}
+                For b As Integer = 0 To 255
+                    byteTokens(b) = $"<0x{b:X2}>"
+                Next
+                _byteTokenStrings = byteTokens
+            Else
+                _byteTokenStrings = Nothing
+            End If
+
             _vocab = New Dictionary(Of String, Integer)(vocab)
 
             Dim vocabR As New Dictionary(Of Integer, String)()
@@ -128,6 +158,17 @@ Namespace Models
                 vocabR(kvp.Value) = kvp.Key
             Next
             _vocabR = vocabR
+
+            ' Single-scalar vocab keys, indexed by code point, so BuildSymbols can resolve a
+            ' scalar without allocating a per-scalar String (hot BPE path).
+            Dim singleChar As New Dictionary(Of Integer, Integer)()
+            For Each kvp As KeyValuePair(Of String, Integer) In _vocab
+                Dim k As String = kvp.Key
+                If k IsNot Nothing AndAlso Utf8Helpers.ScalarCount(k) = 1 Then
+                    singleChar(UnicodePredicates.ScalarCodePoint(k, 0)) = kvp.Value
+                End If
+            Next
+            _singleCharVocab = singleChar
 
             Dim prefixLen As Integer = If(_continuingSubwordPrefix Is Nothing, 0, _continuingSubwordPrefix.Length)
 
@@ -159,7 +200,10 @@ Namespace Models
             If cacheCapacity <= 0 Then
                 _cache = Nothing
             Else
-                _cache = New Cache(Of String, List(Of (Integer, Integer)))(cacheCapacity)
+                ' One bounded FIFO cache per thread, created lazily on first access. Capacity and
+                ' eviction are kept per-thread, matching the Rust thread-local cache.
+                _cache = New ThreadLocal(Of Cache(Of String, List(Of (Integer, Integer))))(
+                    Function() New Cache(Of String, List(Of (Integer, Integer)))(cacheCapacity))
             End If
         End Sub
 
@@ -282,7 +326,8 @@ Namespace Models
 
             Dim useCache As Boolean = (_cache IsNot Nothing) AndAlso (Not _dropout.HasValue OrElse _dropout.Value = 0.0)
             If useCache Then
-                Dim cached As List(Of (Integer, Integer)) = _cache.GetValue(word)
+                Dim cache As Cache(Of String, List(Of (Integer, Integer))) = _cache.Value
+                Dim cached As List(Of (Integer, Integer)) = cache.GetValue(word)
                 If cached IsNot Nothing Then
                     symbols = cached
                 End If
@@ -291,7 +336,7 @@ Namespace Models
             If symbols Is Nothing Then
                 symbols = MergeWord(word)
                 If useCache Then
-                    _cache.Insert(word, symbols)
+                    _cache.Value.Insert(word, symbols)
                 End If
             End If
 
@@ -318,27 +363,44 @@ Namespace Models
             Dim symbols As List(Of (Integer, Integer)) = If(scratch Is Nothing, New List(Of (Integer, Integer))(), scratch)
             symbols.Clear()
 
-            Dim scalars As List(Of ScalarInfo) = New List(Of ScalarInfo)(Utf8Helpers.EnumerateScalars(word))
             Dim unk As (Integer, Integer)? = Nothing
 
-            For i As Integer = 0 To scalars.Count - 1
-                Dim sc As ScalarInfo = scalars(i)
-                Dim isFirst As Boolean = (i = 0)
-                Dim isLast As Boolean = (i = scalars.Count - 1)
+            ' Iterate the word's scalars by .NET index (each word is small, so computing the
+            ' scalar count up front is cheap). No List(Of ScalarInfo) is materialized.
+            Dim net As Integer = 0
+            Dim scalarIdx As Integer = 0
+            Dim totalScalars As Integer = Utf8Helpers.ScalarCount(word)
+            While net < word.Length
+                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(word, net)
+                Dim isFirst As Boolean = (scalarIdx = 0)
+                Dim isLast As Boolean = (scalarIdx = totalScalars - 1)
 
-                Dim rawChar As String = sc.Value
-                Dim byteLen As Integer = sc.Utf8Len
+                Dim byteLen As Integer = Utf8Helpers.Utf8LengthOfCodePoint(cp)
 
-                Dim s As String = rawChar
-                If Not isFirst AndAlso _continuingSubwordPrefix IsNot Nothing Then
-                    s = _continuingSubwordPrefix & s
-                End If
-                If isLast AndAlso _endOfWordSuffix IsNot Nothing Then
-                    s = s & _endOfWordSuffix
-                End If
-
+                ' Fast path: when no subword prefix/suffix is applied to this scalar, resolve it
+                ' through the code-point map so no per-scalar String is allocated.
                 Dim id As Integer
-                If _vocab.TryGetValue(s, id) Then
+                Dim matched As Boolean = False
+                If (_continuingSubwordPrefix Is Nothing OrElse isFirst) AndAlso
+                   (_endOfWordSuffix Is Nothing OrElse isLast) AndAlso
+                   _singleCharVocab.TryGetValue(cp, id) Then
+                    matched = True
+                End If
+
+                Dim rawChar As String = Nothing
+                If Not matched Then
+                    rawChar = Utf8Helpers.ScalarToString(cp)
+                    Dim s As String = rawChar
+                    If Not isFirst AndAlso _continuingSubwordPrefix IsNot Nothing Then
+                        s = _continuingSubwordPrefix & s
+                    End If
+                    If isLast AndAlso _endOfWordSuffix IsNot Nothing Then
+                        s = s & _endOfWordSuffix
+                    End If
+                    matched = _vocab.TryGetValue(s, id)
+                End If
+
+                If matched Then
                     If unk.HasValue Then
                         symbols.Add(unk.Value)
                         unk = Nothing
@@ -352,16 +414,18 @@ Namespace Models
                         Dim bytes As Byte() = Global.System.Text.Encoding.UTF8.GetBytes(rawChar)
                         Dim allPresent As Boolean = True
                         For Each b As Byte In bytes
-                            If Not _vocab.ContainsKey(String.Format("<0x{0:X2}>", b)) Then
+                            If Not _vocab.ContainsKey(_byteTokenStrings(b)) Then
                                 allPresent = False
                                 Exit For
                             End If
                         Next
                         If allPresent Then
                             For Each b As Byte In bytes
-                                symbols.Add((_vocab(String.Format("<0x{0:X2}>", b)), 1))
+                                symbols.Add((_vocab(_byteTokenStrings(b)), 1))
                             Next
-                            Continue For
+                            net += Utf8Helpers.NetLengthOfCodePoint(cp)
+                            scalarIdx += 1
+                            Continue While
                         End If
                     End If
 
@@ -387,7 +451,9 @@ Namespace Models
                     ' NOTE: when there is no unk token and no byteFallback match, the char is
                     ' silently omitted (Rust behavior).
                 End If
-            Next
+                net += Utf8Helpers.NetLengthOfCodePoint(cp)
+                scalarIdx += 1
+            End While
 
             If unk.HasValue Then
                 symbols.Add(unk.Value)

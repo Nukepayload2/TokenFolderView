@@ -2,6 +2,7 @@ Imports System.Collections.Generic
 Imports System.Linq
 Imports System.Text
 Imports System.Text.Json.Nodes
+Imports System.Threading
 Imports Tokenizers.Internal
 
 Namespace Models
@@ -23,7 +24,13 @@ Namespace Models
         Private ReadOnly _vocab As List(Of (String, Double))
         Private ReadOnly _tokenToIds As Dictionary(Of String, Integer)
         Private ReadOnly _trie As Trie(Of Byte)
-        Private ReadOnly _cache As Cache(Of String, List(Of String))
+        ''' <summary>
+        ''' Thread-local sentence→pieces cache. Mirrors the Rust <c>thread_local!</c> cache: each
+        ''' thread has an independent bounded FIFO cache, so concurrent <c>EncodeCount</c> callers
+        ''' never contend. <c>trackAllValues</c> is enabled so <see cref="ClearCache"/> /
+        ''' <see cref="FuseUnk"/> can clear every thread's cache.
+        ''' </summary>
+        Private ReadOnly _cache As ThreadLocal(Of Cache(Of String, List(Of String)))
         Private ReadOnly _random As Func(Of Double)
 
         Private _fuseUnk As Boolean
@@ -79,7 +86,9 @@ Namespace Models
             _isOptimized = True
             _alpha = Nothing
             _nbestSize = Nothing
-            _cache = New Cache(Of String, List(Of String))()
+            _cache = New ThreadLocal(Of Cache(Of String, List(Of String)))(
+                Function() New Cache(Of String, List(Of String))(),
+                trackAllValues:=True)
 
             _tokenToIds = New Dictionary(Of String, Integer)()
             _trie = New Trie(Of Byte)()
@@ -145,7 +154,7 @@ Namespace Models
             End Get
             Set(value As Boolean)
                 _fuseUnk = value
-                _cache.Clear()
+                ClearAllThreadCaches()
             End Set
         End Property
 
@@ -184,7 +193,18 @@ Namespace Models
 
         ''' <summary>Clears the internal encode cache.</summary>
         Public Sub ClearCache()
-            _cache.Clear()
+            ClearAllThreadCaches()
+        End Sub
+
+        ''' <summary>
+        ''' Clears every thread's cache. Threads that have not yet accessed the cache have no
+        ''' instance (a fresh empty cache is created on their first access), so clearing the
+        ''' tracked values covers all live caches.
+        ''' </summary>
+        Private Sub ClearAllThreadCaches()
+            For Each c As Cache(Of String, List(Of String)) In _cache.Values
+                c.Clear()
+            Next
         End Sub
 
         ''' <summary>Returns a copy of the token→id map.</summary>
@@ -234,7 +254,8 @@ Namespace Models
         Public Function Encode(sentence As String) As List(Of String)
             If String.IsNullOrEmpty(sentence) Then Return New List(Of String)()
             If (Not _alpha.HasValue) OrElse _alpha.Value = 0.0 Then
-                Dim cached As List(Of String) = _cache.GetValue(sentence)
+                Dim cache As Cache(Of String, List(Of String)) = _cache.Value
+                Dim cached As List(Of String) = cache.GetValue(sentence)
                 If cached IsNot Nothing Then Return New List(Of String)(cached)
                 Dim result As List(Of String)
                 If _isOptimized Then
@@ -243,7 +264,7 @@ Namespace Models
                     result = EncodeUnoptimized(sentence)
                 End If
                 If Utf8Helpers.Utf8Length(sentence) < MaxCacheLength Then
-                    _cache.Insert(sentence, New List(Of String)(result))
+                    cache.Insert(sentence, New List(Of String)(result))
                 End If
                 Return result
             Else

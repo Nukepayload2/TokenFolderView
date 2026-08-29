@@ -38,7 +38,7 @@ Namespace Internal
                 Dim b As Integer = sc.Utf8Start
                 Dim e As Integer = sc.Utf8Start + sc.Utf8Len
                 lastSeen = e
-                If _predicate(ScalarToRune(inside, sc.NetStart)) Then
+                If _predicate(ScalarToRune(sc.CodePoint)) Then
                     If lastOffset < b Then
                         result.Add(New MatchInfo(lastOffset, b, False))
                     End If
@@ -52,9 +52,8 @@ Namespace Internal
             Return result
         End Function
 
-        ''' <summary>Builds a <see cref="Rune"/> for the scalar at the given .NET index, guarding lone surrogates.</summary>
-        Private Shared Function ScalarToRune(text As String, netStart As Integer) As Rune
-            Dim cp As Integer = UnicodePredicates.ScalarCodePoint(text, netStart)
+        ''' <summary>Builds a <see cref="Rune"/> for a code point, guarding lone surrogates.</summary>
+        Private Shared Function ScalarToRune(cp As Integer) As Rune
             If cp >= &HD800 AndAlso cp <= &HDFFF Then Return Rune.ReplacementChar
             Return New Rune(cp)
         End Function

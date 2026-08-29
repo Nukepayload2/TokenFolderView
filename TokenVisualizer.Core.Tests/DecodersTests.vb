@@ -111,7 +111,7 @@ Namespace TokenVisualizer.Core.Tests
             Dim sample As String = "A Nuskhuri abbreviation of იესუ ქრისტე ( iesu kriste ) "" Jesus Christ """
             Dim separated As New List(Of String)()
             For Each p In TestHelpers.ByteLevelTransform(sample)
-                separated.Add(p.Item1)
+                separated.Add(p.Item1.ToString())
             Next
             Dim decoder As IDecoder = New ByteLevelDecoder()
             Assert.AreEqual(sample, decoder.Decode(separated))
