@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="TokenVisualizer/TokenVisualizer.vbproj" />
+  <Project Path="TokenVisualizer.Core/TokenVisualizer.Core.vbproj" />
+  <Project Path="TokenVisualizer.Core.Tests/TokenVisualizer.Core.Tests.vbproj" />
+</Solution>

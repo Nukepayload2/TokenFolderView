@@ -1,0 +1,392 @@
+Imports System.Buffers
+Imports System.IO
+Imports System.Text
+Imports System.Threading
+Imports System.Threading.Tasks
+Imports Avalonia
+Imports Avalonia.Controls
+Imports Avalonia.Controls.Documents
+Imports Avalonia.Platform.Storage
+Imports Avalonia.Threading
+Imports Tokenizers
+Imports Tokenizers.Scanning
+Imports TokenVisualizer.Controls
+Imports TokenVisualizer.Services
+
+Namespace Views
+
+    Partial Class ExplorerPage
+        Inherits UserControl
+
+        ' Generation counter guards the async file-view load: a click on file B invalidates any
+        ' in-flight load started for file A.
+        Private _loadGeneration As Integer
+
+        Private _currentQuery As String = ""
+
+        Public Sub New()
+            InitializeComponent()
+            TxtActiveTokenizer.Text = "正在加载…"
+        End Sub
+
+        ' ------------------------------------------------------------------
+        ' Lifetime / tokenizer bootstrap
+        ' ------------------------------------------------------------------
+
+        Private Async Sub ExplorerPage_Loaded() Handles Me.Loaded
+            Await Task.Run(Sub() AppState.EnsureActiveTokenizer())
+            UpdateTokenizerLabel()
+            RefreshStatus()
+        End Sub
+
+        Private Sub UpdateTokenizerLabel()
+            Dim state = AppState.Current
+            If state.ActiveTokenizer IsNot Nothing Then
+                TxtActiveTokenizer.Text = state.ActiveTokenizerName
+            Else
+                TxtActiveTokenizer.Text = "未找到 tokenizer.json"
+            End If
+        End Sub
+
+        ' ------------------------------------------------------------------
+        ' Public API used by MainWindow
+        ' ------------------------------------------------------------------
+
+        ''' <summary>
+        ''' Filters the visible tree to nodes whose name matches the query (case-insensitive),
+        ''' preserving hierarchy. A directory that matches by name keeps its whole subtree; a
+        ''' directory that only contains matches is wrapped with just those descendants.
+        ''' </summary>
+        Public Sub ApplySearchFilter(query As String)
+            _currentQuery = If(query, "").Trim()
+            Dim root = AppState.Current.RootNode
+            If root Is Nothing Then Return
+
+            If String.IsNullOrEmpty(_currentQuery) Then
+                FileTree.ItemsSource = {root}
+                Return
+            End If
+
+            Dim filtered = FilterNode(root, _currentQuery)
+            If filtered Is Nothing Then
+                FileTree.ItemsSource = Nothing
+            Else
+                FileTree.ItemsSource = {filtered}
+            End If
+        End Sub
+
+        ''' <summary>Refreshes the root-count label and the scan state UI.</summary>
+        Public Sub RefreshStatus()
+            Dim root = AppState.Current.RootNode
+            If root IsNot Nothing Then
+                TblRootCount.Text = $"{root.FileCount:N0} 个文件 · {root.TokenCount:N0} tokens"
+            Else
+                TblRootCount.Text = ""
+            End If
+            UpdateScanUi()
+        End Sub
+
+        Private Sub UpdateScanUi()
+            Dim scanning = AppState.Current.IsScanning
+            BtnCancelScan.IsVisible = scanning
+            BtnOpenFolder.IsEnabled = Not scanning
+            BtnRescan.IsEnabled = (Not scanning) AndAlso Not String.IsNullOrEmpty(AppState.Current.CurrentScanPath)
+        End Sub
+
+        ' ------------------------------------------------------------------
+        ' Open / rescan / cancel
+        ' ------------------------------------------------------------------
+
+        Private Async Sub BtnOpenFolder_Click() Handles BtnOpenFolder.Click
+            AppState.EnsureActiveTokenizer()
+            If AppState.Current.ActiveTokenizer Is Nothing Then
+                UpdateTokenizerLabel()
+                Return
+            End If
+
+            Dim tl = TopLevel.GetTopLevel(Me)
+            If tl Is Nothing Then Return
+
+            Dim folders = Await tl.StorageProvider.OpenFolderPickerAsync(
+                New FolderPickerOpenOptions With {
+                    .Title = "选择要扫描的文件夹",
+                    .AllowMultiple = False
+                })
+            If folders.Count < 1 Then Return
+
+            Dim path = folders(0).Path.LocalPath
+            If String.IsNullOrEmpty(path) Then Return
+
+            AppState.Current.CurrentScanPath = path
+            Await StartScanAsync(path)
+        End Sub
+
+        Private Async Sub BtnRescan_Click() Handles BtnRescan.Click
+            Dim path = AppState.Current.CurrentScanPath
+            If String.IsNullOrEmpty(path) Then Return
+            AppState.EnsureActiveTokenizer()
+            If AppState.Current.ActiveTokenizer Is Nothing Then
+                UpdateTokenizerLabel()
+                Return
+            End If
+            Await StartScanAsync(path)
+        End Sub
+
+        Private Sub BtnCancelScan_Click() Handles BtnCancelScan.Click
+            Dim scan = AppState.Current.ActiveScan
+            If scan IsNot Nothing Then
+                Try
+                    scan.ScanProgress.Cancellation.Cancel()
+                Catch
+                End Try
+            End If
+        End Sub
+
+        ' ------------------------------------------------------------------
+        ' Scan pipeline
+        ' ------------------------------------------------------------------
+
+        Private Async Function StartScanAsync(path As String) As Task
+            Dim tokenizer = AppState.Current.ActiveTokenizer
+            If tokenizer Is Nothing Then Return
+
+            ' Cancel any previous scan.
+            If AppState.Current.ActiveScan IsNot Nothing Then
+                Try
+                    AppState.Current.ActiveScan.ScanProgress.Cancellation.Cancel()
+                Catch
+                End Try
+            End If
+
+            Dim scanner As New FolderScanner(tokenizer, New ScanOptions())
+            AppState.Current.ActiveScan = scanner
+            AppState.Current.RootNode = Nothing
+            AppState.Current.IsScanning = True
+            AppState.Current.CurrentScanPath = path
+
+            FileTree.ItemsSource = Nothing
+            ClearContentView()
+            RefreshStatus()
+
+            Dim ct = scanner.ScanProgress.Cancellation.Token
+            Try
+                ' Enumeration in ScanAsync runs synchronously before its first Await, so run the
+                ' whole thing on the thread pool to keep the UI responsive.
+                Dim root = Await Task.Run(Function() scanner.ScanAsync(path, ct), ct)
+
+                AppState.Current.RootNode = root
+                ApplySearchFilter(_currentQuery)
+                ExpandAllNodes()
+            Catch ex As OperationCanceledException
+                AppState.Current.RootNode = Nothing
+                FileTree.ItemsSource = Nothing
+            Catch ex As Exception
+                AppState.Current.RootNode = Nothing
+                FileTree.ItemsSource = Nothing
+                TblRootCount.Text = ""
+                TxtActiveTokenizer.Text = $"扫描失败：{ex.Message}"
+            Finally
+                AppState.Current.IsScanning = False
+                RefreshStatus()
+            End Try
+        End Function
+
+        Private Sub ExpandAllNodes()
+            Dispatcher.UIThread.Post(Sub() ExpandContainers(FileTree), DispatcherPriority.Loaded)
+        End Sub
+
+        Private Sub ExpandContainers(tree As TreeView)
+            For i As Integer = 0 To tree.ItemCount - 1
+                Dim c = TryCast(tree.ContainerFromIndex(i), TreeViewItem)
+                If c IsNot Nothing Then
+                    c.IsExpanded = True
+                    ExpandChildren(c)
+                End If
+            Next
+        End Sub
+
+        Private Sub ExpandChildren(item As TreeViewItem)
+            For i As Integer = 0 To item.ItemCount - 1
+                Dim c = TryCast(item.ContainerFromIndex(i), TreeViewItem)
+                If c IsNot Nothing Then
+                    c.IsExpanded = True
+                    ExpandChildren(c)
+                End If
+            Next
+        End Sub
+
+        ' ------------------------------------------------------------------
+        ' File selection + colored token view
+        ' ------------------------------------------------------------------
+
+        Private Sub FileTree_SelectionChanged(sender As Object, e As SelectionChangedEventArgs) Handles FileTree.SelectionChanged
+            Dim node = TryCast(FileTree.SelectedItem, ScanTreeNode)
+            If node Is Nothing OrElse node.IsDirectory Then
+                ClearContentView()
+                Return
+            End If
+            LoadFileAsync(node)
+        End Sub
+
+        Private Sub ClearContentView()
+            Interlocked.Increment(_loadGeneration)
+            TokenText.Inlines.Clear()
+            TblFileName.Text = ""
+            TblFileMeta.Text = ""
+            TblEmpty.IsVisible = True
+        End Sub
+
+        Private Async Sub LoadFileAsync(node As ScanTreeNode)
+            Dim gen = Interlocked.Increment(_loadGeneration)
+            Dim tokenizer = AppState.Current.ActiveTokenizer
+            If tokenizer Is Nothing Then Return
+
+            TblFileName.Text = node.Name
+            TblFileMeta.Text = "加载中…"
+            TblEmpty.IsVisible = True
+            TokenText.Inlines.Clear()
+            TokenScroll.Offset = New Vector(0, 0)
+
+            Try
+                Dim result = Await Task.Run(Function() BuildRuns(node.FullPath, tokenizer))
+                If gen <> _loadGeneration Then Return ' stale load, superseded by a newer selection
+
+                TblFileName.Text = result.fileName
+                TblFileMeta.Text = $"{FormatBytes(result.byteLength)} · {result.charCount:N0} 字符 · {result.tokenCount:N0} tokens"
+                TokenizedTextView.Populate(TokenText, result.runs)
+                TblEmpty.IsVisible = False
+            Catch ex As OperationCanceledException
+            Catch ex As Exception
+                If gen <> _loadGeneration Then Return
+                TblFileMeta.Text = ""
+                TokenText.Inlines.Clear()
+                TokenText.Inlines.Add(New Run With {.Text = $"无法读取文件：{ex.Message}"})
+                TblEmpty.IsVisible = False
+            End Try
+        End Sub
+
+        ''' <summary>Heavy work for the colored view, run off the UI thread.</summary>
+        Private Shared Function BuildRuns(fullPath As String,
+                                          tokenizer As Tokenizer) As (fileName As String, byteLength As Long, charCount As Integer, tokenCount As Integer, runs As List(Of (Text As String, Accent As Boolean)))
+            Dim fileName = Path.GetFileName(fullPath)
+            Dim fi As New FileInfo(fullPath)
+            Dim length = fi.Length
+            If length > Integer.MaxValue Then
+                Throw New IOException("文件过大，无法在视图中显示。")
+            End If
+
+            Dim buffer As Byte() = ArrayPool(Of Byte).Shared.Rent(CInt(length))
+            Try
+                Dim bytesRead = ReadFilePrefix(fullPath, buffer, CInt(length))
+
+                ' Strict UTF-8 first; fall back to a lenient decode for files with odd bytes.
+                Dim text As String
+                Try
+                    text = New UTF8Encoding(False, True).GetString(buffer, 0, bytesRead)
+                Catch ex As DecoderFallbackException
+                    text = Encoding.UTF8.GetString(buffer, 0, bytesRead)
+                End Try
+
+                Dim spans = tokenizer.EncodeWithSpans(text)
+                Dim runs As New List(Of (Text As String, Accent As Boolean))()
+                BuildRunsCore(text, spans, runs)
+                Return (fileName, length, text.Length, spans.Count, runs)
+            Finally
+                ArrayPool(Of Byte).Shared.Return(buffer)
+            End Try
+        End Function
+
+        ''' <summary>
+        ''' Walks the token spans and emits (text, accent) runs covering the whole string. Gaps
+        ''' between token spans (normalization drops etc.) are emitted as normal runs; even-indexed
+        ''' tokens are normal and odd-indexed tokens are accented.
+        ''' </summary>
+        Private Shared Sub BuildRunsCore(text As String,
+                                         spans As IReadOnlyList(Of (Integer, Integer, Integer)),
+                                         runs As List(Of (Text As String, Accent As Boolean)))
+            Dim pos As Integer = 0
+            Dim idx As Integer = 0
+            For Each span In spans
+                Dim s = span.Item2
+                Dim e = span.Item3
+                If s < pos Then s = pos
+                If e < pos Then e = pos
+                If e <= pos Then Continue For
+
+                If s > pos Then
+                    AddRun(runs, text.Substring(pos, s - pos), False)
+                    pos = s
+                End If
+                AddRun(runs, text.Substring(s, e - s), (idx Mod 2 = 1))
+                pos = e
+                idx += 1
+            Next
+            If pos < text.Length Then
+                AddRun(runs, text.Substring(pos), False)
+            End If
+        End Sub
+
+        Private Shared Sub AddRun(runs As List(Of (Text As String, Accent As Boolean)), text As String, accent As Boolean)
+            If String.IsNullOrEmpty(text) Then Return
+            If runs.Count > 0 AndAlso runs(runs.Count - 1).Accent = accent Then
+                runs(runs.Count - 1) = (runs(runs.Count - 1).Text & text, accent)
+            Else
+                runs.Add((text, accent))
+            End If
+        End Sub
+
+        Private Shared Function ReadFilePrefix(path As String, buffer As Byte(), desiredBytes As Integer) As Integer
+            If desiredBytes = 0 Then Return 0
+            Using fs As New FileStream(path, FileMode.Open, FileAccess.Read,
+                                       FileShare.ReadWrite Or FileShare.Delete, 4096, FileOptions.SequentialScan)
+                Dim offset As Integer = 0
+                While offset < desiredBytes
+                    Dim read = fs.Read(buffer, offset, desiredBytes - offset)
+                    If read <= 0 Then Exit While
+                    offset += read
+                End While
+                Return offset
+            End Using
+        End Function
+
+        ' ------------------------------------------------------------------
+        ' Search filtering
+        ' ------------------------------------------------------------------
+
+        Private Shared Function FilterNode(node As ScanTreeNode, query As String) As ScanTreeNode
+            Dim matches = node.Name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
+
+            If Not node.IsDirectory Then
+                Return If(matches, node, Nothing)
+            End If
+
+            ' A directory that matches by name keeps its whole subtree.
+            If matches Then Return node
+
+            Dim kids As New List(Of ScanTreeNode)()
+            For Each child In node.Children
+                Dim f = FilterNode(child, query)
+                If f IsNot Nothing Then kids.Add(f)
+            Next
+            If kids.Count = 0 Then Return Nothing
+
+            Dim result As New ScanTreeNode(node.Name, node.FullPath, True) With {
+                .TokenCount = node.TokenCount,
+                .FileCount = node.FileCount,
+                .FileSize = node.FileSize
+            }
+            For Each k In kids
+                result.Children.Add(k)
+            Next
+            Return result
+        End Function
+
+        Private Shared Function FormatBytes(bytes As Long) As String
+            If bytes < 1024 Then Return $"{bytes} B"
+            If bytes < 1024 * 1024 Then Return $"{bytes / 1024.0:N1} KB"
+            If bytes < 1024L * 1024 * 1024 Then Return $"{bytes / (1024.0 * 1024.0):N1} MB"
+            Return $"{bytes / (1024.0 * 1024.0 * 1024.0):N1} GB"
+        End Function
+
+    End Class
+End Namespace

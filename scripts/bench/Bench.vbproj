@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    DEV-ONLY benchmark console. NOT part of TokenVisualizer.slnx (so the main
+    build/test pipeline is unaffected). It only exists to measure the Core
+    tokenizer's EncodeCount throughput against the Python `tokenizers` reference
+    via scripts/bench.ps1.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Bench</RootNamespace>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\TokenVisualizer.Core\TokenVisualizer.Core.vbproj" />
+  </ItemGroup>
+
+</Project>

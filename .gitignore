@@ -1,0 +1,45 @@
+# Visual Studio user-specific files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Bb]uild/
+bld/
+[Oo]bj/
+[Ll]og/
+
+# Test results and coverage
+[Tt]est[Rr]esult*/
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# NuGet packages and generated files
+*.nupkg
+*.snupkg
+packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Generated code and local caches
+Generated Files/
+*.cache
+*.tmp
+
+# Visual Studio Code (local workspace state)
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
