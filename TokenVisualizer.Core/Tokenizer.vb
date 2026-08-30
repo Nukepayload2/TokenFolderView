@@ -461,8 +461,15 @@ Imports Tokenizers.Serialization
         #Region "Serialization"
         ' ------------------------------------------------------------------
 
-        ''' <summary>Loads a tokenizer from a tokenizer.json string.</summary>
-        Public Shared Function FromJson(json As String) As Tokenizer
+        ''' <summary>
+        ''' Loads a tokenizer from a tokenizer.json string.
+        ''' <paramref name="cacheCapacity"/> / <paramref name="cacheMaxWord"/> are optional BPE word-cache
+        ''' overrides (see <see cref="Models.BpeModel"/>) used by the dev benchmark; <c>Nothing</c> keeps
+        ''' the model defaults.
+        ''' </summary>
+        Public Shared Function FromJson(json As String,
+                                        Optional cacheCapacity As Integer? = Nothing,
+                                        Optional cacheMaxWord As Integer? = Nothing) As Tokenizer
             Dim node As JsonNode = JsonNode.Parse(json)
             If node Is Nothing OrElse TypeOf node IsNot JsonObject Then
                 Throw New ArgumentException("Invalid tokenizer JSON")
@@ -475,7 +482,7 @@ Imports Tokenizers.Serialization
             End If
 
             Dim modelNode As JsonNode = SerializationHelpers.GetNode(obj, "model")
-            Dim model As Object = ComponentFactory.FromModel(modelNode)
+            Dim model As Object = ComponentFactory.FromModel(modelNode, cacheCapacity, cacheMaxWord)
             If model Is Nothing Then
                 Throw New ArgumentException("Model missing.")
             End If
@@ -513,14 +520,18 @@ Imports Tokenizers.Serialization
         End Function
 
         ''' <summary>Loads a tokenizer from a tokenizer.json file.</summary>
-        Public Shared Function FromFile(path As String) As Tokenizer
+        Public Shared Function FromFile(path As String,
+                                        Optional cacheCapacity As Integer? = Nothing,
+                                        Optional cacheMaxWord As Integer? = Nothing) As Tokenizer
             Dim json As String = File.ReadAllText(path)
-            Return FromJson(json)
+            Return FromJson(json, cacheCapacity, cacheMaxWord)
         End Function
 
         ''' <summary>Alias for <see cref="FromFile"/>.</summary>
-        Public Shared Function Load(path As String) As Tokenizer
-            Return FromFile(path)
+        Public Shared Function Load(path As String,
+                                    Optional cacheCapacity As Integer? = Nothing,
+                                    Optional cacheMaxWord As Integer? = Nothing) As Tokenizer
+            Return FromFile(path, cacheCapacity, cacheMaxWord)
         End Function
 
         ''' <summary>Serializes this tokenizer to a tokenizer.json string.</summary>

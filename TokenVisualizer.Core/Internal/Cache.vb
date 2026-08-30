@@ -3,24 +3,47 @@ Imports System.Collections.Generic
 Namespace Internal
 
     ''' <summary>
+    ''' A snapshot of a cache's hit / miss / skip / eviction counters. The counters are only
+    ''' meaningful when the cache has stats enabled (see <see cref="Cache(Of TKey, TValue).EnableStats"/>);
+    ''' when disabled they remain zero so the GetValue/Insert hot paths carry no measurable
+    ''' overhead.
+    ''' </summary>
+    Public Structure CacheStats
+        Public Hits As Integer
+        Public Misses As Integer
+        Public Skips As Integer
+        Public Evictions As Integer
+    End Structure
+
+    ''' <summary>
     ''' A simple bounded cache with insert-order (FIFO) eviction, used by the Unigram and BPE
     ''' models. The default capacity mirrors the Rust <c>DEFAULT_CACHE_CAPACITY</c> (10 000).
     '''
     ''' NOTE: the current on-disk Rust <c>utils/cache.rs</c> implements a HashMap-based cache that
     ''' silently drops inserts once at capacity. This port follows the task specification instead:
     ''' FIFO eviction of the oldest entry when at capacity.
+    '''
+    ''' The internal <see cref="Dictionary(Of TKey, TValue)"/> and <see cref="Queue(Of TKey)"/> are
+    ''' pre-allocated to the requested capacity (legal for 0) so a bounded cache grows in one shot
+    ''' instead of re-hashing from zero as it fills.
     ''' </summary>
     Public NotInheritable Class Cache(Of TKey, TValue)
 
         Private ReadOnly _capacity As Integer
         Private ReadOnly _map As Dictionary(Of TKey, TValue)
         Private ReadOnly _order As Queue(Of TKey)
+        Private _statsEnabled As Boolean
+        Private _hits As Integer
+        Private _misses As Integer
+        Private _skips As Integer
+        Private _evictions As Integer
 
-        Public Sub New(Optional capacity As Integer = 10000)
+        Public Sub New(Optional capacity As Integer = 10000, Optional enableStats As Boolean = False)
             If capacity < 0 Then capacity = 0
             _capacity = capacity
-            _map = New Dictionary(Of TKey, TValue)()
-            _order = New Queue(Of TKey)()
+            _map = New Dictionary(Of TKey, TValue)(capacity)
+            _order = New Queue(Of TKey)(capacity)
+            _statsEnabled = enableStats
         End Sub
 
         Public ReadOnly Property Capacity As Integer
@@ -35,10 +58,44 @@ Namespace Internal
             End Get
         End Property
 
+        ''' <summary>Whether the cache is counting hits/misses/skips/evictions. Off by default.</summary>
+        Public ReadOnly Property StatsEnabled As Boolean
+            Get
+                Return _statsEnabled
+            End Get
+        End Property
+
+        ''' <summary>Turns on the statistics counters. Never changes cache behavior.</summary>
+        Public Sub EnableStats()
+            _statsEnabled = True
+        End Sub
+
+        ''' <summary>Zeros all statistics counters.</summary>
+        Public Sub ResetStats()
+            _hits = 0
+            _misses = 0
+            _skips = 0
+            _evictions = 0
+        End Sub
+
+        ''' <summary>Returns a snapshot of the statistics counters.</summary>
+        Public Function GetStats() As CacheStats
+            Dim s As New CacheStats()
+            s.Hits = _hits
+            s.Misses = _misses
+            s.Skips = _skips
+            s.Evictions = _evictions
+            Return s
+        End Function
+
         ''' <summary>Returns the cached value for <paramref name="key"/>, or <c>Nothing</c>/default if absent.</summary>
         Public Function GetValue(key As TKey) As TValue
             Dim v As TValue
-            If _map.TryGetValue(key, v) Then Return v
+            If _map.TryGetValue(key, v) Then
+                If _statsEnabled Then _hits += 1
+                Return v
+            End If
+            If _statsEnabled Then _misses += 1
             Return Nothing
         End Function
 
@@ -53,11 +110,23 @@ Namespace Internal
         ''' </summary>
         Public Function [Get](key As TKey, createFn As Func(Of TKey, TValue)) As TValue
             Dim v As TValue
-            If _map.TryGetValue(key, v) Then Return v
+            If _map.TryGetValue(key, v) Then
+                If _statsEnabled Then _hits += 1
+                Return v
+            End If
+            If _statsEnabled Then _misses += 1
             v = createFn(key)
             Insert(key, v)
             Return v
         End Function
+
+        ''' <summary>
+        ''' Records that the cache was intentionally bypassed for a key (e.g. an over-long word
+        ''' under a max-word-length policy). Counts a "skip" when stats are enabled.
+        ''' </summary>
+        Public Sub RecordSkip()
+            If _statsEnabled Then _skips += 1
+        End Sub
 
         ''' <summary>
         ''' Inserts a value, evicting the oldest entry (insertion order) when at capacity.
@@ -72,6 +141,7 @@ Namespace Internal
             If _map.Count >= _capacity Then
                 Dim oldest As TKey = _order.Dequeue()
                 _map.Remove(oldest)
+                If _statsEnabled Then _evictions += 1
             End If
             _map(key) = value
             _order.Enqueue(key)

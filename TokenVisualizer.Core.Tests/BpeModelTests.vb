@@ -357,6 +357,40 @@ Namespace TokenVisualizer.Core.Tests
             Assert.IsNull(bpe.IdToToken(999))
         End Sub
 
+        <TestMethod>
+        Public Sub TestMaxWordLength_BypassesCache_ButTokensIdentical()
+            Dim vocab As New Dictionary(Of String, Integer)() From {
+                {"u", 0}, {"n", 1}, {"r", 2}, {"e", 3}, {"l", 4}, {"a", 5}, {"t", 6}, {"d", 7},
+                {"re", 8}, {"at", 9}, {"ed", 10}, {"un", 11}, {"ated", 12}, {"rel", 13}, {"related", 14}, {"unrelated", 15}
+            }
+            Dim merges As New List(Of String)() From {
+                "r e", "a t", "e d", "u n", "at ed", "re l", "rel ated", "un related"
+            }
+
+            ' Reference: no limit.
+            Dim reference As New BpeModel(vocab, merges)
+
+            ' Threshold 5: "unrelated" (9 chars) bypasses the cache; "rel" (3) is cached.
+            Dim limited As New BpeModel(vocab, merges, maxWordLength:=5)
+            limited.EnableCacheStats()
+            limited.ResetCacheStats()
+
+            For Each word As String In {"unrelated", "rel", "unrelated", "rel"}
+                Dim a As List(Of Token) = reference.Tokenize(word)
+                Dim b As List(Of Token) = limited.Tokenize(word)
+                Assert.HasCount(a.Count, b, $"token count for '{word}'")
+                For i As Integer = 0 To a.Count - 1
+                    Assert.AreEqual(a(i), b(i), $"token[{i}] for '{word}'")
+                Next
+            Next
+
+            Dim stats As CacheStats = limited.GetCacheStats()
+            Assert.AreEqual(2, stats.Skips, "each 'unrelated' must be recorded as a skip")
+            Assert.AreEqual(1, stats.Hits, "'rel' second tokenize is a cache hit")
+            Assert.AreEqual(1, stats.Misses, "'rel' first tokenize is a cache miss")
+            Assert.AreEqual(0, stats.Evictions)
+        End Sub
+
     End Class
 
 End Namespace

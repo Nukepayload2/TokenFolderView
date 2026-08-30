@@ -25,8 +25,16 @@ Namespace Serialization
         ' Models
         ' ------------------------------------------------------------------
 
-        ''' <summary>Reconstructs a model from its JSON node, or <c>Nothing</c> when nothing matches.</summary>
-        Public Shared Function FromModel(node As JsonNode) As Object
+        ''' <summary>
+        ''' Reconstructs a model from its JSON node, or <c>Nothing</c> when nothing matches.
+        ''' <paramref name="cacheCapacity"/> / <paramref name="cacheMaxWord"/> are optional
+        ''' overrides threaded through to the BPE model's word cache (used by the dev benchmark to
+        ''' sweep capacity and the max-word-length cache-eligibility limit). <c>Nothing</c> keeps the
+        ''' model defaults.
+        ''' </summary>
+        Public Shared Function FromModel(node As JsonNode,
+                                         Optional cacheCapacity As Integer? = Nothing,
+                                         Optional cacheMaxWord As Integer? = Nothing) As Object
             If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
             Dim obj As JsonObject = DirectCast(node, JsonObject)
 
@@ -34,7 +42,7 @@ Namespace Serialization
             If tag IsNot Nothing Then
                 Select Case tag
                     Case "BPE"
-                        Return BuildBpe(obj)
+                        Return BuildBpe(obj, cacheCapacity, cacheMaxWord)
                     Case "WordPiece"
                         Return BuildWordPiece(obj)
                     Case "WordLevel"
@@ -48,7 +56,7 @@ Namespace Serialization
 
             ' Legacy untagged: probe in the Rust order BPE -> WordPiece -> WordLevel -> Unigram.
             If IsPresent(obj, "vocab") AndAlso IsPresent(obj, "merges") Then
-                Return BuildBpe(obj)
+                Return BuildBpe(obj, cacheCapacity, cacheMaxWord)
             End If
             If IsPresent(obj, "vocab") AndAlso IsPresent(obj, "unk_token") AndAlso
                IsPresent(obj, "continuing_subword_prefix") AndAlso IsPresent(obj, "max_input_chars_per_word") Then
@@ -63,7 +71,9 @@ Namespace Serialization
             Return Nothing
         End Function
 
-        Private Shared Function BuildBpe(obj As JsonObject) As BpeModel
+        Private Shared Function BuildBpe(obj As JsonObject,
+                                         Optional cacheCapacity As Integer? = Nothing,
+                                         Optional cacheMaxWord As Integer? = Nothing) As BpeModel
             Dim vocab As Dictionary(Of String, Integer) = ParseVocab(SerializationHelpers.GetNode(obj, "vocab"))
             Dim merges As List(Of String) = ParseMerges(SerializationHelpers.GetNode(obj, "merges"))
             Dim dropout As Double? = SerializationHelpers.GetDouble(obj, "dropout")
@@ -73,7 +83,9 @@ Namespace Serialization
             Dim fuseUnk As Boolean = SerializationHelpers.GetBool(obj, "fuse_unk").GetValueOrDefault(False)
             Dim byteFallback As Boolean = SerializationHelpers.GetBool(obj, "byte_fallback").GetValueOrDefault(False)
             Dim ignoreMerges As Boolean = SerializationHelpers.GetBool(obj, "ignore_merges").GetValueOrDefault(False)
-            Return New BpeModel(vocab, merges, prefix, eow, unk, fuseUnk, byteFallback, dropout, ignoreMerges)
+            Return New BpeModel(vocab, merges, prefix, eow, unk, fuseUnk, byteFallback, dropout, ignoreMerges,
+                                cacheCapacity:=If(cacheCapacity.HasValue, cacheCapacity.Value, 10000),
+                                maxWordLength:=cacheMaxWord)
         End Function
 
         Private Shared Function BuildWordPiece(obj As JsonObject) As WordPieceModel

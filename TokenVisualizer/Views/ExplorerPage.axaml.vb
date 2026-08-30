@@ -283,13 +283,10 @@ Namespace Views
             Try
                 Dim bytesRead = ReadFilePrefix(fullPath, buffer, CInt(length))
 
-                ' Strict UTF-8 first; fall back to a lenient decode for files with odd bytes.
-                Dim text As String
-                Try
-                    text = New UTF8Encoding(False, True).GetString(buffer, 0, bytesRead)
-                Catch ex As DecoderFallbackException
-                    text = Encoding.UTF8.GetString(buffer, 0, bytesRead)
-                End Try
+                ' Lenient decode: valid UTF-8 yields the exact text; invalid bytes become U+FFFD.
+                ' This is behaviourally identical to a strict decode with a lenient fallback, but
+                ' never throws (a strict decoder would allocate a DecoderFallbackException).
+                Dim text As String = Encoding.UTF8.GetString(buffer, 0, bytesRead)
 
                 Dim spans = tokenizer.EncodeWithSpans(text)
                 Dim source = TokenSource.Create(text, spans)

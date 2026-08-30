@@ -1,3 +1,4 @@
+Imports System.Buffers
 Imports System.Collections.Generic
 Imports System.Text
 Imports Tokenizers.Scanning
@@ -115,6 +116,64 @@ Namespace TokenVisualizer.Core.Tests
             bytes(4095) = &HE4
             Assert.IsFalse(BinaryDetector.IsBinary(bytes))
         End Sub
+
+        <TestMethod>
+        Public Sub MatchesStrictFlushFalseDecoder()
+            ' The Rune-based detector must agree with the previous strict flush:=False decoder on
+            ' every input: exhaustive 1- and 2-byte inputs, a targeted 3-byte sample (overlong /
+            ' surrogate / truncated leading bytes) and random buffers with a deterministic seed.
+            Dim cases As New List(Of Byte())()
+            For b As Integer = 0 To 255
+                cases.Add(New Byte() {CByte(b)})
+            Next
+            For a As Integer = 0 To 255
+                For b As Integer = 0 To 255
+                    cases.Add(New Byte() {CByte(a), CByte(b)})
+                Next
+            Next
+            Dim lead3() As Integer = {&H80, &HC0, &HC2, &HE0, &HED, &HEE, &HFF, &HF0, &HF4, &HF5}
+            Dim third() As Integer = {&H00, &H41, &H80, &H90, &HA0, &HBF, &HC0}
+            For Each l3 In lead3
+                For c2 As Integer = 0 To 255
+                    For Each t3 In third
+                        cases.Add(New Byte() {CByte(l3), CByte(c2), CByte(t3)})
+                    Next
+                Next
+            Next
+
+            Dim rng As New Random(12345)
+            For i As Integer = 0 To 20000
+                Dim buf(7) As Byte
+                rng.NextBytes(buf)
+                cases.Add(buf)
+            Next
+
+            For Each c As Byte() In cases
+                Assert.AreEqual(StrictFlushFalseIsBinary(c), BinaryDetector.IsBinary(c),
+                                $"divergence on bytes {BitConverter.ToString(c)}")
+            Next
+        End Sub
+
+        ''' <summary>Reference: the previous decoder-based implementation (strict, flush:=False).</summary>
+        Private Shared Function StrictFlushFalseIsBinary(bytes As Byte()) As Boolean
+            If bytes.Length = 0 Then Return False
+            Dim decoder As Decoder = New UTF8Encoding(False, True).GetDecoder()
+            Dim charCount As Integer = bytes.Length * 4
+            Dim charBuffer As Char() = ArrayPool(Of Char).Shared.Rent(charCount)
+            Try
+                Try
+                    Dim bytesUsed As Integer
+                    Dim charsUsed As Integer
+                    Dim completed As Boolean
+                    decoder.Convert(bytes.AsSpan(), charBuffer.AsSpan(0, charCount), False, bytesUsed, charsUsed, completed)
+                    Return False
+                Catch ex As DecoderFallbackException
+                    Return True
+                End Try
+            Finally
+                ArrayPool(Of Char).Shared.Return(charBuffer)
+            End Try
+        End Function
 
     End Class
 

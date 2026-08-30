@@ -50,6 +50,12 @@ Namespace Models
         ''' prefix/suffix is applied to that scalar). Read-only after construction.
         ''' </summary>
         Private ReadOnly _singleCharVocab As Dictionary(Of Integer, Integer)
+        ''' <summary>
+        ''' Optional maximum word length for cache eligibility. Words longer than this bypass the
+        ''' word cache entirely (no lookup, no insert) but are still merged normally, so the
+        ''' tokenization result is identical. <c>Nothing</c> = no limit (default).
+        ''' </summary>
+        Private ReadOnly _maxWordLength As Integer?
 
         ''' <summary>
         ''' A single linked-list node used by <see cref="MergeAllSymbols"/>. Mirrors the
@@ -106,6 +112,8 @@ Namespace Models
         ''' <param name="ignoreMerges">If the whole word is in the vocab, emit it directly as one token.</param>
         ''' <param name="cacheCapacity">Cache capacity; 0 disables caching.</param>
         ''' <param name="seededRandom">A <see cref="Random"/> or <see cref="Func(Of Double)"/> used only when dropout is set.</param>
+        ''' <param name="maxWordLength">Optional cache-eligibility word length limit; words longer
+        ''' than this bypass the cache (see <see cref="_maxWordLength"/>). <c>Nothing</c> = no limit.</param>
         Public Sub New(vocab As IDictionary(Of String, Integer),
                        merges As IReadOnlyList(Of String),
                        Optional continuingSubwordPrefix As String = Nothing,
@@ -116,7 +124,8 @@ Namespace Models
                        Optional dropout As Double? = Nothing,
                        Optional ignoreMerges As Boolean = False,
                        Optional cacheCapacity As Integer = 10000,
-                       Optional seededRandom As Object = Nothing)
+                       Optional seededRandom As Object = Nothing,
+                       Optional maxWordLength As Integer? = Nothing)
             If dropout.HasValue AndAlso (dropout.Value < 0.0 OrElse dropout.Value > 1.0) Then
                 Throw New ArgumentOutOfRangeException(NameOf(dropout), "dropout must be in the range [0.0, 1.0]")
             End If
@@ -140,6 +149,7 @@ Namespace Models
             _byteFallback = byteFallback
             _dropout = dropout
             _ignoreMerges = ignoreMerges
+            _maxWordLength = maxWordLength
 
             If byteFallback Then
                 Dim byteTokens As String() = New String(255) {}
@@ -220,6 +230,33 @@ Namespace Models
                 Return _merges.Count
             End Get
         End Property
+
+        ''' <summary>
+        ''' Turns on cache statistics for the current thread's word cache. A no-op when the cache is
+        ''' disabled (capacity &lt;= 0). Statistics never change cache behavior or tokenization.
+        ''' </summary>
+        Public Sub EnableCacheStats()
+            If _cache IsNot Nothing Then
+                _cache.Value.EnableStats()
+            End If
+        End Sub
+
+        ''' <summary>Zeros the current thread's cache statistics counters.</summary>
+        Public Sub ResetCacheStats()
+            If _cache IsNot Nothing Then
+                _cache.Value.ResetStats()
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Returns the current thread's word cache statistics (hits / misses / skips / evictions).
+        ''' All zeros when the cache is disabled or statistics are off. The cache is thread-local, so
+        ''' this reflects only the calling thread's activity (the benchmark is single-threaded).
+        ''' </summary>
+        Public Function GetCacheStats() As CacheStats
+            If _cache Is Nothing Then Return New CacheStats()
+            Return _cache.Value.GetStats()
+        End Function
 
         ''' <summary>Maps a token to its vocabulary id, or <c>Nothing</c> if absent.</summary>
         Public Function TokenToId(token As String) As Integer? Implements IModel.TokenToId
@@ -327,9 +364,16 @@ Namespace Models
             Dim useCache As Boolean = (_cache IsNot Nothing) AndAlso (Not _dropout.HasValue OrElse _dropout.Value = 0.0)
             If useCache Then
                 Dim cache As Cache(Of String, List(Of (Integer, Integer))) = _cache.Value
-                Dim cached As List(Of (Integer, Integer)) = cache.GetValue(word)
-                If cached IsNot Nothing Then
-                    symbols = cached
+                If _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
+                    ' Words longer than the cache-eligibility limit bypass the cache entirely:
+                    ' no lookup, no insert, but still merged normally so the result is identical.
+                    cache.RecordSkip()
+                    symbols = MergeWord(word)
+                Else
+                    Dim cached As List(Of (Integer, Integer)) = cache.GetValue(word)
+                    If cached IsNot Nothing Then
+                        symbols = cached
+                    End If
                 End If
             End If
 

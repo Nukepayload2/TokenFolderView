@@ -8,13 +8,15 @@ Imports System.IO
 Imports System.Linq
 Imports System.Text
 Imports Tokenizers
+Imports Tokenizers.Internal
+Imports Tokenizers.Models
 
 Module Program
 
     ' Same deterministic paragraph the Python reference decodes from this base64
     ' (ASCII + CJK + digits + punctuation + emoji, 451 UTF-8 bytes per copy).
     Private Const ParaB64 As String = "RGVlcFNlZWsgaXMgYW4gYWR2YW5jZWQgbGFyZ2UgbGFuZ3VhZ2UgbW9kZWwgcGxhdGZvcm0uClRoZSBxdWljayBicm93biBmb3gganVtcHMgb3ZlciB0aGUgbGF6eSBkb2cgMTIzNDU2Nzg5MCEKSGVsbG8gd29ybGQsIHRoaXMgaXMgYSB0b2tlbml6YXRpb24gYmVuY2htYXJrLgpDaGluZXNlIHdvcmQgc2VnbWVudGF0aW9uIHRlc3Q6IEFJLCBtYWNoaW5lIGxlYXJuaW5nLCBOTFAuClN5bWJvbHM6IEAjJCVeJiooKV8rLT1bXXt9OzpcfH5gCkZ1bGx3aWR0aCBDSksgcHVuY3R1YXRpb246IO+8ge+8n+OAgu+8jO+8m++8muOAge+8iO+8ieOAiuOAi+OAkOOAkQpDSksgd29yZHM6IOS6uuW3peaZuuiDvSDmnLrlmajlrabkuaAg6Ieq54S26K+t6KiA5aSE55CGIOWkp+ivreiogOaooeWeiwpNaXhlZDogYWJjMTIz5Lit5paH5a2X56ym8J+YgGVtb2pp8J+QiWRyYWdvbiBhbmQg5pWw5a2XMTIzNDUuCg=="
-    Private ReadOnly Para As String = Encoding.UTF8.GetString(Convert.FromBase64String(ParaB64))
+    Private ReadOnly Para As String = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(ParaB64))
 
     Private Const TextLimitBytes As Long = 4L * 1024L * 1024L
     Private Const FileLimitChars As Integer = 256 * 1024
@@ -36,6 +38,18 @@ Module Program
         Dim repeat As Integer = GetIntArg(args, "--repeat", 0)
         Dim iterations As Integer = GetIntArg(args, "--iterations", 3)
 
+        ' Optional BPE word-cache overrides for the capacity x max-word sweep (task #38).
+        ' --cache-capacity N: 0/1000/10000/32000 (Nothing = model default 10000).
+        ' --cache-max-word  N: 0 = unlimited; >0 = cache-eligibility word length limit.
+        Dim cacheCapacity As Integer? = Nothing
+        Dim cacheMaxWord As Integer? = Nothing
+        Dim cc As String = GetArg(args, "--cache-capacity", "")
+        Dim ccVal As Integer
+        If cc.Length > 0 AndAlso Integer.TryParse(cc, ccVal) Then cacheCapacity = ccVal
+        Dim mw As String = GetArg(args, "--cache-max-word", "")
+        Dim mwVal As Integer
+        If mw.Length > 0 AndAlso Integer.TryParse(mw, mwVal) AndAlso mwVal > 0 Then cacheMaxWord = mwVal
+
         If String.IsNullOrEmpty(tokenizerPath) Then tokenizerPath = FindDeepseekTokenizer()
         If String.IsNullOrEmpty(tokenizerPath) OrElse Not File.Exists(tokenizerPath) Then
             Console.Error.WriteLine("DOTNET|error|tokenizer file not found")
@@ -48,7 +62,7 @@ Module Program
             text = BuildTextFromPath(path)
         Else
             If repeat <= 0 Then
-                Dim bytesPerCopy As Integer = Encoding.UTF8.GetByteCount(Para)
+                Dim bytesPerCopy As Integer = System.Text.Encoding.UTF8.GetByteCount(Para)
                 repeat = Math.Max(1, CInt(2000000 \ bytesPerCopy))
             End If
             Dim sb As New StringBuilder(Para.Length * repeat)
@@ -58,22 +72,29 @@ Module Program
             text = sb.ToString()
         End If
 
-        Dim inputBytes As Long = Encoding.UTF8.GetByteCount(text)
+        Dim inputBytes As Long = System.Text.Encoding.UTF8.GetByteCount(text)
         Dim inputMb As Double = inputBytes / (1024.0 * 1024.0)
 
         ' ---- Load the tokenizer ----
         Dim tokenizer As Tokenizer
         Try
-            tokenizer = Tokenizer.Load(tokenizerPath)
+            tokenizer = Tokenizer.Load(tokenizerPath, cacheCapacity, cacheMaxWord)
         Catch ex As Exception
             Console.Error.WriteLine("DOTNET|error|failed to load tokenizer: " & ex.Message)
             Return 3
         End Try
 
+        ' Cache statistics are only gathered when a cache override is in play; enabling them on a
+        ' default run would add a per-word branch to the hot path for no benchmark benefit.
+        Dim bpe As BpeModel = TryCast(tokenizer.Model, BpeModel)
+        Dim statsOn As Boolean = bpe IsNot Nothing AndAlso (cacheCapacity.HasValue OrElse cacheMaxWord.HasValue)
+        If statsOn Then bpe.EnableCacheStats()
+
         ' ---- Warmup (JIT + regex tables + added-token cache) ----
         Dim warmTokens As Integer = tokenizer.EncodeCount(text)
 
         ' ---- Measure best of N ----
+        If statsOn Then bpe.ResetCacheStats()
         Dim bestTicks As Long = Long.MaxValue
         Dim tokenCount As Integer = 0
         For i As Integer = 0 To iterations - 1
@@ -83,6 +104,8 @@ Module Program
             sw.Stop()
             If sw.ElapsedTicks < bestTicks Then bestTicks = sw.ElapsedTicks
         Next
+        Dim stats As New CacheStats()
+        If statsOn Then stats = bpe.GetCacheStats()
 
         Dim elapsedSec As Double = bestTicks / Stopwatch.Frequency
         Dim elapsedMs As Double = elapsedSec * 1000.0
@@ -90,9 +113,9 @@ Module Program
         Dim tps As Double = tokenCount / elapsedSec
 
         Console.WriteLine(
-            $"DOTNET|input_mb={inputMb:F6}|tokens={tokenCount}|elapsed_ms={elapsedMs:F1}|mb_per_s={mbps:F1}|tokens_per_s={tps:F0}")
+            $"DOTNET|input_mb={inputMb:F6}|tokens={tokenCount}|elapsed_ms={elapsedMs:F1}|mb_per_s={mbps:F1}|tokens_per_s={tps:F0}|cache_hits={stats.Hits}|cache_misses={stats.Misses}|cache_skips={stats.Skips}|cache_evictions={stats.Evictions}")
         Console.WriteLine(
-            $"dotnet: {inputMb:F2} MB in {elapsedMs:F1} ms -> {mbps:F1} MB/s, {tps:F0} tokens/s ({tokenCount} tokens)  [warmup={warmTokens}]")
+            $"dotnet: {inputMb:F2} MB in {elapsedMs:F1} ms -> {mbps:F1} MB/s, {tps:F0} tokens/s ({tokenCount} tokens)  [warmup={warmTokens}]  cache: hits={stats.Hits} misses={stats.Misses} skips={stats.Skips} evictions={stats.Evictions}")
         Return 0
     End Function
 
@@ -119,7 +142,7 @@ Module Program
             If content.Length > FileLimitChars Then content = content.Substring(0, FileLimitChars)
             If content.Length > 0 Then
                 parts.Add(content)
-                total += Encoding.UTF8.GetByteCount(content)
+                total += System.Text.Encoding.UTF8.GetByteCount(content)
             End If
         Catch
             ' Skip files that aren't valid UTF-8.

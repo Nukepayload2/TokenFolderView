@@ -22,7 +22,9 @@
 param(
     [string]$Path = "",
     [string]$Config = "Release",
-    [int]$Iterations = 3
+    [int]$Iterations = 3,
+    [int]$CacheCapacity = -1,
+    [int]$CacheMaxWord = -1
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +70,8 @@ Write-Host "[1/2] dotnet bench (config=$Config) ..."
 $dotnetArgs = @("run", "-c", $Config, "--project", $benchProj, "--",
     "--tokenizer", $tokenizerJson, "--iterations", [string]$Iterations)
 if ($Path) { $dotnetArgs += @("--path", $Path) }
+if ($CacheCapacity -ge 0) { $dotnetArgs += @("--cache-capacity", [string]$CacheCapacity) }
+if ($CacheMaxWord -ge 0) { $dotnetArgs += @("--cache-max-word", [string]$CacheMaxWord) }
 $dotnetOut = & dotnet @dotnetArgs 2>&1 | Out-String
 $dotnetLine = Get-ResultLine $dotnetOut "DOTNET"
 if (-not $dotnetLine) {
