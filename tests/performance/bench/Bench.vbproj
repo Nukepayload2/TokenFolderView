@@ -4,7 +4,7 @@
     DEV-ONLY benchmark console. NOT part of TokenVisualizer.slnx (so the main
     build/test pipeline is unaffected). It only exists to measure the Core
     tokenizer's EncodeCount throughput against the Python `tokenizers` reference
-    via scripts/bench.ps1.
+    via tests/performance/bench.ps1.
   -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -15,7 +15,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\TokenVisualizer.Core\TokenVisualizer.Core.vbproj" />
+    <ProjectReference Include="..\..\..\TokenVisualizer.Core\TokenVisualizer.Core.vbproj" />
   </ItemGroup>
 
 </Project>

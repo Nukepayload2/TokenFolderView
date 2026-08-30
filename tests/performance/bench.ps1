@@ -4,8 +4,8 @@
     Python `tokenizers` reference, on the deepseek tokenizer.
 
 .DESCRIPTION
-    Runs the throwaway .NET console (scripts/bench, ProjectReference into
-    TokenVisualizer.Core) and the Python reference (scripts/bench_ref.py) over
+    Runs the throwaway .NET console (tests/performance/bench, ProjectReference into
+    TokenVisualizer.Core) and the Python reference (tests/performance/bench_ref.py) over
     the same deterministic text, then prints a comparison table
     (input MB, tokens, MB/s, tokens/s) for .NET vs Python.
 
@@ -13,11 +13,11 @@
     (recursively, text files only) and report token counts -- this doubles as
     the parity spot-check (our EncodeCount total vs the Python reference).
 
-    The scripts/bench console project is dev-only and is NOT part of the slnx.
+    The tests/performance/bench console project is dev-only and is NOT part of the slnx.
 
 .EXAMPLE
-    ./scripts/bench.ps1                    # synthetic ~2 MB mixed text
-    ./scripts/bench.ps1 -Path .\TokenVisualizer.Core   # real-folder parity + perf
+    ./tests/performance/bench.ps1                    # synthetic ~2 MB mixed text
+    ./tests/performance/bench.ps1 -Path .\TokenVisualizer.Core   # real-folder parity + perf
 #>
 param(
     [string]$Path = "",
@@ -46,7 +46,7 @@ function Get-ResultLine([string]$text, [string]$prefix) {
     return $null
 }
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $benchProj = Join-Path $PSScriptRoot "bench\Bench.vbproj"
 $refPy = Join-Path $PSScriptRoot "bench_ref.py"
 $tokenizerJson = Join-Path $repoRoot "deepseek-v4-flash\tokenizer.json"

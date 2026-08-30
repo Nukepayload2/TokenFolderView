@@ -5,13 +5,13 @@ Generates golden vectors from the Python `tokenizers` library (the Rust core bin
 This script builds 8 tokenizer pipelines entirely from `tokenizers` COMPONENTS (no network,
 no `from_pretrained`), encodes a fixed sample battery, and dumps the reference ids / byte
 offsets / decoded strings plus each pipeline's tokenizer.json (via `to_str()`) into
-`scripts/golden_vectors.json`.
+`tests/performance/golden_vectors.json`.
 
 The VB test suite (`GoldenVectorTests.vb`) loads the SAME tokenizer.json strings via
 `Tokenizer.FromJson(configJson)` and asserts the recorded vectors, making these tests the
 DEFINITIVE parity gate between the VB port and the Rust core.
 
-Run:  python scripts/gen_golden.py
+Run:  python tests/performance/gen_golden.py
 """
 import json
 import os
@@ -31,7 +31,7 @@ from tokenizers.processors import (
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEEPSEEK_PATH = os.path.join(SCRIPT_DIR, "..", "deepseek-v4-flash", "tokenizer.json")
+DEEPSEEK_PATH = os.path.join(SCRIPT_DIR, "..", "..", "deepseek-v4-flash", "tokenizer.json")
 OUT_PATH = os.path.join(SCRIPT_DIR, "golden_vectors.json")
 
 # ---------------------------------------------------------------------------

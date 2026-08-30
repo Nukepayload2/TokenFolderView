@@ -46,3 +46,7 @@ Thumbs.db
 
 # Dev-only scratch: optimization harnesses, ledgers, differential fuzz tools
 tmp/
+
+# Python caches and bytecode (integration-test scripts)
+__pycache__/
+*.pyc

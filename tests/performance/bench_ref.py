@@ -3,11 +3,11 @@
 
 Loads the deepseek tokenizer.json through the `tokenizers` library (the Python
 binding of the Rust core), encodes the SAME deterministic bytes the .NET harness
-(scripts/bench/Program.vb) encodes, and reports throughput. scripts/bench.ps1
-compares the two.
+(tests/performance/bench/Program.vb) encodes, and reports throughput.
+tests/performance/bench.ps1 compares the two.
 
 Usage:
-    python scripts/bench_ref.py [--path FOLDER_OR_FILE] [--repeat N] [--iterations N]
+    python tests/performance/bench_ref.py [--path FOLDER_OR_FILE] [--repeat N] [--iterations N]
 
     --path   Build the benchmark text from a folder (recursively, text files only)
              or a single file, instead of the synthetic ~2 MB paragraph. This is
@@ -20,7 +20,7 @@ import os
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEEPSEEK_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "deepseek-v4-flash", "tokenizer.json"))
+DEEPSEEK_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "deepseek-v4-flash", "tokenizer.json"))
 
 # Same deterministic paragraph the .NET harness decodes from this base64
 # (ASCII + CJK + digits + punctuation + emoji, 451 UTF-8 bytes per copy).

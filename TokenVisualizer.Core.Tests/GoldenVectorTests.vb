@@ -22,8 +22,9 @@ Namespace TokenVisualizer.Core.Tests
 
         ''' <summary>
         ''' Byte-offset alignment gates: gpt2 (the task's pipeline 1) plus the real DeepSeek config.
-        ''' The Python encode() binding reports char offsets, so gen_golden.py converts them to UTF-8
-        ''' byte offsets; the conversion is exact for these pipelines (no add_prefix_space trimming
+        ''' The Python encode() binding reports char offsets, so tests/performance/gen_golden.py converts
+        ''' them to UTF-8 byte offsets; the conversion is exact for these pipelines (no add_prefix_space
+        ''' trimming of multi-byte tokens).
         ''' of multi-byte tokens).
         ''' </summary>
         Private Shared ReadOnly ByteOffsetPipelines As HashSet(Of String) =

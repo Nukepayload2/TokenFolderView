@@ -1,7 +1,7 @@
 ' DEV-ONLY benchmark harness for TokenVisualizer.Core.
 ' Measures EncodeCount throughput on the deepseek tokenizer and prints a
-' machine-parseable "DOTNET|..." line that scripts/bench.ps1 consumes.
-' Mirrors scripts/bench_ref.py exactly so the inputs are byte-identical.
+' machine-parseable "DOTNET|..." line that tests/performance/bench.ps1 consumes.
+' Mirrors tests/performance/bench_ref.py exactly so the inputs are byte-identical.
 Imports System.Collections.Generic
 Imports System.Diagnostics
 Imports System.IO
@@ -56,7 +56,7 @@ Module Program
             Return 2
         End If
 
-        ' ---- Build the benchmark text (byte-identical to scripts/bench_ref.py) ----
+        ' ---- Build the benchmark text (byte-identical to tests/performance/bench_ref.py) ----
         Dim text As String
         If Not String.IsNullOrEmpty(path) Then
             text = BuildTextFromPath(path)
@@ -120,7 +120,7 @@ Module Program
     End Function
 
     ' ------------------------------------------------------------------
-    ' Text building (must match scripts/bench_ref.py's collect order so the
+    ' Text building (must match tests/performance/bench_ref.py's collect order so the
     ' parity run compares identical bytes).
     ' ------------------------------------------------------------------
     Private Function BuildTextFromPath(path As String) As String
