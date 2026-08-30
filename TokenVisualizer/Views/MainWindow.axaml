@@ -1,11 +1,11 @@
-<Window xmlns="https://github.com/avaloniaui"
+﻿<Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:ui="using:FluentAvalonia.UI.Controls"
         mc:Ignorable="d" d:DesignWidth="1200" d:DesignHeight="800"
         x:Class="TokenVisualizer.Views.MainWindow"
-        Title="Token 可视化"
+        Title="词元文件夹视图"
         WindowState="Maximized"
         ExtendClientAreaToDecorationsHint="True"
         Width="1200" Height="800" MinWidth="900" MinHeight="600">
