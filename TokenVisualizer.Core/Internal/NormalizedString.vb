@@ -18,6 +18,14 @@ Namespace Internal
         Private _alignments As List(Of (Integer, Integer))
         ''' <summary>Track of the missing part when this is a slice of a bigger NormalizedString.</summary>
         Private _originalShift As Integer
+        ''' <summary>
+        ''' When False (set only by the offset-free <see cref="OffsetType.None"/> encode path), the
+        ''' alignments are never read downstream, so <see cref="Slice"/> and <see cref="Transform"/>
+        ''' skip building them. The alignment is a per-byte (start, end) List; skipping it avoids the
+        ''' dominant per-piece allocation of the pre-tokenization hot path. When True (the default),
+        ''' behaviour is byte-identical to a fully tracked NormalizedString.
+        ''' </summary>
+        Private _trackAlignments As Boolean = True
 
         ' ---- Lazy caches for the hot byte<->net conversion helpers. ----
         ' NormalizedString.Slice is called once per pre-tokenizer piece (O(n) pieces), so the
@@ -117,6 +125,16 @@ Namespace Internal
             Return Utf8Helpers.Utf8Length(_normalized)
         End Function
 
+        ''' <summary>
+        ''' Enables or disables alignment tracking on this instance. When disabled, subsequent
+        ''' <see cref="Slice"/> and <see cref="Transform"/> calls do not build the per-byte
+        ''' alignment list (used by the offset-free <see cref="OffsetType.None"/> count path, where
+        ''' alignments are never read). Slices inherit the flag from their source.
+        ''' </summary>
+        Friend Sub SetTrackAlignments(value As Boolean)
+            _trackAlignments = value
+        End Sub
+
         ''' <summary>Length of the original string in UTF-8 bytes.</summary>
         Public Function LenOriginal() As Integer
             Return Utf8Helpers.Utf8Length(_original)
@@ -202,6 +220,16 @@ Namespace Internal
             Volatile.Write(_normalizedIndex, Nothing)
             Volatile.Write(_normalizedUtf8Len, -1)
         End Sub
+
+        ''' <summary>
+        ''' Converts a UTF-8 byte offset in the normalized string to a .NET (UTF-16) index using
+        ''' the cached scalar-boundary index (O(log n) binary search). Internal: used by the fused
+        ''' pre-tokenizer split path (<see cref="PreTokenizedString.FuseIsolatedSplits"/>) to
+        ''' extract per-piece substrings for the next pattern's scan.
+        ''' </summary>
+        Friend Function ByteToNetIndexCached(byteOffset As Integer) As Integer
+            Return ByteToNetCached(NormalizedIndex(), _normalized, byteOffset)
+        End Function
 
         ''' <summary>
         ''' Converts a UTF-8 byte offset to a .NET string index using a cached boundary index.
@@ -406,7 +434,7 @@ Namespace Internal
             If fullRange.IsOriginal Then
                 Dim converted = ConvertOffsets(fullRange)
                 If Not converted.HasValue Then
-                    Throw New InvalidOperationException("NormalizedString bad slice: cannot convert offsets.")
+                    Throw SliceConversionFailure()
                 End If
                 normalizedRange = converted.Value
                 originalRange = fullRange.IntoFullRange(OriginalUtf8LenCached())
@@ -414,7 +442,7 @@ Namespace Internal
                 normalizedRange = fullRange.IntoFullRange(NormalizedUtf8LenCached())
                 Dim converted = ConvertOffsets(fullRange)
                 If Not converted.HasValue Then
-                    Throw New InvalidOperationException("NormalizedString bad slice: cannot convert offsets.")
+                    Throw SliceConversionFailure()
                 End If
                 originalRange = converted.Value
             End If
@@ -422,18 +450,40 @@ Namespace Internal
             Dim nShift As Integer = originalRange.Item1
 
             Dim result As New NormalizedString()
+            result._trackAlignments = Me._trackAlignments
             result._original = SliceByUtf8Cached(OriginalIndex(), _original, originalRange.Item1, originalRange.Item2)
             result._normalized = SliceByUtf8Cached(NormalizedIndex(), _normalized, normalizedRange.Item1, normalizedRange.Item2)
-            ' Pre-size the piece's alignment list to the slice's normalized byte length so the
-            ' per-piece rebuild (the pre-tokenizer Split hot path) never pays List growth
-            ' doubling.
-            Dim pieceLen As Integer = normalizedRange.Item2 - normalizedRange.Item1
-            result._alignments = New List(Of (Integer, Integer))(pieceLen)
-            For i As Integer = normalizedRange.Item1 To normalizedRange.Item2 - 1
-                result._alignments.Add((_alignments(i).Item1 - nShift, _alignments(i).Item2 - nShift))
-            Next
+            If Me._trackAlignments Then
+                ' Pre-size the piece's alignment list to the slice's normalized byte length so the
+                ' per-piece rebuild (the pre-tokenizer Split hot path) never pays List growth
+                ' doubling.
+                Dim pieceLen As Integer = normalizedRange.Item2 - normalizedRange.Item1
+                result._alignments = New List(Of (Integer, Integer))(pieceLen)
+                For i As Integer = normalizedRange.Item1 To normalizedRange.Item2 - 1
+                    result._alignments.Add((_alignments(i).Item1 - nShift, _alignments(i).Item2 - nShift))
+                Next
+            Else
+                ' No-alignments mode: the piece's alignments are never read (OffsetType.None
+                ' count path), so leave them empty.
+                result._alignments = New List(Of (Integer, Integer))()
+            End If
             result._originalShift = _originalShift + originalRange.Item1
             Return result
+        End Function
+
+        ''' <summary>
+        ''' Returns the exception to throw when <see cref="ConvertOffsets"/> fails during
+        ''' <see cref="Slice"/>. On a no-track NormalizedString this is the dedicated
+        ''' <see cref="OffsetTrackingRequiredException"/> (a signal to the offset-free fast path to
+        ''' fall back to a fully-tracked encode); on a tracked NormalizedString it is a genuine
+        ''' "bad slice" error and must remain an <see cref="InvalidOperationException"/>.
+        ''' </summary>
+        Private Function SliceConversionFailure() As Exception
+            If Not _trackAlignments Then
+                Return New OffsetTrackingRequiredException(
+                    "Slicing a no-track NormalizedString requires the alignment list, which was skipped.")
+            End If
+            Return New InvalidOperationException("NormalizedString bad slice: cannot convert offsets.")
         End Function
 
         #End Region
@@ -456,6 +506,31 @@ Namespace Internal
 
         ''' <summary>Applies transformations over a specific byte range.</summary>
         Public Sub TransformRange(range As OffsetRange, dest As IEnumerable(Of (String, Integer)), initialOffset As Integer)
+            If Not _trackAlignments Then
+                ' No-alignments mode: see the (Char, Integer) overload. Only a whole-range
+                ' transform is supported; the result normalized string is the concatenation of the
+                ' dest strings (a whole-range splice replaces the entire normalized text).
+                Dim normLen As Integer = Utf8Helpers.Utf8Length(_normalized)
+                Dim isWhole As Boolean
+                If range.IsOriginal Then
+                    isWhole = (range.Start = 0 AndAlso range.End = -1)
+                Else
+                    Dim r As (Integer, Integer) = range.IntoFullRange(normLen)
+                    isWhole = (r.Item1 = 0 AndAlso r.Item2 = normLen)
+                End If
+                If initialOffset = 0 AndAlso isWhole Then
+                    Dim b As New StringBuilder()
+                    For Each item In dest
+                        b.Append(item.Item1)
+                    Next
+                    _normalized = b.ToString()
+                    _alignments = New List(Of (Integer, Integer))()
+                    InvalidateNormalizedCaches()
+                    Return
+                End If
+                Throw New OffsetTrackingRequiredException("Partial transform on a no-track NormalizedString.")
+            End If
+
             Dim nRange As (Integer, Integer)
             If Not range.IsOriginal Then
                 nRange = range.IntoFullRange(Utf8Helpers.Utf8Length(_normalized))
@@ -468,25 +543,27 @@ Namespace Internal
             Dim netStart As Integer = Utf8Helpers.ByteToNetIndex(_normalized, nRange.Item1)
             Dim netEnd As Integer = Utf8Helpers.ByteToNetIndex(_normalized, nRange.Item2)
 
-            ' The replaced range's scalars are scanned ON DEMAND as the stream is consumed, so no
-            ' replaced-bytes list is materialized.
-            Dim scanNet As Integer = netStart
-            Dim scalarCountInRange As Integer = 0
-            While scanNet < netEnd
-                scanNet += Utf8Helpers.NetLengthOfCodePoint(UnicodePredicates.ScalarCodePoint(_normalized, scanNet))
-                scalarCountInRange += 1
-            End While
-
             ' Mirrors the Rust `(&mut iter).take(initial_offset)` call: the first
             ' `initial_offset` characters of the replaced range are dropped before the loop.
+            ' The scalar count in range is only needed when initialOffset > 0 (the common
+            ' whole-range ByteLevel transform uses initialOffset = 0, so the scan is skipped).
             Dim replacedNet As Integer = netStart
             Dim initialRemoved As Integer = 0
-            Dim toSkip As Integer = Math.Min(initialOffset, scalarCountInRange)
-            For k As Integer = 0 To toSkip - 1
-                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
-                initialRemoved += Utf8Helpers.Utf8LengthOfCodePoint(cp)
-                replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
-            Next
+            Dim toSkip As Integer = 0
+            If initialOffset > 0 Then
+                Dim scanNet As Integer = netStart
+                Dim scalarCountInRange As Integer = 0
+                While scanNet < netEnd
+                    scanNet += Utf8Helpers.NetLengthOfCodePoint(UnicodePredicates.ScalarCodePoint(_normalized, scanNet))
+                    scalarCountInRange += 1
+                End While
+                toSkip = Math.Min(initialOffset, scalarCountInRange)
+                For k As Integer = 0 To toSkip - 1
+                    Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
+                    initialRemoved += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                    replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
+                Next
+            End If
 
             Dim offset As Integer = initialRemoved + nRange.Item1
 
@@ -600,6 +677,37 @@ Namespace Internal
 
         ''' <summary>Applies a <c>(Char, Integer)</c> transform stream over a specific byte range.</summary>
         Public Sub TransformRange(range As OffsetRange, dest As IReadOnlyList(Of (Char, Integer)), initialOffset As Integer)
+            If Not _trackAlignments Then
+                ' No-alignments mode (OffsetType.None count path): the only transform that runs
+                ' downstream is the whole-range ByteLevel transform, whose result normalized string
+                ' is simply the concatenation of the dest chars (a whole-range splice replaces the
+                ' entire normalized text). The alignment list is not built. A partial transform on a
+                ' no-track NormalizedString is unsupported and throws (it never happens in the
+                ' count path).
+                Dim normLen As Integer = Utf8Helpers.Utf8Length(_normalized)
+                Dim isWhole As Boolean
+                If range.IsOriginal Then
+                    ' Only a whole-original transform is supported on a no-track NormalizedString
+                    ' (the count path's ByteLevel hot path); a partial original range cannot be
+                    ' mapped without alignments.
+                    isWhole = (range.Start = 0 AndAlso range.End = -1)
+                Else
+                    Dim r As (Integer, Integer) = range.IntoFullRange(normLen)
+                    isWhole = (r.Item1 = 0 AndAlso r.Item2 = normLen)
+                End If
+                If initialOffset = 0 AndAlso isWhole Then
+                    Dim b As New StringBuilder(dest.Count)
+                    For i As Integer = 0 To dest.Count - 1
+                        b.Append(dest(i).Item1)
+                    Next
+                    _normalized = b.ToString()
+                    _alignments = New List(Of (Integer, Integer))()
+                    InvalidateNormalizedCaches()
+                    Return
+                End If
+                Throw New OffsetTrackingRequiredException("Partial transform on a no-track NormalizedString.")
+            End If
+
             Dim nRange As (Integer, Integer)
             If Not range.IsOriginal Then
                 nRange = range.IntoFullRange(Utf8Helpers.Utf8Length(_normalized))
@@ -612,28 +720,29 @@ Namespace Internal
             Dim netStart As Integer = Utf8Helpers.ByteToNetIndex(_normalized, nRange.Item1)
             Dim netEnd As Integer = Utf8Helpers.ByteToNetIndex(_normalized, nRange.Item2)
 
-            ' The replaced range's scalars are scanned ON DEMAND as the stream is consumed, so no
-            ' replaced-bytes list is materialized (saves a list + its population pass). Count the
-            ' scalars in the range up front so the initial-offset skip can be bounded.
-            Dim scanNet As Integer = netStart
-            Dim scalarCountInRange As Integer = 0
-            While scanNet < netEnd
-                scanNet += Utf8Helpers.NetLengthOfCodePoint(UnicodePredicates.ScalarCodePoint(_normalized, scanNet))
-                scalarCountInRange += 1
-            End While
-
             ' Mirrors the Rust `(&mut iter).take(initial_offset)` call: the first
             ' `initial_offset` characters of the replaced range are dropped before the loop, so
             ' the on-demand scalar cursor is positioned past them and their byte length is
-            ' accumulated into the initial byte offset.
+            ' accumulated into the initial byte offset. The scalar count in range is only needed
+            ' when initialOffset > 0 (the common whole-range ByteLevel transform uses
+            ' initialOffset = 0, so the scan is skipped).
             Dim replacedNet As Integer = netStart
             Dim initialRemoved As Integer = 0
-            Dim toSkip As Integer = Math.Min(initialOffset, scalarCountInRange)
-            For k As Integer = 0 To toSkip - 1
-                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
-                initialRemoved += Utf8Helpers.Utf8LengthOfCodePoint(cp)
-                replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
-            Next
+            Dim toSkip As Integer = 0
+            If initialOffset > 0 Then
+                Dim scanNet As Integer = netStart
+                Dim scalarCountInRange As Integer = 0
+                While scanNet < netEnd
+                    scanNet += Utf8Helpers.NetLengthOfCodePoint(UnicodePredicates.ScalarCodePoint(_normalized, scanNet))
+                    scalarCountInRange += 1
+                End While
+                toSkip = Math.Min(initialOffset, scalarCountInRange)
+                For k As Integer = 0 To toSkip - 1
+                    Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, replacedNet)
+                    initialRemoved += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                    replacedNet += Utf8Helpers.NetLengthOfCodePoint(cp)
+                Next
+            End If
 
             Dim offset As Integer = initialRemoved + nRange.Item1
 

@@ -90,6 +90,69 @@ Namespace Internal
         End Sub
 
         ''' <summary>
+        ''' Fuses a run of isolated manual-pattern splits into a single pass. Each pattern's
+        ''' <c>FindMatches</c> is run on the previous partition's pieces, so a later pattern can
+        ''' never join two pieces that an earlier pattern separated (the earlier boundaries act as
+        ''' hard barriers), and the root <see cref="NormalizedString"/> is sliced exactly once per
+        ''' final piece. This produces byte-identical splits to running the same Isolated splits
+        ''' sequentially via <see cref="SplitByFunction"/>, but avoids materializing the
+        ''' intermediate <see cref="NormalizedString"/> pieces and rebuilding the splits list
+        ''' between patterns (the S2 pre-tokenization bottleneck).
+        '''
+        ''' Semantics preserved: splits that already carry tokens pass through unchanged, and
+        ''' empty pieces are dropped, exactly like <see cref="SplitByFunction"/>.
+        ''' </summary>
+        Friend Sub FuseIsolatedSplits(patterns As List(Of Pattern))
+            Dim newSplits As New List(Of Split)()
+            For Each split As Split In Me.Splits
+                If split.Tokens IsNot Nothing Then
+                    newSplits.Add(split)
+                    Continue For
+                End If
+
+                Dim ns As NormalizedString = split.Normalized
+                Dim text As String = ns.Get
+                Dim utf8Len As Integer = ns.Len()
+                Dim ranges As New List(Of (Integer, Integer))(1)
+                ranges.Add((0, utf8Len))
+
+                For Each p As Pattern In patterns
+                    Dim nextRanges As New List(Of (Integer, Integer))()
+                    For Each r In ranges
+                        Dim b1 As Integer = r.Item1
+                        Dim b2 As Integer = r.Item2
+                        If b2 <= b1 Then Continue For
+                        ' Extract the piece's normalized substring via the cached boundary index
+                        ' (binary search), then run the next pattern exactly as the sequential
+                        ' path does (FindMatches on that substring), offsetting matches back to the
+                        ' root normalized byte referential.
+                        Dim n1 As Integer = ns.ByteToNetIndexCached(b1)
+                        Dim n2 As Integer = ns.ByteToNetIndexCached(b2)
+                        If n2 <= n1 Then Continue For
+                        Dim seg As String = text.Substring(n1, n2 - n1)
+                        Dim matches As List(Of MatchInfo) = p.FindMatches(seg)
+                        For Each m As MatchInfo In matches
+                            Dim mb1 As Integer = m.Start
+                            Dim mb2 As Integer = m.End
+                            If mb2 > mb1 Then
+                                nextRanges.Add((b1 + mb1, b1 + mb2))
+                            End If
+                        Next
+                    Next
+                    ranges = nextRanges
+                Next
+
+                For Each r In ranges
+                    If r.Item2 > r.Item1 Then
+                        Dim slice As NormalizedString = ns.Slice(New OffsetRange(False, r.Item1, r.Item2))
+                        newSplits.Add(Split.FromNormalizedString(slice))
+                    End If
+                Next
+            Next
+            Me.Splits = newSplits
+        End Sub
+
+        ''' <summary>
         ''' Applies <paramref name="normalizer"/> to every split that has no attached tokens.
         ''' </summary>
         Public Sub Normalize(normalizer As Action(Of NormalizedString))

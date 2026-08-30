@@ -194,7 +194,20 @@ Imports Tokenizers.Serialization
 
         ''' <summary>Encodes a single sequence without computing offsets.</summary>
         Public Function EncodeFast(text As String, Optional addSpecialTokens As Boolean = True) As Encoding
-            Return EncodeSingleSequenceWithPostProcess(text, addSpecialTokens, OffsetType.None, Nothing)
+            Try
+                Return EncodeSingleSequenceWithPostProcess(text, addSpecialTokens, OffsetType.None, Nothing)
+            Catch ex As OffsetTrackingRequiredException
+                ' Some configurations need the per-byte alignment list even in the offset-free
+                ' path (e.g. GPT-2 ByteLevel addPrefixSpace does a partial-range Prepend; a
+                ' second-round split slices a no-track piece). The no-track fast path signals this
+                ' via the dedicated exception; re-run fully tracked (the pre-R5 EncodeFast
+                ' behaviour) so the result is always correct. The catch is deliberately narrow —
+                ' only the dedicated no-track signal is caught, never a broad
+                ' InvalidOperationException that could mask a genuine bug. The DeepSeek fused path
+                ' never throws, so its per-Encode performance is unaffected and the fallback
+                ' touches no shared state.
+                Return EncodeSingleSequenceWithPostProcess(text, addSpecialTokens, OffsetType.None, Nothing, enableNoTrack:=False)
+            End Try
         End Function
 
         ''' <summary>
@@ -239,9 +252,21 @@ Imports Tokenizers.Serialization
             Return result
         End Function
 
-        ''' <summary>Runs the encode pipeline and returns the number of tokens.</summary>
+        ''' <summary>
+        ''' Runs the encode pipeline and returns the number of tokens. Uses the
+        ''' <see cref="OffsetType.None"/> path (mirroring the Rust <c>encode_fast</c>) because the
+        ''' token count does not depend on offsets; this avoids the per-split byte-offset
+        ''' materialization in <c>IntoEncoding</c> (~50 ms on the 2 MB benchmark).
+        ''' </summary>
         Public Function EncodeCount(text As String, Optional addSpecialTokens As Boolean = False) As Integer
-            Return Encode(text, addSpecialTokens).Length
+            Try
+                Return EncodeFast(text, addSpecialTokens).Length
+            Catch ex As OffsetTrackingRequiredException
+                ' Defensive: EncodeFast already falls back internally, so this branch is normally
+                ' never reached. It guarantees the count stays correct (matching the pre-R5
+                ' behaviour of delegating to the fully-tracked Encode path) even if that changes.
+                Return Encode(text, addSpecialTokens).Length
+            End Try
         End Function
 
         ''' <summary>
@@ -277,8 +302,9 @@ Imports Tokenizers.Serialization
         Private Function EncodeSingleSequenceWithPostProcess(text As String,
                                                               addSpecialTokens As Boolean,
                                                               offsetType As OffsetType,
-                                                              wordIdx As Integer?) As Encoding
-            Dim encoding As Encoding = EncodeSingleSequence(text, 0, offsetType, wordIdx)
+                                                              wordIdx As Integer?,
+                                                              Optional enableNoTrack As Boolean = True) As Encoding
+            Dim encoding As Encoding = EncodeSingleSequence(text, 0, offsetType, wordIdx, enableNoTrack)
             Return PostProcess(encoding, Nothing, addSpecialTokens)
         End Function
 
@@ -289,8 +315,21 @@ Imports Tokenizers.Serialization
         Private Function EncodeSingleSequence(sequence As String,
                                               typeId As Integer,
                                               offsetType As OffsetType,
-                                              wordIdx As Integer?) As Encoding
+                                              wordIdx As Integer?,
+                                              Optional enableNoTrack As Boolean = True) As Encoding
             Dim pts As PreTokenizedString = Me.AddedVocabulary.ExtractAndNormalize(sequence, Me.Normalizer)
+
+            ' The offset-free path (EncodeCount / EncodeFast) never reads the per-byte alignment
+            ' lists, so tell the pre-tokenizer slices and transforms to skip building them. This
+            ' eliminates the dominant per-piece allocation of the pre-tokenization hot path.
+            ' <paramref name="enableNoTrack"/> is False only on the fallback path, which re-runs
+            ' the whole pipeline fully tracked when a no-track NormalizedString hits an operation
+            ' that needs the alignment list (OffsetTrackingRequiredException).
+            If offsetType = OffsetType.None AndAlso enableNoTrack Then
+                For Each s As Split In pts.Splits
+                    s.Normalized.SetTrackAlignments(False)
+                Next
+            End If
 
             If Me.PreTokenizer IsNot Nothing Then
                 Me.PreTokenizer.PreTokenize(pts)

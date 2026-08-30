@@ -43,3 +43,6 @@ Generated Files/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Dev-only scratch: optimization harnesses, ledgers, differential fuzz tools
+tmp/

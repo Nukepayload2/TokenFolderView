@@ -33,6 +33,19 @@ Namespace PreTokenizers
             End If
         End Sub
 
+        ''' <summary>
+        ''' Whether this split qualifies for the fused Isolated fast path: non-inverted, Isolated
+        ''' behavior, and a hand-written manual pattern (not a .NET <see cref="RegexPattern"/>).
+        ''' When it qualifies, <paramref name="pattern"/> receives the underlying pattern.
+        ''' </summary>
+        Friend Function TryGetIsolatedManualPattern(ByRef pattern As Pattern) As Boolean
+            If _invert Then Return False
+            If _behavior <> SplitDelimiterBehavior.Isolated Then Return False
+            If TypeOf _pattern IsNot ManualPatternBase Then Return False
+            pattern = _pattern
+            Return True
+        End Function
+
         Public Function ToJson() As JsonObject Implements IPreTokenizer.ToJson
             Dim o As New JsonObject()
             o("type") = "Split"
