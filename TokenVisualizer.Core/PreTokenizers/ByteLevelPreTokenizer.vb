@@ -58,18 +58,19 @@ Namespace PreTokenizers
 
             pretokenized.Normalize(
                 Sub(normalized As NormalizedString)
-                    Dim s As String = normalized.Get
                     ' Each source scalar produces exactly its UTF-8 byte count of (Char, Integer)
                     ' items. The per-thread buffer is reused across pieces (Clear keeps the backing
                     ' array, only growing when a piece is larger than the previous max), so no
-                    ' per-piece List is allocated.
+                    ' per-piece List is allocated. AppendByteTransform iterates the piece's
+                    ' normalized scalars directly: for a lazy no-track view it walks the source's
+                    ' scalar range without materializing the piece's substring (and the piece's
+                    ' _original is never materialized at all), while eager pieces iterate their
+                    ' materialized normalized string exactly as before.
                     Dim transformations As List(Of (Char, Integer)) = TransformBuffer.Value
                     transformations.Clear()
-                    Dim hint As Integer = Utf8Helpers.Utf8Length(s)
+                    Dim hint As Integer = normalized.Len()
                     If transformations.Capacity < hint Then transformations.Capacity = hint
-                    For Each sc In Utf8Helpers.EnumerateScalars(s)
-                        BytesToUnicodeTable.AppendByteTransform(transformations, sc.CodePoint)
-                    Next
+                    normalized.AppendByteTransform(transformations)
                     normalized.Transform(transformations, 0)
                 End Sub)
         End Sub

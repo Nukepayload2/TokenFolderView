@@ -45,7 +45,10 @@ def build_text_from_path(path):
         if total >= TEXT_LIMIT_BYTES:
             return
         try:
-            with open(fp, "r", encoding="utf-8-sig") as f:
+            # newline="" disables Python's universal-newlines translation (CRLF -> LF), so the
+            # read bytes match the .NET harness's File.ReadAllText exactly. Without it the two
+            # sides saw different byte counts and different token counts on CRLF files.
+            with open(fp, "r", encoding="utf-8-sig", newline="") as f:
                 content = f.read(FILE_LIMIT_CHARS)
             if content:
                 parts.append(content)

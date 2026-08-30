@@ -159,6 +159,15 @@ Namespace Models
             Return subTokens
         End Function
 
+        ''' <summary>
+        ''' Count-only fallback: the WordPiece model is not the count fast path, so reuse
+        ''' <see cref="Tokenize"/> and take its length. Equal to <c>Tokenize(word).Count</c> by
+        ''' construction.
+        ''' </summary>
+        Public Function CountTokens(word As String) As Integer Implements IModel.CountTokens
+            Return Tokenize(word).Count
+        End Function
+
         Private Function GetUnkId() As Integer
             Dim id As Integer
             If _vocab.TryGetValue(_unkToken, id) Then Return id

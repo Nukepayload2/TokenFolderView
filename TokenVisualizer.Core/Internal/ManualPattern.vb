@@ -26,23 +26,22 @@ Namespace Internal
         ''' <summary>Emits all match spans for <paramref name="inside"/> into <paramref name="result"/>.</summary>
         Protected MustOverride Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
 
-        Public Overrides Function FindMatches(inside As String) As List(Of MatchInfo)
+        Protected Overrides Sub FindMatchesCore(inside As String, result As List(Of MatchInfo))
             If inside Is Nothing Then inside = String.Empty
             If inside.Length = 0 Then
-                Return New List(Of MatchInfo) From {New MatchInfo(0, 0, False)}
+                result.Add(New MatchInfo(0, 0, False))
+                Return
             End If
 
             ' The scanner emits MatchInfo entries directly (with implicit gap filling via
             ' <see cref="EmitMatch"/>), so no intermediate (start,end) span list is materialized.
-            Dim result As New List(Of MatchInfo)()
             Dim prev As Integer = 0
             Me.Scan(inside, result, prev)
             Dim total As Integer = Utf8Helpers.Utf8Length(inside)
             If prev < total Then
                 result.Add(New MatchInfo(prev, total, False))
             End If
-            Return result
-        End Function
+        End Sub
 
         ''' <summary>
         ''' Appends a match span, first filling any gap between <paramref name="prev"/> (the end of

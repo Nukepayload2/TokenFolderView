@@ -257,8 +257,31 @@ Imports Tokenizers.Serialization
         ''' <see cref="OffsetType.None"/> path (mirroring the Rust <c>encode_fast</c>) because the
         ''' token count does not depend on offsets; this avoids the per-split byte-offset
         ''' materialization in <c>IntoEncoding</c> (~50 ms on the 2 MB benchmark).
+        '''
+        ''' When neither truncation nor padding is configured, takes the count-only fast path
+        ''' (<see cref="EncodeCountCore"/>): the pipeline runs the same normalization, added-token
+        ''' extraction, pre-tokenization and no-track alignment skipping, but the model tokenizes
+        ''' each split via <see cref="IModel.CountTokens"/> and the splits are never materialized
+        ''' into a <c>List(Of Token)</c> or an <c>Encoding</c>. This removes the per-token
+        ''' <c>Token</c> structs + per-token tuple list that <see cref="EncodeFast"/> still builds,
+        ''' which is the dominant per-piece fixed cost on high-piece-density real code. Truncation /
+        ''' padding are not counted this way (they need the materialized encoding), so those
+        ''' configurations fall back to <see cref="EncodeFast"/>, whose length is the exact
+        ''' pre-R7 behaviour.
         ''' </summary>
         Public Function EncodeCount(text As String, Optional addSpecialTokens As Boolean = False) As Integer
+            If Me.Truncation Is Nothing AndAlso Me.Padding Is Nothing Then
+                Try
+                    Return EncodeCountCore(text, addSpecialTokens)
+                Catch ex As OffsetTrackingRequiredException
+                    ' The count-only fast path hit a configuration it cannot serve — the same
+                    ' no-track operations EncodeFast falls back on (ByteLevel addPrefixSpace
+                    ' partial transform, a second-round slice of a no-track piece). Delegate to
+                    ' EncodeFast, which is correct for any configuration (it internally falls back
+                    ' to a fully-tracked encode when the no-track path cannot serve it).
+                    Return EncodeFast(text, addSpecialTokens).Length
+                End Try
+            End If
             Try
                 Return EncodeFast(text, addSpecialTokens).Length
             Catch ex As OffsetTrackingRequiredException
@@ -267,6 +290,34 @@ Imports Tokenizers.Serialization
                 ' behaviour of delegating to the fully-tracked Encode path) even if that changes.
                 Return Encode(text, addSpecialTokens).Length
             End Try
+        End Function
+
+        ''' <summary>
+        ''' The count-only fast path behind <see cref="EncodeCount"/> (no truncation/padding).
+        ''' Mirrors <see cref="EncodeSingleSequence"/> exactly through model tokenization, then
+        ''' sums <see cref="IModel.CountTokens"/> over the untokenized splits instead of building
+        ''' tokens, and finally adds the post-processor's added special tokens when requested.
+        ''' </summary>
+        Private Function EncodeCountCore(text As String, addSpecialTokens As Boolean) As Integer
+            Dim pts As PreTokenizedString = Me.AddedVocabulary.ExtractAndNormalize(text, Me.Normalizer)
+
+            ' Same no-track alignment skipping as the offset-free EncodeSingleSequence path.
+            For Each s As Split In pts.Splits
+                s.Normalized.SetTrackAlignments(False)
+            Next
+
+            If Me.PreTokenizer IsNot Nothing Then
+                Me.PreTokenizer.PreTokenize(pts)
+            End If
+
+            Dim n As Integer = pts.TokenizeCount(Function(nm As NormalizedString) Me.Model.CountTokens(nm.Get))
+
+            ' Post-processing without truncation/padding only ever adds the post-processor's
+            ' special tokens (single sequence), and only when addSpecialTokens is requested.
+            If addSpecialTokens AndAlso Me.PostProcessor IsNot Nothing Then
+                n += Me.PostProcessor.GetAddedTokens(False)
+            End If
+            Return n
         End Function
 
         ''' <summary>

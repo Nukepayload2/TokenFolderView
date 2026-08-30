@@ -448,9 +448,18 @@ Namespace Internal
             Dim startOffset As Integer = 0
             Dim netLen As Integer = sentence.Length
             Dim netIdx As Integer = 0
+            ' Running UTF-8 byte offset of netIdx, kept incrementally. Recomputing it from the
+            ' string start per trie match (the old Utf8Helpers.NetIndexToUtf8) made the matcher
+            ' O(n * matches): real code contains the tokenizer.json's own added-token literals, so
+            ' ~1000+ matches each paid an O(n) rescan of the whole text. The counter mirrors
+            ' NetIndexToUtf8 exactly (ScalarCodePoint + Utf8LengthOfCodePoint per scalar), so the
+            ' emitted byte offsets are byte-identical.
+            Dim byteOff As Integer = 0
             While netIdx < netLen
                 Dim netMatchEnd As Integer = splitRe.FindLongestPrefix(sentence, netIdx)
                 If netMatchEnd <= netIdx Then
+                    Dim cp As Integer = UnicodePredicates.ScalarCodePoint(sentence, netIdx)
+                    byteOff += Utf8Helpers.Utf8LengthOfCodePoint(cp)
                     netIdx += ScalarNetLen(sentence, netIdx)
                     Continue While
                 End If
@@ -459,10 +468,15 @@ Namespace Internal
                 Dim id As Integer = trieIds(matched)
                 Dim addedToken As AddedToken = _addedTokensMapR(id)
 
-                Dim startByte As Integer = Utf8Helpers.NetIndexToUtf8(sentence, netIdx)
-                Dim stopByte As Integer = Utf8Helpers.NetIndexToUtf8(sentence, netMatchEnd)
+                Dim startByte As Integer = byteOff
+                ' True byte offset of netMatchEnd. LStrip/RStrip may extend the emitted
+                ' (startByte, stopByte) range, but the running counter must track netIdx exactly,
+                ' so byteOff is always advanced to matchEndByte (never the adjusted stopByte).
+                Dim matchEndByte As Integer = byteOff + Utf8Helpers.Utf8Length(matched)
+                Dim stopByte As Integer = matchEndByte
 
                 If Me._encodeSpecialTokens AndAlso _specialTokensSet.Contains(addedToken.Content) Then
+                    byteOff = matchEndByte
                     netIdx = netMatchEnd
                     Continue While
                 End If
@@ -472,6 +486,7 @@ Namespace Internal
                     Dim stopSpace As Boolean = stopByte = byteLen OrElse Not StartsWithWord(sentence, netMatchEnd)
                     If Not stopSpace OrElse Not startSpace Then
                         ' Discard: not a single word.
+                        byteOff = matchEndByte
                         netIdx = netMatchEnd
                         Continue While
                     End If
@@ -493,6 +508,7 @@ Namespace Internal
                 End If
                 result.Add((id, (startByte, stopByte)))
                 startOffset = stopByte
+                byteOff = matchEndByte
                 netIdx = netMatchEnd
             End While
 

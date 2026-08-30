@@ -100,6 +100,15 @@ Namespace Models
             Throw New InvalidOperationException("WordLevel error: Missing [UNK] token from the vocabulary")
         End Function
 
+        ''' <summary>
+        ''' Count-only fallback: the WordLevel model is not the count fast path, so reuse
+        ''' <see cref="Tokenize"/> and take its length. Equal to <c>Tokenize(word).Count</c> by
+        ''' construction.
+        ''' </summary>
+        Public Function CountTokens(word As String) As Integer Implements IModel.CountTokens
+            Return Tokenize(word).Count
+        End Function
+
     End Class
 
 End Namespace

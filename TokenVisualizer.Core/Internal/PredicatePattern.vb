@@ -24,13 +24,13 @@ Namespace Internal
             _predicate = predicate
         End Sub
 
-        Public Overrides Function FindMatches(inside As String) As List(Of MatchInfo)
+        Protected Overrides Sub FindMatchesCore(inside As String, result As List(Of MatchInfo))
             If inside Is Nothing Then inside = String.Empty
             If inside.Length = 0 Then
-                Return New List(Of MatchInfo) From {New MatchInfo(0, 0, False)}
+                result.Add(New MatchInfo(0, 0, False))
+                Return
             End If
 
-            Dim result As New List(Of MatchInfo)()
             Dim lastOffset As Integer = 0
             Dim lastSeen As Integer = 0
 
@@ -49,8 +49,7 @@ Namespace Internal
             If lastSeen > lastOffset Then
                 result.Add(New MatchInfo(lastOffset, lastSeen, False))
             End If
-            Return result
-        End Function
+        End Sub
 
         ''' <summary>Builds a <see cref="Rune"/> for a code point, guarding lone surrogates.</summary>
         Private Shared Function ScalarToRune(cp As Integer) As Rune

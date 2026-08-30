@@ -116,6 +116,11 @@ Namespace Internal
                 Dim ranges As New List(Of (Integer, Integer))(1)
                 ranges.Add((0, utf8Len))
 
+                ' One scratch match list reused across every per-piece scan: the scanner writes
+                ' into it and it is cleared by FindMatchesInto, so no List(Of MatchInfo) is
+                ' allocated per piece (a dominant per-piece cost on high-piece-density corpora).
+                Dim scratch As New List(Of MatchInfo)()
+
                 For Each p As Pattern In patterns
                     Dim nextRanges As New List(Of (Integer, Integer))()
                     For Each r In ranges
@@ -130,8 +135,9 @@ Namespace Internal
                         Dim n2 As Integer = ns.ByteToNetIndexCached(b2)
                         If n2 <= n1 Then Continue For
                         Dim seg As String = text.Substring(n1, n2 - n1)
-                        Dim matches As List(Of MatchInfo) = p.FindMatches(seg)
-                        For Each m As MatchInfo In matches
+                        p.FindMatchesInto(seg, scratch)
+                        For i As Integer = 0 To scratch.Count - 1
+                            Dim m As MatchInfo = scratch(i)
                             Dim mb1 As Integer = m.Start
                             Dim mb2 As Integer = m.End
                             If mb2 > mb1 Then
@@ -213,6 +219,28 @@ Namespace Internal
                 End If
             Next
         End Sub
+
+        ''' <summary>
+        ''' Count-only twin of <see cref="Tokenize"/>. Returns the total number of tokens the splits
+        ''' would produce without building any <c>List(Of Token)</c>: splits that already carry
+        ''' attached tokens contribute their attached token count; the remaining splits contribute
+        ''' <c>countFn(split.Normalized)</c>. Because <see cref="Tokenize"/> calls
+        ''' <c>tokenizeFn</c> once per untokenized split and reads <c>Tokens.Count</c> for attached
+        ''' splits, this returns exactly the same total as <c>Tokenize(...)</c> would, provided
+        ''' <c>countFn(n) = tokenizeFn(n).Count</c>. The count-only fast path uses
+        ''' <c>countFn = Model.CountTokens</c>.
+        ''' </summary>
+        Public Function TokenizeCount(countFn As Func(Of NormalizedString, Integer)) As Integer
+            Dim total As Integer = 0
+            For Each split In Me.Splits
+                If split.Tokens Is Nothing Then
+                    total += countFn(split.Normalized)
+                Else
+                    total += split.Tokens.Count
+                End If
+            Next
+            Return total
+        End Function
 
         ''' <summary>
         ''' Early-exits when <paramref name="maxTokens"/> have been produced,

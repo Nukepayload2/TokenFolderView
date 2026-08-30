@@ -34,7 +34,29 @@ Namespace Internal
         ''' indicating whether each segment is a match. The output covers the whole string,
         ''' with contiguous ordered slices.
         ''' </summary>
-        Public MustOverride Function FindMatches(inside As String) As List(Of MatchInfo)
+        Public Function FindMatches(inside As String) As List(Of MatchInfo)
+            Dim result As New List(Of MatchInfo)()
+            FindMatchesInto(inside, result)
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Writes the matches for <paramref name="inside"/> into <paramref name="result"/>,
+        ''' clearing it first. The hot fused-split path reuses one scratch list across every
+        ''' per-piece scan, avoiding one <see cref="List(Of MatchInfo)"/> allocation per piece.
+        ''' Semantics are identical to <see cref="FindMatches"/>; a caller must consume (or copy)
+        ''' the entries before the next call clears the list.
+        ''' </summary>
+        Friend Sub FindMatchesInto(inside As String, result As List(Of MatchInfo))
+            result.Clear()
+            FindMatchesCore(inside, result)
+        End Sub
+
+        ''' <summary>
+        ''' Writes the match segments of <paramref name="inside"/> into <paramref name="result"/>
+        ''' (which is pre-cleared). Subclasses implement the pattern-specific scanning here.
+        ''' </summary>
+        Protected MustOverride Sub FindMatchesCore(inside As String, result As List(Of MatchInfo))
 
         ''' <summary>
         ''' Factory used by later phases to dispatch to the right pattern implementation.
@@ -64,13 +86,13 @@ Namespace Internal
             _regex = New Regex(pattern, RegexOptions.Compiled Or RegexOptions.CultureInvariant)
         End Sub
 
-        Public Overrides Function FindMatches(inside As String) As List(Of MatchInfo)
+        Protected Overrides Sub FindMatchesCore(inside As String, result As List(Of MatchInfo))
             If inside Is Nothing Then inside = String.Empty
             If inside.Length = 0 Then
-                Return New List(Of MatchInfo) From {New MatchInfo(0, 0, False)}
+                result.Add(New MatchInfo(0, 0, False))
+                Return
             End If
 
-            Dim result As New List(Of MatchInfo)()
             Dim prev As Integer = 0
             For Each m As Match In _regex.Matches(inside)
                 Dim startNet As Integer = m.Index
@@ -87,8 +109,7 @@ Namespace Internal
             If prev <> total Then
                 result.Add(New MatchInfo(prev, total, False))
             End If
-            Return result
-        End Function
+        End Sub
     End Class
 
     ''' <summary>
@@ -104,24 +125,26 @@ Namespace Internal
             _pattern = pattern
         End Sub
 
-        Public Overrides Function FindMatches(inside As String) As List(Of MatchInfo)
+        Protected Overrides Sub FindMatchesCore(inside As String, result As List(Of MatchInfo))
             If inside Is Nothing Then inside = String.Empty
 
             ' Empty pattern matches nothing: the whole input is one non-match segment
             ' (Rust reports the char count here, not the byte count).
             If _pattern.Length = 0 Then
                 If inside.Length = 0 Then
-                    Return New List(Of MatchInfo) From {New MatchInfo(0, 0, False)}
+                    result.Add(New MatchInfo(0, 0, False))
+                    Return
                 End If
                 Dim count As Integer = Utf8Helpers.ScalarCount(inside)
-                Return New List(Of MatchInfo) From {New MatchInfo(0, count, False)}
+                result.Add(New MatchInfo(0, count, False))
+                Return
             End If
 
             If inside.Length = 0 Then
-                Return New List(Of MatchInfo) From {New MatchInfo(0, 0, False)}
+                result.Add(New MatchInfo(0, 0, False))
+                Return
             End If
 
-            Dim result As New List(Of MatchInfo)()
             Dim prevByte As Integer = 0
             Dim searchNet As Integer = 0
             While True
@@ -141,8 +164,7 @@ Namespace Internal
             If prevByte <> total Then
                 result.Add(New MatchInfo(prevByte, total, False))
             End If
-            Return result
-        End Function
+        End Sub
     End Class
 
     ''' <summary>
@@ -157,14 +179,14 @@ Namespace Internal
             _inner = inner
         End Sub
 
-        Public Overrides Function FindMatches(inside As String) As List(Of MatchInfo)
-            Dim inner = _inner.FindMatches(inside)
-            Dim result As New List(Of MatchInfo)(inner.Count)
-            For Each m In inner
-                result.Add(New MatchInfo(m.Start, m.End, Not m.IsMatch))
+        Protected Overrides Sub FindMatchesCore(inside As String, result As List(Of MatchInfo))
+            ' The inner pattern writes into the same list; invert the flags in place afterwards.
+            _inner.FindMatchesInto(inside, result)
+            For i As Integer = 0 To result.Count - 1
+                Dim m As MatchInfo = result(i)
+                result(i) = New MatchInfo(m.Start, m.End, Not m.IsMatch)
             Next
-            Return result
-        End Function
+        End Sub
     End Class
 
 End Namespace

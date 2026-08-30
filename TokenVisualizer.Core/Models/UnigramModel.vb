@@ -322,6 +322,15 @@ Namespace Models
         End Function
 
         ''' <summary>
+        ''' Count-only fallback: the Unigram model is not the count fast path, so reuse
+        ''' <see cref="Tokenize"/> and take its length. Equal to <c>Tokenize(word).Count</c> by
+        ''' construction.
+        ''' </summary>
+        Public Function CountTokens(sentence As String) As Integer Implements IModel.CountTokens
+            Return Tokenize(sentence).Count
+        End Function
+
+        ''' <summary>
         ''' Populates a lattice with the vocabulary trie matches and unk fallbacks. Mirrors Rust
         ''' <c>Unigram::populate_nodes</c> (model.rs:170-209).
         ''' </summary>

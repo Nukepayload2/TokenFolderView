@@ -10,6 +10,13 @@ Namespace Models
     Public Interface IModel
         ''' <summary>Tokenizes the given word into tokens with offsets relative to the word.</summary>
         Function Tokenize(word As String) As List(Of Token)
+        ''' <summary>
+        ''' Returns the number of tokens <see cref="Tokenize"/> would produce for the given word,
+        ''' without building the token list. Used by the count-only <see cref="Tokenizer.EncodeCount"/>
+        ''' fast path, where per-token allocations are pure overhead. Must equal
+        ''' <c>Tokenize(word).Count</c> for every word and configuration.
+        ''' </summary>
+        Function CountTokens(word As String) As Integer
         ''' <summary>Number of entries in the vocabulary.</summary>
         ReadOnly Property VocabSize As Integer
         ''' <summary>Maps a token to its vocabulary id, or <c>Nothing</c> if absent.</summary>

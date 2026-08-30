@@ -1,3 +1,4 @@
+Imports System.Buffers
 Imports System.Linq
 Imports System.Text
 Imports System.Threading
@@ -26,6 +27,26 @@ Namespace Internal
         ''' behaviour is byte-identical to a fully tracked NormalizedString.
         ''' </summary>
         Private _trackAlignments As Boolean = True
+
+        ' ---- Lazy no-track slice view. ----
+        ' A no-track Slice does not eagerly materialize the piece's _original / _normalized
+        ' substrings. Instead it stores a (root, byte-range) view; the substrings are materialized
+        ' on first access via the accessors below. In the count-only path the piece's _original is
+        ' never read (so it is never materialized) and _normalized is read once by the ByteLevel
+        ' transform, which iterates the view directly (AppendByteTransform). Kept only when
+        ' _trackAlignments = False (a fully-tracked Slice stays eager); _root = Nothing otherwise.
+        Private _root As NormalizedString
+        Private _viewNormStart As Integer
+        Private _viewNormEnd As Integer
+        Private _viewOrigStart As Integer
+        Private _viewOrigEnd As Integer
+
+        ''' <summary>
+        ''' Single shared empty alignment list for no-track slices/transforms. The no-track path
+        ''' never mutates _alignments (it only replaces it with another empty list), so all
+        ''' no-track pieces can share one instance instead of allocating one empty List per piece.
+        ''' </summary>
+        Private Shared ReadOnly _emptyAlignments As New List(Of (Integer, Integer))()
 
         ' ---- Lazy caches for the hot byte<->net conversion helpers. ----
         ' NormalizedString.Slice is called once per pre-tokenizer piece (O(n) pieces), so the
@@ -91,9 +112,33 @@ Namespace Internal
         #Region "Basic accessors"
         ' ------------------------------------------------------------------
 
+        ''' <summary>
+        ''' Materializes the normalized substring of a lazy no-track view on first access. For an
+        ''' eager NormalizedString (or one already materialized) this is a no-op.
+        ''' </summary>
+        Private Sub MaterializeNormalized()
+            If _normalized Is Nothing AndAlso _root IsNot Nothing Then
+                _root.MaterializeNormalized()
+                _normalized = Utf8Helpers.SliceByUtf8(_root._normalized, _viewNormStart, _viewNormEnd)
+                Volatile.Write(_normalizedUtf8Len, _viewNormEnd - _viewNormStart)
+            End If
+        End Sub
+
+        ''' <summary>
+        ''' Materializes the original substring of a lazy no-track view on first access. For an
+        ''' eager NormalizedString (or one already materialized) this is a no-op.
+        ''' </summary>
+        Private Sub MaterializeOriginal()
+            If _original Is Nothing AndAlso _root IsNot Nothing Then
+                _root.MaterializeOriginal()
+                _original = Utf8Helpers.SliceByUtf8(_root._original, _viewOrigStart, _viewOrigEnd)
+            End If
+        End Sub
+
         ''' <summary>Returns the normalized string.</summary>
         Public ReadOnly Property [Get]() As String
             Get
+                MaterializeNormalized()
                 Return _normalized
             End Get
         End Property
@@ -101,13 +146,14 @@ Namespace Internal
         ''' <summary>Returns the original string.</summary>
         Public ReadOnly Property Original() As String
             Get
+                MaterializeOriginal()
                 Return _original
             End Get
         End Property
 
         ''' <summary>Returns the original offsets of this NormalizedString.</summary>
         Public Function OffsetsOriginal() As (Integer, Integer)
-            Return (_originalShift, _originalShift + Utf8Helpers.Utf8Length(_original))
+            Return (_originalShift, _originalShift + LenOriginal())
         End Function
 
         ''' <summary>
@@ -122,6 +168,7 @@ Namespace Internal
 
         ''' <summary>Length of the normalized string in UTF-8 bytes.</summary>
         Public Function Len() As Integer
+            If _normalized Is Nothing AndAlso _root IsNot Nothing Then Return _viewNormEnd - _viewNormStart
             Return Utf8Helpers.Utf8Length(_normalized)
         End Function
 
@@ -137,12 +184,20 @@ Namespace Internal
 
         ''' <summary>Length of the original string in UTF-8 bytes.</summary>
         Public Function LenOriginal() As Integer
+            If _original Is Nothing AndAlso _root IsNot Nothing Then Return _viewOrigEnd - _viewOrigStart
             Return Utf8Helpers.Utf8Length(_original)
         End Function
 
         ''' <summary>Whether the normalized string is empty.</summary>
         Public Function IsEmpty() As Boolean
+            If _normalized Is Nothing AndAlso _root IsNot Nothing Then Return _viewNormEnd <= _viewNormStart
             Return _normalized.Length = 0
+        End Function
+
+        ''' <summary>Whether the original string is empty (O(1); a lazy view is not materialized).</summary>
+        Private Function IsOriginalEmpty() As Boolean
+            If _original Is Nothing AndAlso _root IsNot Nothing Then Return _viewOrigEnd <= _viewOrigStart
+            Return _original.Length = 0
         End Function
 
         #End Region
@@ -175,6 +230,7 @@ Namespace Internal
 
         ''' <summary>Lazily built scalar boundary index for the original string (never mutates).</summary>
         Private Function OriginalIndex() As ScalarBoundaryIndex
+            MaterializeOriginal()
             Dim idx As ScalarBoundaryIndex = Volatile.Read(_originalIndex)
             If idx Is Nothing Then
                 Dim built As ScalarBoundaryIndex = BuildScalarIndex(_original)
@@ -187,6 +243,7 @@ Namespace Internal
 
         ''' <summary>Lazily built scalar boundary index for the normalized string (invalidated on transform).</summary>
         Private Function NormalizedIndex() As ScalarBoundaryIndex
+            MaterializeNormalized()
             Dim idx As ScalarBoundaryIndex = Volatile.Read(_normalizedIndex)
             If idx Is Nothing Then
                 Dim built As ScalarBoundaryIndex = BuildScalarIndex(_normalized)
@@ -198,6 +255,7 @@ Namespace Internal
         End Function
 
         Private Function OriginalUtf8LenCached() As Integer
+            If _original Is Nothing AndAlso _root IsNot Nothing Then Return _viewOrigEnd - _viewOrigStart
             Dim v As Integer = Volatile.Read(_originalUtf8Len)
             If v < 0 Then
                 v = Utf8Helpers.Utf8Length(_original)
@@ -207,6 +265,7 @@ Namespace Internal
         End Function
 
         Private Function NormalizedUtf8LenCached() As Integer
+            If _normalized Is Nothing AndAlso _root IsNot Nothing Then Return _viewNormEnd - _viewNormStart
             Dim v As Integer = Volatile.Read(_normalizedUtf8Len)
             If v < 0 Then
                 v = Utf8Helpers.Utf8Length(_normalized)
@@ -298,16 +357,16 @@ Namespace Internal
         ''' something that is outside range.
         ''' </summary>
         Public Function ConvertOffsets(range As OffsetRange) As (Integer, Integer)?
-            Dim lenOriginal As Integer = OriginalUtf8LenCached()
-            Dim lenNormalized As Integer = NormalizedUtf8LenCached()
+            Dim origLen As Integer = OriginalUtf8LenCached()
+            Dim normLen As Integer = NormalizedUtf8LenCached()
 
             Dim target As (Integer, Integer)
             Dim original As Boolean
             If range.IsOriginal Then
-                target = range.IntoFullRange(lenOriginal)
+                target = range.IntoFullRange(origLen)
                 original = True
             Else
-                target = range.IntoFullRange(lenNormalized)
+                target = range.IntoFullRange(normLen)
                 original = False
             End If
 
@@ -316,12 +375,14 @@ Namespace Internal
             ' If the target goes reverse, return Nothing
             If target.Item1 > target.Item2 Then Return Nothing
 
-            ' If we target 0..0 on an empty string, we want to expand to the entire equivalent
-            If original AndAlso _original.Length = 0 AndAlso target.Item1 = 0 AndAlso target.Item2 = 0 Then
-                Return (0, lenNormalized)
+            ' If we target 0..0 on an empty string, we want to expand to the entire equivalent.
+            ' Use O(1) empty checks (a lazy view is not materialized; a large eager string is not
+            ' byte-counted) — this method is on the per-piece pre-tokenization hot path.
+            If original AndAlso IsOriginalEmpty() AndAlso target.Item1 = 0 AndAlso target.Item2 = 0 Then
+                Return (0, normLen)
             End If
-            If Not original AndAlso _normalized.Length = 0 AndAlso target.Item1 = 0 AndAlso target.Item2 = 0 Then
-                Return (0, lenOriginal)
+            If Not original AndAlso IsEmpty() AndAlso target.Item1 = 0 AndAlso target.Item2 = 0 Then
+                Return (0, origLen)
             End If
 
             If original Then
@@ -368,6 +429,7 @@ Namespace Internal
 
         ''' <summary>Returns a range of the normalized string.</summary>
         Public Function GetRange(range As OffsetRange) As String
+            MaterializeNormalized()
             If range.IsOriginal Then
                 Dim converted = ConvertOffsets(range)
                 If converted.HasValue Then
@@ -382,6 +444,8 @@ Namespace Internal
 
         ''' <summary>Returns a range of the original string.</summary>
         Public Function GetRangeOriginal(range As OffsetRange) As String
+            MaterializeNormalized()
+            MaterializeOriginal()
             If range.IsOriginal Then
                 Dim r = range.IntoFullRange(Utf8Helpers.Utf8Length(_original))
                 Return Utf8Helpers.SliceByUtf8(_original, r.Item1, r.Item2)
@@ -451,9 +515,11 @@ Namespace Internal
 
             Dim result As New NormalizedString()
             result._trackAlignments = Me._trackAlignments
-            result._original = SliceByUtf8Cached(OriginalIndex(), _original, originalRange.Item1, originalRange.Item2)
-            result._normalized = SliceByUtf8Cached(NormalizedIndex(), _normalized, normalizedRange.Item1, normalizedRange.Item2)
             If Me._trackAlignments Then
+                ' Fully-tracked (or eager no-track) slice: materialize both substrings eagerly,
+                ' exactly as before.
+                result._original = SliceByUtf8Cached(OriginalIndex(), _original, originalRange.Item1, originalRange.Item2)
+                result._normalized = SliceByUtf8Cached(NormalizedIndex(), _normalized, normalizedRange.Item1, normalizedRange.Item2)
                 ' Pre-size the piece's alignment list to the slice's normalized byte length so the
                 ' per-piece rebuild (the pre-tokenizer Split hot path) never pays List growth
                 ' doubling.
@@ -463,9 +529,24 @@ Namespace Internal
                     result._alignments.Add((_alignments(i).Item1 - nShift, _alignments(i).Item2 - nShift))
                 Next
             Else
-                ' No-alignments mode: the piece's alignments are never read (OffsetType.None
-                ' count path), so leave them empty.
-                result._alignments = New List(Of (Integer, Integer))()
+                ' No-alignments mode (the OffsetType.None count path): defer BOTH substrings as a
+                ' lazy (root, byte-range) view. The piece's _original is never read in the count
+                ' path (so never materialized) and _normalized is consumed by the ByteLevel
+                ' transform via AppendByteTransform without materializing a substring. `Get` /
+                ' `Original` materialize on first access, so any downstream consumer sees exactly
+                ' the same strings an eager slice would. The shared empty list avoids one List
+                ' allocation per piece.
+                result._root = Me
+                result._viewNormStart = normalizedRange.Item1
+                result._viewNormEnd = normalizedRange.Item2
+                result._viewOrigStart = originalRange.Item1
+                result._viewOrigEnd = originalRange.Item2
+                result._alignments = _emptyAlignments
+                ' The private ctor defaults these to String.Empty; the lazy-view sentinel is
+                ' _normalized/_original = Nothing, so clear them (the view is only reachable when
+                ' no-track, and both are re-materialized on first access).
+                result._original = Nothing
+                result._normalized = Nothing
             End If
             result._originalShift = _originalShift + originalRange.Item1
             Return result
@@ -509,8 +590,10 @@ Namespace Internal
             If Not _trackAlignments Then
                 ' No-alignments mode: see the (Char, Integer) overload. Only a whole-range
                 ' transform is supported; the result normalized string is the concatenation of the
-                ' dest strings (a whole-range splice replaces the entire normalized text).
-                Dim normLen As Integer = Utf8Helpers.Utf8Length(_normalized)
+                ' dest strings (a whole-range splice replaces the entire normalized text). The
+                ' source's normalized byte length is read through Len() so a lazy no-track view is
+                ' never materialized here.
+                Dim normLen As Integer = Len()
                 Dim isWhole As Boolean
                 If range.IsOriginal Then
                     isWhole = (range.Start = 0 AndAlso range.End = -1)
@@ -524,7 +607,7 @@ Namespace Internal
                         b.Append(item.Item1)
                     Next
                     _normalized = b.ToString()
-                    _alignments = New List(Of (Integer, Integer))()
+                    _alignments = _emptyAlignments
                     InvalidateNormalizedCaches()
                     Return
                 End If
@@ -683,8 +766,9 @@ Namespace Internal
                 ' is simply the concatenation of the dest chars (a whole-range splice replaces the
                 ' entire normalized text). The alignment list is not built. A partial transform on a
                 ' no-track NormalizedString is unsupported and throws (it never happens in the
-                ' count path).
-                Dim normLen As Integer = Utf8Helpers.Utf8Length(_normalized)
+                ' count path). The source's normalized byte length is read through Len() so a lazy
+                ' no-track view is never materialized here.
+                Dim normLen As Integer = Len()
                 Dim isWhole As Boolean
                 If range.IsOriginal Then
                     ' Only a whole-original transform is supported on a no-track NormalizedString
@@ -696,12 +780,24 @@ Namespace Internal
                     isWhole = (r.Item1 = 0 AndAlso r.Item2 = normLen)
                 End If
                 If initialOffset = 0 AndAlso isWhole Then
-                    Dim b As New StringBuilder(dest.Count)
-                    For i As Integer = 0 To dest.Count - 1
-                        b.Append(dest(i).Item1)
-                    Next
-                    _normalized = b.ToString()
-                    _alignments = New List(Of (Integer, Integer))()
+                    ' Zero-intermediate whole-range splice: the result normalized string is
+                    ' exactly one UTF-16 char per dest item, so a rented char buffer (returned to
+                    ' ArrayPool.Shared and reused across pieces) replaces the per-piece
+                    ' StringBuilder. The single `New String` copy is the unavoidable floor; the
+                    ' StringBuilder object and its internal buffer are eliminated. The buffer is
+                    ' never exposed and the string is a fresh copy, so returning the rental is
+                    ' always safe.
+                    Dim n As Integer = dest.Count
+                    Dim buf As Char() = ArrayPool(Of Char).Shared.Rent(n)
+                    Try
+                        For i As Integer = 0 To n - 1
+                            buf(i) = dest(i).Item1
+                        Next
+                        _normalized = New String(buf, 0, n)
+                    Finally
+                        ArrayPool(Of Char).Shared.Return(buf)
+                    End Try
+                    _alignments = _emptyAlignments
                     InvalidateNormalizedCaches()
                     Return
                 End If
@@ -860,6 +956,35 @@ Namespace Internal
         End Sub
 
         ''' <summary>
+        ''' Appends the ByteLevel byte-transform stream of this piece's normalized scalars to
+        ''' <paramref name="dest"/> (one (Char, Integer) item per UTF-8 byte). For a lazy no-track
+        ''' view this iterates the source's scalar range directly (never materializing the piece's
+        ''' normalized substring); otherwise it iterates the materialized normalized string. Both
+        ''' paths emit byte-identical streams to iterating <c>Get</c> with
+        ''' <c>Utf8Helpers.EnumerateScalars</c>.
+        ''' </summary>
+        Friend Sub AppendByteTransform(dest As List(Of (Char, Integer)))
+            If _normalized Is Nothing AndAlso _root IsNot Nothing Then
+                ' Lazy view: the source's scalar-boundary index is already cached (FuseIsolatedSplits
+                ' built it to find the piece boundaries), so the byte->net conversion is an O(log n)
+                ' binary search. No substring is allocated.
+                Dim rootIdx As ScalarBoundaryIndex = _root.NormalizedIndex()
+                Dim netA As Integer = ByteToNetCached(rootIdx, _root._normalized, _viewNormStart)
+                Dim netB As Integer = ByteToNetCached(rootIdx, _root._normalized, _viewNormEnd)
+                Dim net As Integer = netA
+                While net < netB
+                    Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_root._normalized, net)
+                    BytesToUnicodeTable.AppendByteTransform(dest, cp)
+                    net += Utf8Helpers.NetLengthOfCodePoint(cp)
+                End While
+            Else
+                For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
+                    BytesToUnicodeTable.AppendByteTransform(dest, sc.CodePoint)
+                Next
+            End If
+        End Sub
+
+        ''' <summary>
         ''' Applies filtering over the normalized characters.
         ''' NOTE: the <paramref name="keep"/> predicate receives a single <see cref="Char"/> (the
         ''' first UTF-16 code unit of each scalar). Surrogate pairs are still treated as one scalar
@@ -868,6 +993,7 @@ Namespace Internal
         ''' Unicode scalar value.
         ''' </summary>
         Public Function Filter(keep As Func(Of Char, Boolean)) As NormalizedString
+            MaterializeNormalized()
             Dim removed As Integer = 0
             Dim removedStart As Integer = 0
 
@@ -903,6 +1029,7 @@ Namespace Internal
         ''' Unicode scalar value.
         ''' </summary>
         Public Function Map(func As Func(Of Char, Char)) As NormalizedString
+            MaterializeNormalized()
             Dim transforms As New List(Of (String, Integer))()
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
                 If sc.NetLen = 1 Then
@@ -917,6 +1044,7 @@ Namespace Internal
 
         ''' <summary>Lowercases the normalized string.</summary>
         Public Function Lowercase() As NormalizedString
+            MaterializeNormalized()
             Dim newChars As New List(Of (String, Integer))()
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
                 Dim lowered As String = Utf8Helpers.ScalarToString(sc.CodePoint).ToLowerInvariant()
@@ -932,6 +1060,7 @@ Namespace Internal
 
         ''' <summary>Uppercases the normalized string.</summary>
         Public Function Uppercase() As NormalizedString
+            MaterializeNormalized()
             Dim newChars As New List(Of (String, Integer))()
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
                 Dim upper As String = Utf8Helpers.ScalarToString(sc.CodePoint).ToUpperInvariant()
@@ -947,6 +1076,7 @@ Namespace Internal
 
         ''' <summary>Prepends the given string to the normalized string.</summary>
         Public Function Prepend(s As String) As NormalizedString
+            MaterializeNormalized()
             Dim firstScalar As ScalarInfo? = Nothing
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
                 firstScalar = sc
@@ -968,6 +1098,7 @@ Namespace Internal
 
         ''' <summary>Appends the given string to the normalized string.</summary>
         Public Function Append(s As String) As NormalizedString
+            MaterializeNormalized()
             Dim lastScalar As ScalarInfo? = Nothing
             For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
                 lastScalar = sc
@@ -992,6 +1123,7 @@ Namespace Internal
 
         ''' <summary>Clears the normalized part of the string.</summary>
         Public Function Clear() As Integer
+            MaterializeNormalized()
             Dim len As Integer = Utf8Helpers.Utf8Length(_normalized)
             Me.Transform(New List(Of (String, Integer))(), len)
             Return len
@@ -999,6 +1131,7 @@ Namespace Internal
 
         ''' <summary>Replaces anything that matches the pattern with the given content.</summary>
         Public Function Replace(pattern As Pattern, content As String) As NormalizedString
+            MaterializeNormalized()
             Dim newNormalized As New StringBuilder()
             ' Pre-size to the current alignment count: a typical replace keeps the text size
             ' roughly stable, so the common case never pays List growth doubling.
@@ -1079,6 +1212,7 @@ Namespace Internal
         End Function
 
         Private Function Lrstrip(left As Boolean, right As Boolean) As NormalizedString
+            MaterializeNormalized()
             Dim leadingSpaces As Integer = 0
             If left Then
                 For Each sc In Utf8Helpers.EnumerateScalars(_normalized)
@@ -1132,6 +1266,7 @@ Namespace Internal
 
         ''' <summary>Applies NFD normalization.</summary>
         Public Function Nfd() As NormalizedString
+            MaterializeNormalized()
             Dim stream As List(Of NormChar) = UnicodeNormalizer.Decompose(_normalized, compat:=False)
             Me.Transform(stream.Select(Function(x) (x.Ch, x.Change)), 0)
             Return Me
@@ -1139,6 +1274,7 @@ Namespace Internal
 
         ''' <summary>Applies NFKD normalization.</summary>
         Public Function Nfkd() As NormalizedString
+            MaterializeNormalized()
             Dim stream As List(Of NormChar) = UnicodeNormalizer.Decompose(_normalized, compat:=True)
             Me.Transform(stream.Select(Function(x) (x.Ch, x.Change)), 0)
             Return Me
@@ -1146,6 +1282,7 @@ Namespace Internal
 
         ''' <summary>Applies NFC normalization.</summary>
         Public Function Nfc() As NormalizedString
+            MaterializeNormalized()
             Dim nfd As List(Of NormChar) = UnicodeNormalizer.Decompose(_normalized, compat:=False)
             Dim composed As List(Of NormChar) = UnicodeNormalizer.Compose(nfd)
             Me.Transform(composed.Select(Function(x) (x.Ch, x.Change)), 0)
@@ -1154,6 +1291,7 @@ Namespace Internal
 
         ''' <summary>Applies NFKC normalization.</summary>
         Public Function Nfkc() As NormalizedString
+            MaterializeNormalized()
             Dim nfd As List(Of NormChar) = UnicodeNormalizer.Decompose(_normalized, compat:=True)
             Dim composed As List(Of NormChar) = UnicodeNormalizer.Compose(nfd)
             Me.Transform(composed.Select(Function(x) (x.Ch, x.Change)), 0)
@@ -1180,6 +1318,7 @@ Namespace Internal
         ''' <paramref name="behavior"/>.
         ''' </summary>
         Public Function Split(pattern As Pattern, behavior As SplitDelimiterBehavior) As List(Of NormalizedString)
+            MaterializeNormalized()
             Dim matches As List(Of MatchInfo) = pattern.FindMatches(_normalized)
 
             ' Isolated (the pre-tokenizer hot path): every match becomes a piece and no
@@ -1278,6 +1417,7 @@ Namespace Internal
         ''' corresponding (offset, length) range into the normalized string.
         ''' </summary>
         Public Function AlignmentsOriginal() As List(Of (Integer, Integer))
+            MaterializeOriginal()
             ' Pre-size to the original byte length: the output has exactly one entry per original
             ' byte, so the common case never pays List growth doubling.
             Dim result As New List(Of (Integer, Integer))(Utf8Helpers.Utf8Length(_original))
@@ -1334,6 +1474,7 @@ Namespace Internal
         #End Region
 
         Public Overrides Function ToString() As String
+            MaterializeNormalized()
             Return _normalized
         End Function
     End Class

@@ -28,7 +28,7 @@ Namespace Models
         ''' <c>EncodeCount</c> callers (e.g. the scanner's <c>Parallel.ForEach</c>) never contend on
         ''' shared mutable state. <c>Nothing</c> when the cache is disabled (capacity &lt;= 0).
         ''' </summary>
-        Private ReadOnly _cache As ThreadLocal(Of Cache(Of String, List(Of (Integer, Integer))))
+        Private ReadOnly _cache As ThreadLocal(Of Cache(Of String, CacheValue))
         Private ReadOnly _dropout As Double?
         Private ReadOnly _unkToken As String
         Private ReadOnly _continuingSubwordPrefix As String
@@ -97,6 +97,51 @@ Namespace Models
                 Me.NewId = newId
             End Sub
         End Structure
+
+        ''' <summary>
+        ''' A cached word→merged-symbols entry. Real-code corpora merge ~85% of words to exactly
+        ''' one token, so the value is a union: single-token results store the (id, byteLen)
+        ''' tuple directly (no List), multi-token results store the <see cref="Many"/> List.
+        ''' <see cref="Count"/> is the merged symbol count (1 for single, Many.Count for multi,
+        ''' 0 for an empty result). A cache miss is distinguishable by <c>Count = 0</c> (a
+        ''' non-empty merge result always has Count &gt; 0; empty results are simply not cached).
+        ''' </summary>
+        Private Structure CacheValue
+            Public Count As Integer
+            Public Single_ As (Integer, Integer)
+            Public Many As List(Of (Integer, Integer))
+
+            Public Sub New(count As Integer, singleValue As (Integer, Integer), many As List(Of (Integer, Integer)))
+                Me.Count = count
+                Me.Single_ = singleValue
+                Me.Many = many
+            End Sub
+        End Structure
+
+        ''' <summary>
+        ''' Per-thread reusable merge buffers (<see cref="MergeAllSymbols"/>): the doubly-linked
+        ''' nodes list, the min-priority queue and the dropout skip list. Reused across calls so
+        ''' a cache-miss merge allocates only the small result list. Thread-local (never shared),
+        ''' matching the word cache: concurrent <c>EncodeCount</c> callers each get their own
+        ''' buffers and never contend. The buffers are never exposed outside
+        ''' <see cref="MergeAllSymbols"/>, so reusing them cannot alias a cached value.
+        ''' </summary>
+        Private Structure MergeScratch
+            Public Nodes As List(Of SymbolNode)
+            Public Queue As PriorityQueue(Of MergeNode, (Integer, Integer))
+            Public Skip As List(Of MergeNode)
+        End Structure
+
+        Private Shared Function CreateMergeScratch() As MergeScratch
+            Dim s As New MergeScratch()
+            s.Nodes = New List(Of SymbolNode)()
+            s.Queue = New PriorityQueue(Of MergeNode, (Integer, Integer))()
+            s.Skip = New List(Of MergeNode)()
+            Return s
+        End Function
+
+        Private Shared ReadOnly _mergeScratch As ThreadLocal(Of MergeScratch) =
+            New ThreadLocal(Of MergeScratch)(AddressOf CreateMergeScratch)
 
         ''' <summary>
         ''' Creates a BPE model.
@@ -211,9 +256,11 @@ Namespace Models
                 _cache = Nothing
             Else
                 ' One bounded FIFO cache per thread, created lazily on first access. Capacity and
-                ' eviction are kept per-thread, matching the Rust thread-local cache.
-                _cache = New ThreadLocal(Of Cache(Of String, List(Of (Integer, Integer))))(
-                    Function() New Cache(Of String, List(Of (Integer, Integer)))(cacheCapacity))
+                ' eviction are kept per-thread, matching the Rust thread-local cache. The value is
+                ' the CacheValue union (single-token words store a tuple, not a List), so ~85% of
+                ' real-code cache entries hold no List.
+                _cache = New ThreadLocal(Of Cache(Of String, CacheValue))(
+                    Function() New Cache(Of String, CacheValue)(cacheCapacity))
             End If
         End Sub
 
@@ -363,16 +410,26 @@ Namespace Models
 
             Dim useCache As Boolean = (_cache IsNot Nothing) AndAlso (Not _dropout.HasValue OrElse _dropout.Value = 0.0)
             If useCache Then
-                Dim cache As Cache(Of String, List(Of (Integer, Integer))) = _cache.Value
+                Dim cache As Cache(Of String, CacheValue) = _cache.Value
                 If _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
                     ' Words longer than the cache-eligibility limit bypass the cache entirely:
                     ' no lookup, no insert, but still merged normally so the result is identical.
                     cache.RecordSkip()
                     symbols = MergeWord(word)
                 Else
-                    Dim cached As List(Of (Integer, Integer)) = cache.GetValue(word)
-                    If cached IsNot Nothing Then
-                        symbols = cached
+                    Dim cv As CacheValue = cache.GetValue(word)
+                    If cv.Count > 0 Then
+                        ' Cache hit.
+                        If cv.Count = 1 Then
+                            ' Single merged token: build the token directly from the cached
+                            ' tuple, avoiding both a List(Of (Integer,Integer)) materialization
+                            ' and the symbol-iteration loop. Byte offsets are (0, byteLen)
+                            ' exactly as the word_to_tokens tail would compute.
+                            Dim byteLen As Integer = cv.Single_.Item2
+                            Return New List(Of Token)() From {
+                                New Token(cv.Single_.Item1, _vocabR(cv.Single_.Item1), (0, byteLen))}
+                        End If
+                        symbols = cv.Many
                     End If
                 End If
             End If
@@ -380,7 +437,15 @@ Namespace Models
             If symbols Is Nothing Then
                 symbols = MergeWord(word)
                 If useCache Then
-                    _cache.Value.Insert(word, symbols)
+                    Dim cache As Cache(Of String, CacheValue) = _cache.Value
+                    If symbols.Count = 1 Then
+                        cache.Insert(word, New CacheValue(1, symbols(0), Nothing))
+                    ElseIf symbols.Count > 1 Then
+                        cache.Insert(word, New CacheValue(symbols.Count, Nothing, symbols))
+                    End If
+                    ' symbols.Count = 0 (every scalar silently omitted, no unk/byteFallback):
+                    ' not cached; GetValue would read Count = 0 as a miss and re-merge, which is
+                    ' correct (and such words are pathological).
                 End If
             End If
 
@@ -394,6 +459,67 @@ Namespace Models
                 pos = newPos
             Next
             Return tokens
+        End Function
+
+        ''' <summary>
+        ''' Returns the number of tokens <see cref="Tokenize"/> would produce for the given word,
+        ''' without building the <c>List(Of Token)</c> (and without the per-token reverse-vocab
+        ''' lookup <c>Tokenize</c> pays in its word_to_tokens tail). Structurally identical to
+        ''' <see cref="Tokenize"/>: same empty-word / <c>ignoreMerges</c> early-outs, same
+        ''' cache-hit / max-word-bypass / miss-then-insert semantics, same <c>MergeWord</c> symbol
+        ''' set. <see cref="Tokenize"/> builds one <see cref="Token"/> per symbol 1:1, so
+        ''' <c>CountTokens(word) = Tokenize(word).Count</c> for every word. This is the count-only
+        ''' fast path's per-word hot function; on a cache hit it reads the union
+        ''' <c>CacheValue.Count</c> directly (O(1), no <c>List(Of (Integer, Integer))</c>).
+        ''' </summary>
+        Public Function CountTokens(word As String) As Integer Implements IModel.CountTokens
+            If word Is Nothing OrElse word.Length = 0 Then
+                Return 0
+            End If
+
+            ' ignore_merges: if the whole word is in the vocab, emit it directly (1 token).
+            ' Mirrors the Tokenize early-out exactly.
+            If _ignoreMerges Then
+                Dim wholeId As Integer
+                If _vocab.TryGetValue(word, wholeId) Then
+                    Return 1
+                End If
+            End If
+
+            Dim symbols As List(Of (Integer, Integer)) = Nothing
+
+            Dim useCache As Boolean = (_cache IsNot Nothing) AndAlso (Not _dropout.HasValue OrElse _dropout.Value = 0.0)
+            If useCache Then
+                Dim cache As Cache(Of String, CacheValue) = _cache.Value
+                If _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
+                    ' Words longer than the cache-eligibility limit bypass the cache entirely:
+                    ' no lookup, no insert, but still merged normally (identical result).
+                    cache.RecordSkip()
+                    symbols = MergeWord(word)
+                Else
+                    Dim cv As CacheValue = cache.GetValue(word)
+                    If cv.Count > 0 Then
+                        ' Cache hit: the cached value carries the merged symbol count directly,
+                        ' so the count is O(1) and needs no List(Of (Integer,Integer)) dereference
+                        ' (notably on the ~85% single-token entries, which hold no List at all).
+                        Return cv.Count
+                    End If
+                End If
+            End If
+
+            If symbols Is Nothing Then
+                symbols = MergeWord(word)
+                If useCache Then
+                    Dim cache As Cache(Of String, CacheValue) = _cache.Value
+                    If symbols.Count = 1 Then
+                        cache.Insert(word, New CacheValue(1, symbols(0), Nothing))
+                    ElseIf symbols.Count > 1 Then
+                        cache.Insert(word, New CacheValue(symbols.Count, Nothing, symbols))
+                    End If
+                End If
+            End If
+
+            Return symbols.Count
         End Function
 
         ''' <summary>
@@ -513,15 +639,25 @@ Namespace Models
         ''' </summary>
         Private Function MergeAllSymbols(symbols As List(Of (Integer, Integer))) As List(Of (Integer, Integer))
             Dim count As Integer = symbols.Count
-            Dim nodes As New List(Of SymbolNode)(count)
+
+            ' Reuse the per-thread nodes list / priority queue / skip list so a cache-miss
+            ' merge allocates only the small result list. Clear keeps the backing storage; the
+            ' algorithm only ever touches indices in [0, count), which the rebuild fully
+            ' overwrites, so stale entries beyond count are never read.
+            Dim scratch As MergeScratch = _mergeScratch.Value
+            Dim nodes As List(Of SymbolNode) = scratch.Nodes
+            nodes.Clear()
+            If nodes.Capacity < count Then nodes.Capacity = count
             For i As Integer = 0 To count - 1
                 Dim prev As Integer = If(i = 0, -1, i - 1)
                 Dim nxt As Integer = If(i = count - 1, -1, i + 1)
                 nodes.Add(New SymbolNode(symbols(i).Item1, prev, nxt, symbols(i).Item2))
             Next
 
-            Dim queue As New PriorityQueue(Of MergeNode, (Integer, Integer))()
-            Dim skip As New List(Of MergeNode)()
+            Dim queue As PriorityQueue(Of MergeNode, (Integer, Integer)) = scratch.Queue
+            queue.Clear()
+            Dim skip As List(Of MergeNode) = scratch.Skip
+            skip.Clear()
 
             ' Seed all adjacent pairs present in the merge map (by vector index, like Rust).
             For i As Integer = 0 To count - 2
