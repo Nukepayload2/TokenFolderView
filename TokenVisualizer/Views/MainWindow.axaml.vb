@@ -1,7 +1,11 @@
+Imports System.Collections.Generic
+Imports System.Threading.Tasks
+Imports Avalonia
 Imports Avalonia.Controls
 Imports Avalonia.Input
 Imports Avalonia.Media
 Imports Avalonia.Threading
+Imports Avalonia.VisualTree
 Imports FluentAvalonia.UI.Controls
 Imports TokenVisualizer.Services
 
@@ -16,7 +20,6 @@ Namespace Views
         Private _searchQuery As String = ""
         Private WithEvents _searchTimer As DispatcherTimer
         Private WithEvents _statusTimer As DispatcherTimer
-        Private _currentBackdrop As String = "Simple"
 
         Public Sub New()
             InitializeComponent()
@@ -30,27 +33,6 @@ Namespace Views
             _statusTimer.Start()
         End Sub
 
-        ' ---- Backdrop (Mica / Acrylic / Simple) ----
-
-        Public Sub ApplyBackdrop()
-            ApplyBackdrop(_currentBackdrop)
-        End Sub
-
-        Public Sub ApplyBackdrop(backdrop As String)
-            _currentBackdrop = backdrop
-            Select Case backdrop
-                Case "Mica"
-                    TransparencyLevelHint = {WindowTransparencyLevel.Mica}
-                    Background = Brushes.Transparent
-                Case "Acrylic"
-                    TransparencyLevelHint = {WindowTransparencyLevel.AcrylicBlur}
-                    Background = Brushes.Transparent
-                Case Else ' Simple
-                    TransparencyLevelHint = {WindowTransparencyLevel.None}
-                    Background = Nothing
-            End Select
-        End Sub
-
         Private Sub TitleBarBorder_PointerPressed(sender As Object, e As PointerPressedEventArgs) Handles TitleBarBorder.PointerPressed
             If e.GetCurrentPoint(Me).Properties.IsLeftButtonPressed Then
                 BeginMoveDrag(e)
@@ -60,14 +42,11 @@ Namespace Views
         Private Sub Window_Loaded() Handles Me.Loaded
             BuildNavigationMenu()
 
-            ' Apply the saved backdrop from settings.
-            Try
-                ApplyBackdrop(SettingsService.Load().BackdropName)
-            Catch
-            End Try
+            ' Hide the platform's Fullscreen caption button (kept out of the UI by design).
+            ScheduleHideFullScreenButton()
 
             ' Preload the active tokenizer in the background so the Explorer page has it.
-            Threading.Tasks.Task.Run(Sub() AppState.EnsureActiveTokenizer())
+            Task.Run(Sub() AppState.EnsureActiveTokenizer())
         End Sub
 
         ' ---- Navigation ----
@@ -201,5 +180,66 @@ Namespace Views
                 End Try
             End If
         End Sub
+
+        ''' <summary>
+        ''' Hides the Fullscreen caption button that Avalonia 12's native window decorations
+        ''' (WindowDrawnDecorations) render alongside Minimize/Maximize/Close. There is no
+        ''' SystemDecorations level between "BorderOnly" and "Full", so we hide the button by
+        ''' walking the visual tree. The decorations live under the window's VisualRoot (the
+        ''' TopLevelHost), not under the Window control itself, so we search there too. The
+        ''' decorations template applies after Loaded, so the walk is retried on a short timer
+        ''' until the button is found.
+        ''' </summary>
+        Private WithEvents _fullScreenHideTimer As DispatcherTimer
+        Private _fullScreenHideRetries As Integer = 0
+
+        Private Sub ScheduleHideFullScreenButton()
+            _fullScreenHideTimer = New DispatcherTimer With {
+                .Interval = TimeSpan.FromMilliseconds(250)
+            }
+            _fullScreenHideTimer.Start()
+        End Sub
+
+        Private Sub FullScreenHideTimer_Tick() Handles _fullScreenHideTimer.Tick
+            _fullScreenHideRetries += 1
+            If HideFullScreenButtons() Then
+                _fullScreenHideTimer.Stop()
+            ElseIf _fullScreenHideRetries >= 16 Then
+                ' Give up after ~4s; the decorations may not have applied on this platform.
+                _fullScreenHideTimer.Stop()
+            End If
+        End Sub
+
+        Private Function HideFullScreenButtons() As Boolean
+            Dim found As Boolean = False
+            Dim roots As New List(Of Visual)()
+            roots.Add(Me)
+            If Me.VisualRoot IsNot Nothing Then roots.Add(Me.VisualRoot)
+            For Each child As Visual In Me.GetVisualChildren()
+                roots.Add(child)
+            Next
+            For Each rootVisual As Visual In roots
+                Dim stack As New Stack(Of Visual)()
+                stack.Push(rootVisual)
+                While stack.Count > 0
+                    Dim v = stack.Pop()
+                    Dim b = TryCast(v, Button)
+                    If b IsNot Nothing AndAlso IsFullScreenCaptionButton(b) Then
+                        b.IsVisible = False
+                        found = True
+                    End If
+                    For Each child As Visual In v.GetVisualChildren()
+                        stack.Push(child)
+                    Next
+                End While
+            Next
+            Return found
+        End Function
+
+        Private Shared Function IsFullScreenCaptionButton(b As Button) As Boolean
+            Return String.Equals(b.Name, "PART_FullScreenButton", StringComparison.OrdinalIgnoreCase) OrElse
+                   String.Equals(b.Name, "PART_PopoverFullScreenButton", StringComparison.OrdinalIgnoreCase) OrElse
+                   String.Equals(b.Name, "Fullscreen", StringComparison.OrdinalIgnoreCase)
+        End Function
     End Class
 End Namespace

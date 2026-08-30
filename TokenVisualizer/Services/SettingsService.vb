@@ -71,9 +71,6 @@ Namespace Services
         ''' <summary>UI theme: "System", "Light" or "Dark".</summary>
         Public Property ThemeName As String = "System"
 
-        ''' <summary>Window backdrop: "Simple", "Mica" or "Acrylic".</summary>
-        Public Property BackdropName As String = "Simple"
-
         ''' <summary>Index of the active tokenizer in <see cref="Tokenizers"/>.</summary>
         Public Property ActiveTokenizerIndex As Integer = 0
 

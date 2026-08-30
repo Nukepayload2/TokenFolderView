@@ -36,7 +36,7 @@
             </ui:FASettingsExpander>
 
             <!-- 外观 -->
-            <ui:FASettingsExpander Header="外观" Description="切换应用主题与窗口背景效果" IconSource="Color">
+            <ui:FASettingsExpander Header="外观" Description="切换应用主题" IconSource="Color">
                 <StackPanel Spacing="14">
                     <StackPanel Spacing="6">
                         <TextBlock Text="主题" Opacity="0.8"/>
@@ -44,14 +44,6 @@
                             <ComboBoxItem Content="跟随系统" Tag="System"/>
                             <ComboBoxItem Content="浅色" Tag="Light"/>
                             <ComboBoxItem Content="深色" Tag="Dark"/>
-                        </ComboBox>
-                    </StackPanel>
-                    <StackPanel Spacing="6">
-                        <TextBlock Text="背景效果" Opacity="0.8"/>
-                        <ComboBox x:Name="CboBackdrop" MinWidth="180">
-                            <ComboBoxItem Content="无" Tag="Simple"/>
-                            <ComboBoxItem Content="Mica" Tag="Mica"/>
-                            <ComboBoxItem Content="Acrylic" Tag="Acrylic"/>
                         </ComboBox>
                     </StackPanel>
                 </StackPanel>

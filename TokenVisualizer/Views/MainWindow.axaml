@@ -13,9 +13,8 @@
     <Grid RowDefinitions="Auto,*,Auto">
         <!-- Row 0: extended title bar with search -->
         <Border x:Name="TitleBarBorder" Height="48" Padding="0,0,140,0" Background="{DynamicResource SystemControlBackgroundAltHighBrush}">
-            <Grid ColumnDefinitions="Auto,*,Auto">
-                <TextBlock Text="Token 可视化" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center" Margin="16,0,0,0"/>
-                <TextBox x:Name="SearchBox" Grid.Column="1" PlaceholderText="搜索文件 / 文件夹…" Width="400" MaxWidth="500" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <Grid ColumnDefinitions="*">
+                <TextBox x:Name="SearchBox" PlaceholderText="搜索文件 / 文件夹…" Width="400" MaxWidth="500" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Grid>
         </Border>
         <!-- Row 1: navigation -->

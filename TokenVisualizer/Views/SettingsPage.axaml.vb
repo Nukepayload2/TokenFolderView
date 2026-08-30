@@ -44,12 +44,6 @@ Namespace Views
                 Case "Dark" : CboTheme.SelectedIndex = 2
                 Case Else : CboTheme.SelectedIndex = 0
             End Select
-
-            Select Case _settings.BackdropName
-                Case "Mica" : CboBackdrop.SelectedIndex = 1
-                Case "Acrylic" : CboBackdrop.SelectedIndex = 2
-                Case Else : CboBackdrop.SelectedIndex = 0
-            End Select
         End Sub
 
         ' ------------------------------------------------------------------
@@ -118,23 +112,6 @@ Namespace Views
             End Select
             _settings.ThemeName = themeName
             SettingsService.Save(_settings)
-            ' Refresh the backdrop so the new theme colors take effect.
-            Dim wnd = TryCast(TopLevel.GetTopLevel(Me), MainWindow)
-            If wnd IsNot Nothing Then wnd.ApplyBackdrop()
-        End Sub
-
-        Private Sub CboBackdrop_SelectionChanged(sender As Object, e As SelectionChangedEventArgs) Handles CboBackdrop.SelectionChanged
-            If _loading OrElse _settings Is Nothing Then Return
-            Dim tag As String = GetSelectedTag(CboBackdrop)
-            Dim backdropName As String = "Simple"
-            Select Case tag
-                Case "Mica" : backdropName = "Mica"
-                Case "Acrylic" : backdropName = "Acrylic"
-            End Select
-            _settings.BackdropName = backdropName
-            SettingsService.Save(_settings)
-            Dim wnd = TryCast(TopLevel.GetTopLevel(Me), MainWindow)
-            If wnd IsNot Nothing Then wnd.ApplyBackdrop(backdropName)
         End Sub
 
         Private Shared Function GetSelectedTag(cbo As ComboBox) As String
