@@ -120,6 +120,13 @@ Namespace Scanning
 
         ' ------------------------------------------------------------------
 
+        ''' <summary>
+        ''' Handles a single file, opening it exactly once. A short head probe is read first and
+        ''' checked for binary content (when enabled); text files then keep reading the rest of the
+        ''' file on the same handle and are token-counted, so a counted file pays a single open.
+        ''' Binary files are skipped after paying only the head read. Any read/decode/count failure
+        ''' increments the error counter instead of aborting the scan.
+        ''' </summary>
         Private Sub ProcessFile(relativePath As String,
                                 fullPath As String,
                                 length As Long,
@@ -129,61 +136,54 @@ Namespace Scanning
                 Return
             End If
 
-            If _options.CheckBinary AndAlso IsBinaryFile(fullPath, length) Then
-                ScanProgress.IncrementFilesSkipped()
-                Return
-            End If
-
+            Dim headLen As Integer = CInt(Math.Min(length, BinaryHeadBytes))
+            Dim probe As Byte() = ArrayPool(Of Byte).Shared.Rent(headLen)
+            Dim buffer As Byte() = Nothing
             Try
-                Dim tokenCount As Integer = CountTokens(fullPath, length)
+                Dim bytesRead As Integer
+                Dim isBinary As Boolean
+                Using fs As New FileStream(fullPath, FileMode.Open, FileAccess.Read,
+                                           FileShare.ReadWrite Or FileShare.Delete, 4096, FileOptions.SequentialScan)
+                    bytesRead = ReadAtMost(fs, probe, 0, headLen)
+                    isBinary = _options.CheckBinary AndAlso BinaryDetector.IsBinary(probe.AsMemory(0, bytesRead))
+                    If Not isBinary Then
+                        buffer = ArrayPool(Of Byte).Shared.Rent(CInt(length))
+                        Array.Copy(probe, 0, buffer, 0, bytesRead)
+                        bytesRead += ReadAtMost(fs, buffer, bytesRead, CInt(length) - bytesRead)
+                    End If
+                End Using
+
+                If isBinary Then
+                    ScanProgress.IncrementFilesSkipped()
+                    Return
+                End If
+
+                Dim text As String = Encoding.UTF8.GetString(buffer, 0, bytesRead)
+                Dim tokenCount As Integer = _tokenizer.EncodeCount(text)
                 results.Add((relativePath, length, tokenCount))
                 ScanProgress.IncrementFilesScanned()
                 ScanProgress.AddTotalTokens(tokenCount)
             Catch ex As Exception
                 ScanProgress.IncrementFilesWithErrors()
+            Finally
+                ArrayPool(Of Byte).Shared.Return(probe)
+                If buffer IsNot Nothing Then ArrayPool(Of Byte).Shared.Return(buffer)
             End Try
         End Sub
 
-        ''' <summary>Reads the first <see cref="BinaryHeadBytes"/> bytes of the file and runs <see cref="BinaryDetector.IsBinary"/>.</summary>
-        Private Shared Function IsBinaryFile(fullPath As String, length As Long) As Boolean
-            Dim headLength As Integer = CInt(Math.Min(length, BinaryHeadBytes))
-            Dim buffer As Byte() = ArrayPool(Of Byte).Shared.Rent(headLength)
-            Try
-                Dim bytesRead As Integer = ReadFilePrefix(fullPath, buffer, headLength)
-                Return BinaryDetector.IsBinary(buffer.AsMemory(0, bytesRead))
-            Finally
-                ArrayPool(Of Byte).Shared.Return(buffer)
-            End Try
-        End Function
-
-        ''' <summary>Reads the whole file (already known to be within the size limit) and counts its tokens.</summary>
-        Private Function CountTokens(fullPath As String, length As Long) As Integer
-            Dim buffer As Byte() = ArrayPool(Of Byte).Shared.Rent(CInt(length))
-            Try
-                Dim bytesRead As Integer = ReadFilePrefix(fullPath, buffer, CInt(length))
-                Dim text As String = Encoding.UTF8.GetString(buffer, 0, bytesRead)
-                Return _tokenizer.EncodeCount(text)
-            Finally
-                ArrayPool(Of Byte).Shared.Return(buffer)
-            End Try
-        End Function
-
         ''' <summary>
-        ''' Reads up to <paramref name="desiredBytes"/> bytes from the start of the file, tolerating
-        ''' short reads and files that are concurrently truncated.
+        ''' Reads up to <paramref name="count"/> bytes from <paramref name="fs"/> into
+        ''' <paramref name="buffer"/> at <paramref name="offset"/>, tolerating short reads.
+        ''' Returns the number of bytes actually read.
         ''' </summary>
-        Private Shared Function ReadFilePrefix(fullPath As String, buffer As Byte(), desiredBytes As Integer) As Integer
-            If desiredBytes = 0 Then Return 0
-            Using fs As New FileStream(fullPath, FileMode.Open, FileAccess.Read,
-                                       FileShare.ReadWrite Or FileShare.Delete, 4096, FileOptions.SequentialScan)
-                Dim offset As Integer = 0
-                While offset < desiredBytes
-                    Dim read As Integer = fs.Read(buffer, offset, desiredBytes - offset)
-                    If read <= 0 Then Exit While
-                    offset += read
-                End While
-                Return offset
-            End Using
+        Private Shared Function ReadAtMost(fs As FileStream, buffer As Byte(), offset As Integer, count As Integer) As Integer
+            Dim read As Integer = 0
+            While read < count
+                Dim n As Integer = fs.Read(buffer, offset + read, count - read)
+                If n <= 0 Then Exit While
+                read += n
+            End While
+            Return read
         End Function
 
         ''' <summary>Recursively collects files, pruning blacklisted folders by name at any depth.</summary>

@@ -5,7 +5,6 @@ Imports System.Threading
 Imports System.Threading.Tasks
 Imports Avalonia
 Imports Avalonia.Controls
-Imports Avalonia.Controls.Documents
 Imports Avalonia.Platform.Storage
 Imports Avalonia.Threading
 Imports Tokenizers
@@ -230,7 +229,7 @@ Namespace Views
 
         Private Sub ClearContentView()
             Interlocked.Increment(_loadGeneration)
-            TokenText.Inlines.Clear()
+            TokenLines.ItemsSource = Nothing
             TblFileName.Text = ""
             TblFileMeta.Text = ""
             TblEmpty.IsVisible = True
@@ -244,30 +243,35 @@ Namespace Views
             TblFileName.Text = node.Name
             TblFileMeta.Text = "加载中…"
             TblEmpty.IsVisible = True
-            TokenText.Inlines.Clear()
+            TokenLines.ItemsSource = Nothing
             TokenScroll.Offset = New Vector(0, 0)
 
             Try
-                Dim result = Await Task.Run(Function() BuildRuns(node.FullPath, tokenizer))
+                Dim result = Await Task.Run(Function() BuildLines(node.FullPath, tokenizer))
                 If gen <> _loadGeneration Then Return ' stale load, superseded by a newer selection
 
                 TblFileName.Text = result.fileName
                 TblFileMeta.Text = $"{FormatBytes(result.byteLength)} · {result.charCount:N0} 字符 · {result.tokenCount:N0} tokens"
-                TokenizedTextView.Populate(TokenText, result.runs)
+                TokenLines.ItemsSource = result.lines
                 TblEmpty.IsVisible = False
             Catch ex As OperationCanceledException
             Catch ex As Exception
                 If gen <> _loadGeneration Then Return
                 TblFileMeta.Text = ""
-                TokenText.Inlines.Clear()
-                TokenText.Inlines.Add(New Run With {.Text = $"无法读取文件：{ex.Message}"})
+                TokenLines.ItemsSource = Nothing
+                TokenLines.ItemsSource = New List(Of TokenLine)() From {TokenLine.FromPlainText($"无法读取文件：{ex.Message}")}
                 TblEmpty.IsVisible = False
             End Try
         End Sub
 
-        ''' <summary>Heavy work for the colored view, run off the UI thread.</summary>
-        Private Shared Function BuildRuns(fullPath As String,
-                                          tokenizer As Tokenizer) As (fileName As String, byteLength As Long, charCount As Integer, tokenCount As Integer, runs As List(Of (Text As String, Accent As Boolean)))
+        ''' <summary>
+        ''' Heavy work for the colored view, run off the UI thread. Only cheap integer structures are
+        ''' built here (decoded text, token spans, per-line records); the per-line run tuples and
+        ''' Avalonia inlines are computed lazily on the UI thread by <see cref="TokenLine"/> when a
+        ''' virtualized container is materialized.
+        ''' </summary>
+        Private Shared Function BuildLines(fullPath As String,
+                                           tokenizer As Tokenizer) As (fileName As String, byteLength As Long, charCount As Integer, tokenCount As Integer, lines As List(Of TokenLine))
             Dim fileName = Path.GetFileName(fullPath)
             Dim fi As New FileInfo(fullPath)
             Dim length = fi.Length
@@ -288,52 +292,16 @@ Namespace Views
                 End Try
 
                 Dim spans = tokenizer.EncodeWithSpans(text)
-                Dim runs As New List(Of (Text As String, Accent As Boolean))()
-                BuildRunsCore(text, spans, runs)
-                Return (fileName, length, text.Length, spans.Count, runs)
+                Dim source = TokenSource.Create(text, spans)
+                Dim lines As New List(Of TokenLine)(source.Lines.Length)
+                For i As Integer = 0 To source.Lines.Length - 1
+                    lines.Add(New TokenLine(source, i))
+                Next
+                Return (fileName, length, text.Length, spans.Count, lines)
             Finally
                 ArrayPool(Of Byte).Shared.Return(buffer)
             End Try
         End Function
-
-        ''' <summary>
-        ''' Walks the token spans and emits (text, accent) runs covering the whole string. Gaps
-        ''' between token spans (normalization drops etc.) are emitted as normal runs; even-indexed
-        ''' tokens are normal and odd-indexed tokens are accented.
-        ''' </summary>
-        Private Shared Sub BuildRunsCore(text As String,
-                                         spans As IReadOnlyList(Of (Integer, Integer, Integer)),
-                                         runs As List(Of (Text As String, Accent As Boolean)))
-            Dim pos As Integer = 0
-            Dim idx As Integer = 0
-            For Each span In spans
-                Dim s = span.Item2
-                Dim e = span.Item3
-                If s < pos Then s = pos
-                If e < pos Then e = pos
-                If e <= pos Then Continue For
-
-                If s > pos Then
-                    AddRun(runs, text.Substring(pos, s - pos), False)
-                    pos = s
-                End If
-                AddRun(runs, text.Substring(s, e - s), (idx Mod 2 = 1))
-                pos = e
-                idx += 1
-            Next
-            If pos < text.Length Then
-                AddRun(runs, text.Substring(pos), False)
-            End If
-        End Sub
-
-        Private Shared Sub AddRun(runs As List(Of (Text As String, Accent As Boolean)), text As String, accent As Boolean)
-            If String.IsNullOrEmpty(text) Then Return
-            If runs.Count > 0 AndAlso runs(runs.Count - 1).Accent = accent Then
-                runs(runs.Count - 1) = (runs(runs.Count - 1).Text & text, accent)
-            Else
-                runs.Add((text, accent))
-            End If
-        End Sub
 
         Private Shared Function ReadFilePrefix(path As String, buffer As Byte(), desiredBytes As Integer) As Integer
             If desiredBytes = 0 Then Return 0

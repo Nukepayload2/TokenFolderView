@@ -3,6 +3,7 @@
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:scanning="using:Tokenizers.Scanning"
+             xmlns:controls="using:TokenVisualizer.Controls"
              mc:Ignorable="d" d:DesignWidth="1200" d:DesignHeight="800"
              x:Class="TokenVisualizer.Views.ExplorerPage">
 
@@ -64,12 +65,24 @@
                     </StackPanel>
                 </Border>
                 <Grid Grid.Row="1">
-                    <ScrollViewer x:Name="TokenScroll">
-                        <TextBlock x:Name="TokenText"
-                                   FontFamily="Cascadia Code,Consolas,Courier New"
-                                   TextWrapping="Wrap"
-                                   IsHitTestVisible="False"
-                                   Margin="12,4"/>
+                    <ScrollViewer x:Name="TokenScroll"
+                                  HorizontalScrollBarVisibility="Auto"
+                                  VerticalScrollBarVisibility="Auto">
+                        <ItemsControl x:Name="TokenLines" Margin="12,4">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel/>
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate x:DataType="controls:TokenLine">
+                                    <TextBlock Inlines="{Binding Inlines, Mode=OneWay}"
+                                               FontFamily="Cascadia Code,Consolas,Courier New"
+                                               TextWrapping="NoWrap"
+                                               IsHitTestVisible="False"/>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
                     </ScrollViewer>
                     <TextBlock x:Name="TblEmpty" Text="选择文件查看 token 着色"
                                HorizontalAlignment="Center" VerticalAlignment="Center"
