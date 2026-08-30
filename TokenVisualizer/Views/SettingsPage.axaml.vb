@@ -100,16 +100,11 @@ Namespace Views
             Dim tag As String = GetSelectedTag(CboTheme)
             Dim themeName As String = "System"
             Select Case tag
-                Case "Light"
-                    Application.Current.RequestedThemeVariant = ThemeVariant.Light
-                    themeName = "Light"
-                Case "Dark"
-                    Application.Current.RequestedThemeVariant = ThemeVariant.Dark
-                    themeName = "Dark"
-                Case Else
-                    Application.Current.RequestedThemeVariant = Nothing
-                    themeName = "System"
+                Case "Light" : themeName = "Light"
+                Case "Dark" : themeName = "Dark"
+                Case Else : themeName = "System"
             End Select
+            App.ApplyThemeName(themeName)
             _settings.ThemeName = themeName
             SettingsService.Save(_settings)
         End Sub
