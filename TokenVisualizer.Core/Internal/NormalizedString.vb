@@ -773,6 +773,41 @@ Namespace Internal
         End Function
 
         ''' <summary>
+        ''' M9: pooled-buffer twin of <see cref="ToByteMappedString"/>: writes the GPT-2 byte-mapped
+        ''' chars for the normalized byte range <c>[startByte, endByte)</c> into
+        ''' <paramref name="buffer"/> (a caller-owned array, grown on demand and retained across
+        ''' calls — a per-thread reusable buffer, NOT a <see cref="String"/>) and returns the char
+        ''' count. The M2/M8 range-driven count path (<see cref="PreTokenizedString.FusedRangeCountVisitor"/>)
+        ''' uses this to feed the BPE word cache via a <see cref="ReadOnlySpan(Of Char)"/> over the
+        ''' buffer, so a cache hit never materializes the mapped string (the ~800 MB M9 target).
+        ''' Char content is byte-identical to <see cref="ToByteMappedString"/> (the same inner loop,
+        ''' no <c>New String</c>); a lazy no-track source is materialized on demand (via
+        ''' <see cref="NormalizedIndex"/>), exactly like <see cref="ToByteMappedString"/>. The buffer
+        ''' is never exposed to the model (only a span read synchronously inside the count call), so
+        ''' the caller may reuse it for the next range.
+        ''' </summary>
+        Friend Function MapToBuffer(startByte As Integer, endByte As Integer, ByRef buffer As Char()) As Integer
+            If endByte <= startByte Then Return 0
+            ' One mapped Char per UTF-8 byte (a lone surrogate maps as U+FFFD, 3 bytes), so the
+            ' byte-range length is a safe upper bound for the char count.
+            Dim nBytes As Integer = endByte - startByte
+            If buffer Is Nothing OrElse buffer.Length < nBytes Then
+                buffer = New Char(nBytes - 1) {}
+            End If
+            Dim idx As ScalarBoundaryIndex = NormalizedIndex()
+            Dim netA As Integer = ByteToNetCached(idx, _normalized, startByte)
+            Dim netB As Integer = ByteToNetCached(idx, _normalized, endByte)
+            Dim net As Integer = netA
+            Dim count As Integer = 0
+            While net < netB
+                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, net)
+                count += BytesToUnicodeTable.AppendByteTransformChars(buffer, count, cp)
+                net += Utf8Helpers.NetLengthOfCodePoint(cp)
+            End While
+            Return count
+        End Function
+
+        ''' <summary>
         ''' Returns the exception to throw when <see cref="ConvertOffsets"/> fails during
         ''' <see cref="Slice"/>. On a no-track NormalizedString this is the dedicated
         ''' <see cref="OffsetTrackingRequiredException"/> (a signal to the offset-free fast path to

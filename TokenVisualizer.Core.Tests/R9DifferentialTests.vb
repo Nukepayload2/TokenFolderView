@@ -523,10 +523,15 @@ Namespace TokenVisualizer.Core.Tests
             Dim p As EncodeCountStageProfile = tokenizer.ProfileCountStages(big)
             Assert.AreEqual(tokenizer.EncodeCount(big, False), p.TokenCount,
                 "M2 profile TokenCount must match EncodeCount")
-            ' IsGreaterThan(lowerBound, value) asserts value > lowerBound, so to prove the fuse
-            ' phase allocates strictly less than the model phase, FusedSplit is the lower bound.
-            Assert.IsGreaterThan(p.FusedSplitAllocated, p.ModelAllocated,
-                "M2 fuse phase (ranges only) must allocate less than the model phase (mapped strings + BPE)")
+            ' M9: the memory alternate-lookup count path eliminates the per-range mapped-string
+            ' materialization, so the Model phase allocates near zero on a warm word cache (the old
+            ' String path allocated ~1 char of mapped string per input byte). Prove the count path
+            ' actually ran by checking the Model phase stays far below the input size: a Model phase
+            ' well under the input size can only come from the M9 memory path (the fallback
+            ' TokenizeCount path materializes each split's substring, whose size tracks the input).
+            ' IsLessThan(lowerBound, value) asserts value < lowerBound (P-010).
+            Assert.IsLessThan(big.Length * 4L, p.ModelAllocated,
+                $"M9 model phase must stay far below the input size ({p.ModelAllocated} B for {big.Length} chars)")
         End Sub
 
         ''' <summary>
@@ -793,6 +798,58 @@ Namespace TokenVisualizer.Core.Tests
                     Next
                 Next
             Next
+        End Sub
+
+        ''' <summary>
+        ''' M9 differential: the memory-keyed BPE count fast path
+        ''' (<see cref="BpeModel.CountTokensMemory"/>, which resolves the word cache via
+        ''' <see cref="Cache(Of String, CacheValue).GetValueMemory"/> alternate lookup over a
+        ''' <see cref="ReadOnlyMemory(Of Char)"/> without materializing a String) must return the exact
+        ''' same count as the String-keyed <see cref="BpeModel.CountTokens"/> for every word, in both
+        ''' directions: String-inserted cache entries must be found by memory lookups (hits) and
+        ''' memory-inserted entries by String lookups, across misses, single-token and multi-token
+        ''' words, the empty word, and the max-word-length bypass. Guards the alternate-lookup
+        ''' comparer consistency (memory hash == String hash) and the miss materialize+insert path
+        ''' against a divergence. Read-only.
+        ''' </summary>
+        <TestMethod>
+        Public Sub M9_MemoryAlternateLookup_MatchesStringCountTokens()
+            Dim bpe As BpeModel = BuildBpe(cacheCapacity:=10000)
+            bpe.EnableCacheStats()
+            bpe.ResetCacheStats()
+            Dim words As String() = {
+                "", "a", "the", "quick", "brown fox", "hello world", "tokenization",
+                "xyzzy", "zz", "abc123", "a" & ChrW(&H3042), "３",
+                "the quick brown fox jumps over the lazy dog"
+            }
+            ' Interleave String and memory lookups: iteration 0 primes the cache (String inserts),
+            ' the remaining iterations must be memory cache hits over String-seeded entries.
+            For r As Integer = 0 To 3
+                For Each w In words
+                    Dim viaString As Integer = bpe.CountTokens(w)
+                    Dim viaMemory As Integer = bpe.CountTokensMemory(w.AsMemory())
+                    Assert.AreEqual(viaString, viaMemory, $"memory vs string count for '{w}' (repeat {r})")
+                Next
+            Next
+            ' Prime via memory first on fresh words (miss -> materialize + insert), then read back
+            ' via String (a String hit over a memory-inserted entry).
+            Dim fresh As String() = {
+                "jumps over lazy dog",
+                String.Join("", Enumerable.Repeat("ab", 40)),
+                "x" & String.Concat(Enumerable.Repeat("x", 200)),
+                "你好世界 中文编程 测试" & vbCrLf & vbTab & "abc",
+                "hello" & vbLf & "world" & vbCrLf & "again"
+            }
+            For Each w In fresh
+                Dim viaMemory As Integer = bpe.CountTokensMemory(w.AsMemory())
+                Dim viaString As Integer = bpe.CountTokens(w)
+                Assert.AreEqual(viaMemory, viaString, $"memory-first count for '{w}'")
+            Next
+            ' The interleaved loop primed the cache on iteration 0 and hit on iterations 1-3; prove
+            ' the memory lookups actually resolved cached entries (hits) rather than silently missing.
+            Dim stats As CacheStats = bpe.GetCacheStats()
+            Assert.IsGreaterThanOrEqualTo(words.Length, stats.Hits,
+                "memory alternate lookups must hit the String-seeded word cache")
         End Sub
 
         ''' <summary>Test-local <see cref="IFusedRangeVisitor"/> that collects the streamed ranges per split.</summary>

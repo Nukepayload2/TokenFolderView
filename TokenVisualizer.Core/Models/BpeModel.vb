@@ -273,9 +273,14 @@ Namespace Models
                 ' One bounded FIFO cache per thread, created lazily on first access. Capacity and
                 ' eviction are kept per-thread, matching the Rust thread-local cache. The value is
                 ' the CacheValue union (single-token words store a tuple, not a List), so ~85% of
-                ' real-code cache entries hold no List.
+                ' real-code cache entries hold no List. M9: the dictionary is built with the
+                ' StringMemoryAlternateComparer so the M2/M8 count path can resolve cache HITS via
+                ' Dictionary.GetAlternateLookup with a ReadOnlyMemory(Of Char) over a pooled mapping
+                ' buffer (Cache.GetValueMemory) — zero String allocation on the ~96% hit path. The
+                ' comparer is ordinal (case-sensitive, culture-invariant), behaviorally identical to
+                ' the default string comparer, so cache semantics are unchanged.
                 _cache = New ThreadLocal(Of Cache(Of String, CacheValue))(
-                    Function() New Cache(Of String, CacheValue)(cacheCapacity))
+                    Function() New Cache(Of String, CacheValue)(cacheCapacity, comparer:=New StringMemoryAlternateComparer()))
             End If
         End Sub
 
@@ -535,6 +540,53 @@ Namespace Models
             End If
 
             Return symbols.Count
+        End Function
+
+        ''' <summary>
+        ''' M9: memory-keyed count-only twin of <see cref="CountTokens"/> for the M2/M8 range-driven
+        ''' count path. The word is a <see cref="ReadOnlyMemory(Of Char)"/> over a pooled mapping
+        ''' buffer (built by <see cref="NormalizedString.MapToBuffer"/>), so a word-cache HIT (the
+        ''' ~96% common case) resolves via <see cref="Cache(Of String, CacheValue).GetValueMemory"/>
+        ''' with zero String allocation — the mapped chars are never materialized. A miss (the ~4%
+        ''' case) materializes the String once (<c>word.ToString()</c>), merges and inserts it exactly
+        ''' like <see cref="CountTokens"/>' miss tail, so the cache stores only stable Strings (never
+        ''' the pooled buffer — no aliasing). Every other branch (empty word, ignore_merges,
+        ''' max-word-length bypass, no cache / dropout) delegates to <see cref="CountTokens"/> /
+        ''' <see cref="MergeWord"/>, so the result is byte-identical to the String-keyed path for every
+        ''' word and configuration. <see cref="ReadOnlyMemory(Of Char)"/> (not
+        ''' <see cref="ReadOnlySpan(Of Char)"/>) is the key type because the VB compiler does not
+        ''' support ByRef-like types in method signatures (P-011 / BinaryDetector precedent).
+        ''' </summary>
+        Public Function CountTokensMemory(word As ReadOnlyMemory(Of Char)) As Integer
+            If word.IsEmpty Then Return 0
+            If _ignoreMerges Then Return CountTokens(word.ToString())
+            Dim useCache As Boolean = (_cache IsNot Nothing) AndAlso (Not _dropout.HasValue OrElse _dropout.Value = 0.0)
+            If useCache Then
+                Dim cache As Cache(Of String, CacheValue) = _cache.Value
+                If _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
+                    ' Words longer than the cache-eligibility limit bypass the cache entirely:
+                    ' record a skip and merge normally (identical result, no insert), exactly like
+                    ' CountTokens' max-word-length branch.
+                    cache.RecordSkip()
+                    Return MergeWord(word.ToString(), _symbolScratch.Value).Count
+                End If
+                Dim cv As CacheValue = cache.GetValueMemory(word)
+                If cv.Count > 0 Then
+                    ' Cache hit via memory alternate lookup: zero String allocation (M9 target).
+                    Return cv.Count
+                End If
+                ' Cache miss: materialize the String once, merge, insert (CountTokens' miss tail).
+                Dim materialized As String = word.ToString()
+                Dim symbols As List(Of (Integer, Integer)) = MergeWord(materialized, _symbolScratch.Value)
+                If symbols.Count = 1 Then
+                    cache.Insert(materialized, New CacheValue(1, symbols(0), Nothing))
+                ElseIf symbols.Count > 1 Then
+                    cache.Insert(materialized, New CacheValue(symbols.Count, Nothing, symbols))
+                End If
+                Return symbols.Count
+            End If
+            ' No cache (capacity <= 0 or dropout): delegate to the String path.
+            Return CountTokens(word.ToString())
         End Function
 
         ''' <summary>

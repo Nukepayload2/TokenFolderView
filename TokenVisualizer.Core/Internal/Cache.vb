@@ -38,10 +38,15 @@ Namespace Internal
         Private _skips As Integer
         Private _evictions As Integer
 
-        Public Sub New(Optional capacity As Integer = 10000, Optional enableStats As Boolean = False)
+        Public Sub New(Optional capacity As Integer = 10000, Optional enableStats As Boolean = False,
+                       Optional comparer As IEqualityComparer(Of TKey) = Nothing)
             If capacity < 0 Then capacity = 0
             _capacity = capacity
-            _map = New Dictionary(Of TKey, TValue)(capacity)
+            If comparer Is Nothing Then
+                _map = New Dictionary(Of TKey, TValue)(capacity)
+            Else
+                _map = New Dictionary(Of TKey, TValue)(capacity, comparer)
+            End If
             _order = New Queue(Of TKey)(capacity)
             _statsEnabled = enableStats
         End Sub
@@ -92,6 +97,27 @@ Namespace Internal
         Public Function GetValue(key As TKey) As TValue
             Dim v As TValue
             If _map.TryGetValue(key, v) Then
+                If _statsEnabled Then _hits += 1
+                Return v
+            End If
+            If _statsEnabled Then _misses += 1
+            Return Nothing
+        End Function
+
+        ''' <summary>
+        ''' M9: alternate-lookup twin of <see cref="GetValue"/>, keyed by a
+        ''' <see cref="ReadOnlyMemory(Of Char)"/> over a pooled mapping buffer instead of a materialized
+        ''' <see cref="String"/>. Only valid when <c>TKey = String</c> AND the dictionary was built
+        ''' with <see cref="StringMemoryAlternateComparer"/> (the BPE word cache). A cache hit returns
+        ''' the value without allocating the key String — the M9 target (hit ~96%, so the mapped-string
+        ''' <c>New String</c> is eliminated). <see cref="ReadOnlyMemory(Of Char)"/> (not
+        ''' <see cref="ReadOnlySpan(Of Char)"/>) is the key type because the VB compiler does not
+        ''' support ByRef-like types in method signatures (P-011 / BinaryDetector precedent).
+        ''' </summary>
+        Public Function GetValueMemory(key As ReadOnlyMemory(Of Char)) As TValue
+            Dim v As TValue
+            Dim lookup = _map.GetAlternateLookup(Of ReadOnlyMemory(Of Char))()
+            If lookup.TryGetValue(key, v) Then
                 If _statsEnabled Then _hits += 1
                 Return v
             End If
@@ -151,6 +177,42 @@ Namespace Internal
             _map.Clear()
             _order.Clear()
         End Sub
+    End Class
+
+    ''' <summary>
+    ''' M9: dictionary comparer for the BPE word cache that ALSO supports alternate lookup by a
+    ''' <see cref="ReadOnlyMemory(Of Char)"/> over a pooled mapping buffer (instead of a materialized
+    ''' <see cref="String"/>), so a cache hit never allocates the key. Equivalence and hashing are
+    ''' ordinal and mutually consistent between the String and Memory forms (both delegate to the
+    ''' runtime's string hashing over the same chars), so an entry inserted by one form is found by
+    ''' the other. <see cref="ReadOnlyMemory(Of Char)"/> (not <see cref="ReadOnlySpan(Of Char)"/>) is
+    ''' the alternate type because the VB compiler does not support ByRef-like types in method
+    ''' signatures (P-011 / BinaryDetector precedent); the span is used only as an inferred local
+    ''' inside the equivalence/hash helpers.
+    ''' </summary>
+    Friend NotInheritable Class StringMemoryAlternateComparer
+        Implements IEqualityComparer(Of String)
+        Implements IAlternateEqualityComparer(Of ReadOnlyMemory(Of Char), String)
+
+        Public Function EqualsString(x As String, y As String) As Boolean Implements IEqualityComparer(Of String).Equals
+            Return String.Equals(x, y)
+        End Function
+
+        Public Function GetHashCodeString(obj As String) As Integer Implements IEqualityComparer(Of String).GetHashCode
+            Return obj.GetHashCode()
+        End Function
+
+        Public Function EqualsMemory(alternate As ReadOnlyMemory(Of Char), key As String) As Boolean Implements IAlternateEqualityComparer(Of ReadOnlyMemory(Of Char), String).Equals
+            Return key.AsSpan().SequenceEqual(alternate.Span)
+        End Function
+
+        Public Function GetHashCodeMemory(alternate As ReadOnlyMemory(Of Char)) As Integer Implements IAlternateEqualityComparer(Of ReadOnlyMemory(Of Char), String).GetHashCode
+            Return String.GetHashCode(alternate.Span)
+        End Function
+
+        Public Function CreateMemory(alternate As ReadOnlyMemory(Of Char)) As String Implements IAlternateEqualityComparer(Of ReadOnlyMemory(Of Char), String).Create
+            Return alternate.ToString()
+        End Function
     End Class
 
 End Namespace

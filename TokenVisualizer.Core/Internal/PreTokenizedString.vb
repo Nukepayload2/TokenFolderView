@@ -708,19 +708,31 @@ Namespace Internal
 
     ''' <summary>
     ''' Reusable <see cref="IFusedRangeVisitor"/> for the M8 range-driven count path: each
-    ''' <see cref="Visit"/> builds the byte-mapped string of the range (via
-    ''' <see cref="NormalizedString.ToByteMappedString"/>) and counts it via the held
+    ''' <see cref="Visit"/> maps the range's bytes to chars and counts it via the held
     ''' <see cref="IModel"/> directly (no delegate), summing into <see cref="Total"/>. State is
     ''' fields, not captured locals, so the instance is zero-allocation reusable across calls — no
     ''' closure and no per-call <see cref="Func(Of String, Integer)"/> delegate; the caller resets
     ''' per-call state via <see cref="Reset"/> before each encode and reads <see cref="Total"/>
-    ''' afterwards.
+    ''' afterwards. M9: when the model is a <see cref="BpeModel"/> (the DeepSeek count path), the
+    ''' mapped chars are written into a pooled per-thread buffer (<see cref="_mapBuffer"/>) and
+    ''' counted via <see cref="BpeModel.CountTokensSpan"/> over a <see cref="ReadOnlySpan(Of Char)"/>,
+    ''' so a word-cache hit (~96%) never materializes the mapped <see cref="String"/>; non-BPE models
+    ''' keep the unchanged <see cref="NormalizedString.ToByteMappedString"/> + String path.
     ''' </summary>
     Friend NotInheritable Class FusedRangeCountVisitor
         Implements IFusedRangeVisitor
 
         ''' <summary>The model whose <c>CountTokens</c> counts each range's mapped string; set by <see cref="Reset"/>.</summary>
         Private _model As IModel
+        ''' <summary>The model when it is a <see cref="BpeModel"/> (the M9 span fast path); Nothing for non-BPE models.</summary>
+        Private _bpe As BpeModel
+        ''' <summary>M9: per-thread reusable byte-mapped char buffer. The visitor is per-thread
+        ''' (a <see cref="ThreadLocal(Of T)"/> in <c>Tokenizer</c>), so this array is never shared
+        ''' across threads. Grown on demand and retained across ranges; the span over it is consumed
+        ''' synchronously by <see cref="BpeModel.CountTokensSpan"/> before the next
+        ''' <see cref="Visit"/>, so reuse cannot alias a cached value (the BPE cache stores only
+        ''' materialized Strings, never this buffer).</summary>
+        Private _mapBuffer As Char()
         ''' <summary>Accumulated token count over the ranges visited since the last <see cref="Reset"/>.</summary>
         Public Total As Integer
 
@@ -729,6 +741,7 @@ Namespace Internal
         ''' <summary>Resets per-call state; the instance is then ready for a new encode.</summary>
         Public Sub Reset(model As IModel)
             Me._model = model
+            Me._bpe = TryCast(model, BpeModel)
             Me.Total = 0
             Me._ns = Nothing
         End Sub
@@ -739,7 +752,17 @@ Namespace Internal
 
         Public Sub Visit(startByte As Integer, endByte As Integer) Implements IFusedRangeVisitor.Visit
             If endByte > startByte Then
-                Total += _model.CountTokens(_ns.ToByteMappedString(startByte, endByte))
+                If Me._bpe IsNot Nothing Then
+                    ' M9: map into the pooled buffer and count via a ReadOnlyMemory over it — a BPE
+                    ' word-cache hit (~96%) resolves with zero String allocation. The memory is a
+                    ' stack struct over the buffer; it is consumed synchronously by
+                    ' CountTokensMemory before the next Visit, so the buffer reuse cannot alias a
+                    ' cached value (the BPE cache stores only materialized Strings).
+                    Dim count As Integer = _ns.MapToBuffer(startByte, endByte, _mapBuffer)
+                    Total += _bpe.CountTokensMemory(_mapBuffer.AsMemory(0, count))
+                Else
+                    Total += _model.CountTokens(_ns.ToByteMappedString(startByte, endByte))
+                End If
             End If
         End Sub
     End Class
