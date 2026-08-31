@@ -1,4 +1,5 @@
 Imports System.Linq
+Imports System.Threading
 Imports Tokenizers.Models
 
 Namespace Internal
@@ -41,6 +42,13 @@ Namespace Internal
 
         Public Shared Function FromString(text As String) As PreTokenizedString
             Return FromNormalizedString(NormalizedString.FromString(text))
+        End Function
+
+        ''' <summary>Builds a <see cref="PreTokenizedString"/> over a no-track root
+        ''' <see cref="NormalizedString"/> (no per-byte alignment list). Only for the offset-free
+        ''' count-only path; see <see cref="NormalizedString.FromStringNoTrack"/>.</summary>
+        Public Shared Function FromStringNoTrack(text As String) As PreTokenizedString
+            Return FromNormalizedString(NormalizedString.FromStringNoTrack(text))
         End Function
 
         ''' <summary>Builds a <see cref="PreTokenizedString"/> from an existing <see cref="NormalizedString"/>.</summary>
@@ -103,6 +111,22 @@ Namespace Internal
         ''' empty pieces are dropped, exactly like <see cref="SplitByFunction"/>.
         ''' </summary>
         Friend Sub FuseIsolatedSplits(patterns As List(Of Pattern))
+            FuseIsolatedSplitsCore(patterns, False)
+        End Sub
+
+        ''' <summary>
+        ''' Fuse variant that additionally applies the pure-map ByteLevel byte→char mapping to each
+        ''' final piece, so a trailing ByteLevel(use_regex:=False, add_prefix_space:=False)
+        ''' pre-tokenizer (e.g. DeepSeek's) can be folded into the fused pass and its independent
+        ''' traversal of every piece skipped. Produces byte-identical pieces to
+        ''' <see cref="FuseIsolatedSplits"/> followed by ByteLevel.PreTokenize (the mapping is
+        ''' applied by <see cref="NormalizedString.SliceWithByteMap"/>).
+        ''' </summary>
+        Friend Sub FuseIsolatedSplitsWithByteMap(patterns As List(Of Pattern))
+            FuseIsolatedSplitsCore(patterns, True)
+        End Sub
+
+        Private Sub FuseIsolatedSplitsCore(patterns As List(Of Pattern), applyByteMap As Boolean)
             Dim newSplits As New List(Of Split)()
             For Each split As Split In Me.Splits
                 If split.Tokens IsNot Nothing Then
@@ -111,52 +135,181 @@ Namespace Internal
                 End If
 
                 Dim ns As NormalizedString = split.Normalized
-                Dim text As String = ns.Get
-                Dim utf8Len As Integer = ns.Len()
-                Dim ranges As New List(Of (Integer, Integer))(1)
-                ranges.Add((0, utf8Len))
-
-                ' One scratch match list reused across every per-piece scan: the scanner writes
-                ' into it and it is cleared by FindMatchesInto, so no List(Of MatchInfo) is
-                ' allocated per piece (a dominant per-piece cost on high-piece-density corpora).
-                Dim scratch As New List(Of MatchInfo)()
-
-                For Each p As Pattern In patterns
-                    Dim nextRanges As New List(Of (Integer, Integer))()
-                    For Each r In ranges
-                        Dim b1 As Integer = r.Item1
-                        Dim b2 As Integer = r.Item2
-                        If b2 <= b1 Then Continue For
-                        ' Run the next pattern directly on the text slice via the cached boundary
-                        ' index (binary search): the manual scanners accept a (string, start, length)
-                        ' slice and scan it in place, so no per-(piece × pattern) substring is
-                        ' materialized. Matches come back with byte offsets relative to the slice
-                        ' and are offset back to the root normalized byte referential below.
-                        Dim n1 As Integer = ns.ByteToNetIndexCached(b1)
-                        Dim n2 As Integer = ns.ByteToNetIndexCached(b2)
-                        If n2 <= n1 Then Continue For
-                        p.FindMatchesInto(text, n1, n2 - n1, scratch)
-                        For i As Integer = 0 To scratch.Count - 1
-                            Dim m As MatchInfo = scratch(i)
-                            Dim mb1 As Integer = m.Start
-                            Dim mb2 As Integer = m.End
-                            If mb2 > mb1 Then
-                                nextRanges.Add((b1 + mb1, b1 + mb2))
-                            End If
-                        Next
-                    Next
-                    ranges = nextRanges
-                Next
-
+                Dim ranges As List(Of (Integer, Integer)) = ComputeFusedRanges(ns, patterns)
                 For Each r In ranges
                     If r.Item2 > r.Item1 Then
-                        Dim slice As NormalizedString = ns.Slice(New OffsetRange(False, r.Item1, r.Item2))
-                        newSplits.Add(Split.FromNormalizedString(slice))
+                        If applyByteMap Then
+                            newSplits.Add(Split.FromNormalizedString(
+                                ns.SliceWithByteMap(New OffsetRange(False, r.Item1, r.Item2))))
+                        Else
+                            Dim slice As NormalizedString = ns.Slice(New OffsetRange(False, r.Item1, r.Item2))
+                            newSplits.Add(Split.FromNormalizedString(slice))
+                        End If
                     End If
                 Next
             Next
             Me.Splits = newSplits
         End Sub
+
+        ''' <summary>
+        ''' Runs the fused manual-Isolated-split patterns over one split's normalized text and
+        ''' returns the final piece ranges (byte offsets in that split's normalized referential)
+        ''' that the sequential Isolated splits would produce. Shared by the piece-materializing
+        ''' fused path (<see cref="FuseIsolatedSplitsCore"/>) and the M2 range-driven count path
+        ''' (<see cref="FusedRangesBySplit"/> / <see cref="CountFusedRanges"/>), so both compute
+        ''' byte-identical ranges. One scratch match list is reused across every per-piece scan:
+        ''' the scanner writes into it and it is cleared by <c>FindMatchesInto</c>, so no
+        ''' <see cref="List(Of MatchInfo)"/> is allocated per piece (a dominant per-piece cost on
+        ''' high-piece-density corpora).
+        '''
+        ''' M7: the per-pattern intermediate output lists (ranges1/ranges2 in the DeepSeek 3-pattern
+        ''' config) and the scratch match list are per-thread (<see cref="ThreadLocal(Of T)"/>) and
+        ''' retained across pieces. The intermediate range buffers alternate (a list is never written
+        ''' while the same pass scans it); Clear() + refill reuses the retained backing array, so the
+        ''' per-piece geometric growth of intermediate lists is eliminated after the first piece that
+        ''' reaches each size. Only the final pattern's output is a fresh list, because it escapes to
+        ''' the caller (<see cref="CountFusedRanges"/> / <see cref="FuseIsolatedSplitsCore"/> iterate
+        ''' it) and must not be clobbered by the next piece.
+        ''' </summary>
+        Private Shared ReadOnly s_rangeBufferA As New ThreadLocal(Of List(Of (Integer, Integer)))(
+            Function() New List(Of (Integer, Integer))(1))
+        Private Shared ReadOnly s_rangeBufferB As New ThreadLocal(Of List(Of (Integer, Integer)))(
+            Function() New List(Of (Integer, Integer))(16))
+        Private Shared ReadOnly s_matchScratch As New ThreadLocal(Of List(Of MatchInfo))(
+            Function() New List(Of MatchInfo)(16))
+        Private Shared Function ComputeFusedRanges(ns As NormalizedString, patterns As List(Of Pattern)) As List(Of (Integer, Integer))
+            Dim text As String = ns.Get
+            Dim utf8Len As Integer = ns.Len()
+            If patterns.Count = 0 Then
+                Return New List(Of (Integer, Integer))(1) From {(0, utf8Len)}
+            End If
+
+            ' M7: the intermediate pattern outputs (ranges1, ranges2 in the DeepSeek 3-pattern
+            ' config) are consumed by the next pattern and then die, so their backing arrays are
+            ' reused across pieces via two per-thread alternating buffers (a list being scanned by
+            ' the current pattern is never the write target of the same pass). A buffer is Clear()ed
+            ' and refilled, retaining its capacity from previous pieces, so the per-piece geometric
+            ' growth of the intermediate lists (measured ~164 MB in the 235-sample harness) is
+            ' eliminated after the first piece that reaches each size. The final pattern's output
+            ' escapes to the caller (CountFusedRanges / FuseIsolatedSplitsCore iterates it), so it
+            ' is always a fresh list. The scratch match list is likewise per-thread and reused
+            ' across pieces (it is cleared by FindMatchesInto before every scan, and consumed within
+            ' the pass, so it never aliases).
+            Dim scratch As List(Of MatchInfo) = s_matchScratch.Value
+            Dim needScratchCap As Integer = Math.Max(16, text.Length \ 32)
+            If scratch.Capacity < needScratchCap Then scratch.Capacity = needScratchCap
+
+            Dim bufA As List(Of (Integer, Integer)) = s_rangeBufferA.Value
+            Dim bufB As List(Of (Integer, Integer)) = s_rangeBufferB.Value
+            bufA.Clear()
+            bufA.Add((0, utf8Len))
+            Dim ranges As List(Of (Integer, Integer)) = bufA
+
+            For pi As Integer = 0 To patterns.Count - 1
+                Dim p As Pattern = patterns(pi)
+                Dim preSize As Integer
+                If pi = patterns.Count - 1 Then
+                    ' Final pattern: fresh list, pre-sized as before (M6 estimate), escapes to caller.
+                    preSize = Math.Min(utf8Len, Math.Max(16, ranges.Count * 2 + utf8Len \ 5))
+                    Dim finalRanges As New List(Of (Integer, Integer))(preSize)
+                    FillRangesInto(ns, text, p, ranges, scratch, finalRanges)
+                    Return finalRanges
+                End If
+                ' Intermediate pattern: reuse the other alternating buffer. Pre-size so the common
+                ' high-piece-density case avoids geometric reallocation; an intermediate pattern's
+                ' output is at least one piece per input range (Isolated never drops a segment).
+                ' EnsureCapacity only grows, so the buffer's retained backing stays valid.
+                Dim target As List(Of (Integer, Integer)) = If(ranges Is bufA, bufB, bufA)
+                preSize = Math.Max(16, ranges.Count * 2)
+                If target.Capacity < preSize Then target.Capacity = preSize
+                target.Clear()
+                FillRangesInto(ns, text, p, ranges, scratch, target)
+                ranges = target
+            Next
+            ' Unreachable when patterns.Count > 0 (the final pattern returns above).
+            Return New List(Of (Integer, Integer))(1) From {(0, utf8Len)}
+        End Function
+
+        ''' <summary>
+        ''' Runs one pattern's scan over every range of <paramref name="ranges"/> and writes the
+        ''' resulting sub-ranges into <paramref name="target"/> (the same loop body as the original
+        ''' fused pass; extracted so the intermediate buffer-reuse path and the fresh final list share
+        ''' one implementation). The scanner writes into <paramref name="scratch"/> (pre-cleared by
+        ''' <c>FindMatchesInto</c>); match offsets are slice-relative and are offset back to the root
+        ''' normalized byte referential before being added to <paramref name="target"/>.
+        ''' </summary>
+        Private Shared Sub FillRangesInto(ns As NormalizedString, text As String, p As Pattern,
+                                          ranges As List(Of (Integer, Integer)), scratch As List(Of MatchInfo),
+                                          target As List(Of (Integer, Integer)))
+            For Each r In ranges
+                Dim b1 As Integer = r.Item1
+                Dim b2 As Integer = r.Item2
+                If b2 <= b1 Then Continue For
+                ' Run the pattern directly on the text slice via the cached boundary index (binary
+                ' search): the manual scanners accept a (string, start, length) slice and scan it in
+                ' place, so no per-(piece × pattern) substring is materialized. Matches come back
+                ' with byte offsets relative to the slice and are offset back below.
+                Dim n1 As Integer = ns.ByteToNetIndexCached(b1)
+                Dim n2 As Integer = ns.ByteToNetIndexCached(b2)
+                If n2 <= n1 Then Continue For
+                p.FindMatchesInto(text, n1, n2 - n1, scratch)
+                For i As Integer = 0 To scratch.Count - 1
+                    Dim m As MatchInfo = scratch(i)
+                    Dim mb1 As Integer = m.Start
+                    Dim mb2 As Integer = m.End
+                    If mb2 > mb1 Then
+                        target.Add((b1 + mb1, b1 + mb2))
+                    End If
+                Next
+            Next
+        End Sub
+
+        ''' <summary>
+        ''' M2 range-driven twin of the fused pre-tokenization: computes the final ranges (byte
+        ''' offsets in each untokenized split's normalized text) that
+        ''' <see cref="FuseIsolatedSplitsCore"/> would produce, WITHOUT materializing the per-range
+        ''' <see cref="Split"/> / <see cref="NormalizedString"/> pieces (the dominant allocation of
+        ''' the fused pass, which escapes to <c>Me.Splits</c> and cannot be stack-eliminated). Splits
+        ''' that already carry tokens are skipped — their count is contributed by
+        ''' <see cref="CountFusedRanges"/>. The count-only fast path
+        ''' (<c>Tokenizer.EncodeCount</c>) feeds the model directly from these ranges.
+        ''' </summary>
+        Friend Function FusedRangesBySplit(patterns As List(Of Pattern)) As List(Of (NormalizedString, List(Of (Integer, Integer))))
+            Dim result As New List(Of (NormalizedString, List(Of (Integer, Integer))))()
+            For Each split As Split In Me.Splits
+                If split.Tokens IsNot Nothing Then Continue For
+                result.Add((split.Normalized, ComputeFusedRanges(split.Normalized, patterns)))
+            Next
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Counts the tokens the ranges produced by <see cref="FusedRangesBySplit"/> would yield:
+        ''' splits that already carry attached tokens contribute their token count; every other
+        ''' range builds its byte-mapped normalized string via
+        ''' <see cref="NormalizedString.ToByteMappedString"/> and calls <paramref name="countFn"/>.
+        ''' Returns exactly the total that <c>FuseIsolatedSplitsWithByteMap</c> followed by
+        ''' <see cref="TokenizeCount"/> would report, provided <c>countFn(s) = Model.CountTokens(s)</c>,
+        ''' but without constructing a piece object per range.
+        ''' </summary>
+        Friend Function CountFusedRanges(rangesBySplit As List(Of (NormalizedString, List(Of (Integer, Integer)))),
+                                         countFn As Func(Of String, Integer)) As Integer
+            Dim total As Integer = 0
+            For Each split As Split In Me.Splits
+                If split.Tokens IsNot Nothing Then
+                    total += split.Tokens.Count
+                End If
+            Next
+            For Each pair As (NormalizedString, List(Of (Integer, Integer))) In rangesBySplit
+                Dim ns As NormalizedString = pair.Item1
+                For Each r As (Integer, Integer) In pair.Item2
+                    If r.Item2 > r.Item1 Then
+                        total += countFn(ns.ToByteMappedString(r.Item1, r.Item2))
+                    End If
+                Next
+            Next
+            Return total
+        End Function
 
         ''' <summary>
         ''' Applies <paramref name="normalizer"/> to every split that has no attached tokens.

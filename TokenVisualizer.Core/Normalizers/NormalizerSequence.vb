@@ -20,6 +20,13 @@ Namespace Normalizers
             End If
         End Sub
 
+        ''' <summary>Whether this sequence contains no normalizers (an identity no-op).</summary>
+        Public ReadOnly Property IsEmpty As Boolean
+            Get
+                Return _normalizers.Count = 0
+            End Get
+        End Property
+
         Public Sub Normalize(normalized As Internal.NormalizedString) Implements INormalizer.Normalize
             For Each normalizer In _normalizers
                 normalizer.Normalize(normalized)

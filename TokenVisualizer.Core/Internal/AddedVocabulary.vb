@@ -340,6 +340,43 @@ Namespace Internal
         End Function
 
         ''' <summary>
+        ''' Count-only twin of <see cref="ExtractAndNormalize"/> used when the normalizer is
+        ''' identity (Nothing, an empty <see cref="NormalizerSequence"/>, or an empty
+        ''' <see cref="PrecompiledNormalizer"/> charsmap). The root NormalizedString is built
+        ''' WITHOUT the per-byte alignment list and every produced piece is a no-track lazy view,
+        ''' so no alignment list is ever materialized — the dominant allocation of the tracked
+        ''' extract on the count-only path (M3). Produces the same splits as
+        ''' <see cref="ExtractAndNormalize"/> for an identity normalizer: the same added-token
+        ''' matches, the same token ids and the same (normalized) piece texts. Original-offset
+        ''' information of the pieces is identity (never read by the count-only path). Callers must
+        ''' only invoke this when the normalizer is identity; otherwise the pieces' original ranges
+        ''' would be wrong (the count-only path never reads them, but the invariant holds here).
+        ''' </summary>
+        Public Function ExtractAndNormalizeNoTrack(rawText As String) As PreTokenizedString
+            Dim pretokenized As PreTokenizedString = PreTokenizedString.FromStringNoTrack(rawText)
+
+            ' 1. Extract all the non-normalized tokens from the non-normalized string.
+            Me.SplitUsingTrieNoTrack(pretokenized, Me._splitTrie, Me._splitTrieIds)
+
+            ' 2. Then extract the normalized tokens from the normalized pieces of the string.
+            '    (The normalizer is identity for this path, so the pieces are already normalized.)
+            Dim newSplits As New List(Of Split)()
+            For Each split In pretokenized.Splits
+                If split.Tokens IsNot Nothing Then
+                    newSplits.Add(split)
+                    Continue For
+                End If
+
+                Dim matches As List(Of (Integer?, (Integer, Integer))) =
+                    Me.FindMatches(split.Normalized.Get, Me._splitNormalizedTrie, Me._splitNormalizedTrieIds)
+                AppendMatchesNoTrack(split, matches, newSplits)
+            Next
+            pretokenized.Splits = newSplits
+
+            Return pretokenized
+        End Function
+
+        ''' <summary>
         ''' Splits every untokenized split of <paramref name="pretokenized"/> on the given trie,
         ''' attaching a single token to each matched piece. Empty pieces are dropped. Mirrors the
         ''' Rust <c>split_with_indices</c> over <c>PreTokenizedString::split</c>.
@@ -355,6 +392,55 @@ Namespace Internal
                 AppendMatches(split, matches, newSplits)
             Next
             pretokenized.Splits = newSplits
+        End Sub
+
+        ''' <summary>
+        ''' Splits every untokenized split of <paramref name="pretokenized"/> on the given trie,
+        ''' mirroring <see cref="SplitUsingTrie"/> but building no-track lazy pieces (no alignment
+        ''' list). Only used by the count-only <see cref="ExtractAndNormalizeNoTrack"/> path.
+        ''' </summary>
+        Private Sub SplitUsingTrieNoTrack(pretokenized As PreTokenizedString, trie As CharTrie, trieIds As Dictionary(Of String, Integer))
+            Dim newSplits As New List(Of Split)()
+            For Each split In pretokenized.Splits
+                If split.Tokens IsNot Nothing Then
+                    newSplits.Add(split)
+                    Continue For
+                End If
+                Dim matches As List(Of (Integer?, (Integer, Integer))) = Me.FindMatches(split.Normalized.Get, trie, trieIds)
+                AppendMatchesNoTrack(split, matches, newSplits)
+            Next
+            pretokenized.Splits = newSplits
+        End Sub
+
+        ''' <summary>
+        ''' Appends the slices corresponding to <paramref name="matches"/> to
+        ''' <paramref name="newSplits"/>, mirroring <see cref="AppendMatches"/> but building no-track
+        ''' lazy slices (<see cref="NormalizedString.SliceNoTrack"/>) instead of fully-tracked
+        ''' slices, so no per-piece alignment list is materialized. Only used by the count-only
+        ''' <see cref="ExtractAndNormalizeNoTrack"/> path (identity normalizer ⇒ pieces are
+        ''' identity-aligned, so the no-track slice is exact).
+        ''' </summary>
+        Private Shared Sub AppendMatchesNoTrack(split As Split, matches As List(Of (Integer?, (Integer, Integer))), newSplits As List(Of Split))
+            Dim wholeLen As Integer = Utf8Helpers.Utf8Length(split.Normalized.Get)
+            For Each m In matches
+                ' Fast path: a non-token match covering the whole normalized string (the common
+                ' "no added token found" case) is reused as-is.
+                If m.Item2.Item1 = 0 AndAlso m.Item2.Item2 = wholeLen AndAlso Not m.Item1.HasValue Then
+                    newSplits.Add(Split.FromNormalizedString(split.Normalized))
+                    Continue For
+                End If
+
+                Dim slice As NormalizedString = split.Normalized.SliceNoTrack(m.Item2.Item1, m.Item2.Item2)
+                If slice.IsEmpty() Then Continue For
+                If m.Item1.HasValue Then
+                    Dim value As String = slice.Get
+                    Dim len As Integer = Utf8Helpers.Utf8Length(value)
+                    Dim tokens As New List(Of Token) From {New Token(m.Item1.Value, value, (0, len))}
+                    newSplits.Add(New Split(slice, tokens))
+                Else
+                    newSplits.Add(Split.FromNormalizedString(slice))
+                End If
+            Next
         End Sub
 
         ''' <summary>Appends the slices corresponding to <paramref name="matches"/> to <paramref name="newSplits"/>.</summary>

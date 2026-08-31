@@ -62,13 +62,19 @@ Namespace Internal
         ' published cache or tear a multi-word struct. Building is idempotent (derived purely
         ' from the immutable string), so a lost compare-exchange is harmless.
         Private NotInheritable Class ScalarBoundaryIndex
-            Public ReadOnly Utf8Starts As Integer()
-            Public ReadOnly NetStarts As Integer()
+            ''' <summary>Byte offset of each non-ASCII scalar start (empty when the string is pure ASCII).</summary>
+            Public ReadOnly BreakBytes As Integer()
+            ''' <summary>Cumulative byte-over-net excess (byteOff - net) BEFORE the scalar at the matching <see cref="BreakBytes"/> entry.</summary>
+            Public ReadOnly BreakExcess As Integer()
+            ''' <summary>UTF-8 byte length of the non-ASCII scalar at the matching <see cref="BreakBytes"/> entry.</summary>
+            Public ReadOnly BreakLens As Integer()
+            ''' <summary>Total UTF-8 byte length of the string.</summary>
             Public ReadOnly Utf8Len As Integer
 
-            Public Sub New(utf8Starts As Integer(), netStarts As Integer(), utf8Len As Integer)
-                Me.Utf8Starts = utf8Starts
-                Me.NetStarts = netStarts
+            Public Sub New(breakBytes As Integer(), breakExcess As Integer(), breakLens As Integer(), utf8Len As Integer)
+                Me.BreakBytes = breakBytes
+                Me.BreakExcess = breakExcess
+                Me.BreakLens = breakLens
                 Me.Utf8Len = utf8Len
             End Sub
         End Class
@@ -108,6 +114,26 @@ Namespace Internal
             Return n
         End Function
 
+        ''' <summary>
+        ''' Builds a NormalizedString from a string WITHOUT the per-byte identity alignment list and
+        ''' with alignment tracking disabled. Only for the offset-free count-only path (the M3
+        ''' no-track extract): that path never reads the alignment list, so skipping it removes the
+        ''' dominant per-encode allocation (one (start, end) tuple per UTF-8 byte). The original and
+        ''' normalized strings are the same reference (identity). A no-track NormalizedString that
+        ''' later needs the alignment list throws <see cref="OffsetTrackingRequiredException"/> (the
+        ''' existing count-only fallback contract), so configurations that need alignments fall back
+        ''' to a fully tracked encode via <see cref="Tokenizer.EncodeCount"/> and stay correct.
+        ''' </summary>
+        Public Shared Function FromStringNoTrack(s As String) As NormalizedString
+            Dim n As New NormalizedString()
+            n._original = s
+            n._normalized = s
+            n._originalShift = 0
+            n._trackAlignments = False
+            n._alignments = _emptyAlignments
+            Return n
+        End Function
+
         ' ------------------------------------------------------------------
         #Region "Basic accessors"
         ' ------------------------------------------------------------------
@@ -119,7 +145,12 @@ Namespace Internal
         Private Sub MaterializeNormalized()
             If _normalized Is Nothing AndAlso _root IsNot Nothing Then
                 _root.MaterializeNormalized()
-                _normalized = Utf8Helpers.SliceByUtf8(_root._normalized, _viewNormStart, _viewNormEnd)
+                ' Use the root's cached scalar-boundary index (binary search) instead of the
+                ' O(n) Utf8Helpers.SliceByUtf8. Semantics are byte-identical (ByteToNetCached
+                ' matches ByteToNetIndex, flooring mid-scalar offsets to the scalar start); the
+                ' index is built once per root and shared by every piece, so materializing a
+                ' match-heavy piece (many pieces of one large root) is O(log n) instead of O(n).
+                _normalized = SliceByUtf8Cached(_root.NormalizedIndex(), _root._normalized, _viewNormStart, _viewNormEnd)
                 Volatile.Write(_normalizedUtf8Len, _viewNormEnd - _viewNormStart)
             End If
         End Sub
@@ -131,7 +162,8 @@ Namespace Internal
         Private Sub MaterializeOriginal()
             If _original Is Nothing AndAlso _root IsNot Nothing Then
                 _root.MaterializeOriginal()
-                _original = Utf8Helpers.SliceByUtf8(_root._original, _viewOrigStart, _viewOrigEnd)
+                ' Same binary-search slicing as MaterializeNormalized (see there).
+                _original = SliceByUtf8Cached(_root.OriginalIndex(), _root._original, _viewOrigStart, _viewOrigEnd)
             End If
         End Sub
 
@@ -206,26 +238,61 @@ Namespace Internal
         #Region "Cached byte<->net conversions (hot paths)"
         ' ------------------------------------------------------------------
 
-        ''' <summary>Builds a scalar boundary index (byte and net offsets of each scalar start) for <paramref name="s"/>.</summary>
+        ''' <summary>
+        ''' Builds a scalar boundary index for <paramref name="s"/>. The index is stored as a SPARSE
+        ''' breakpoint list rather than one entry per scalar: between two consecutive non-ASCII
+        ''' scalars the byte→net excess is constant, so only the non-ASCII scalar starts need to be
+        ''' recorded. Real code is mostly ASCII with scattered non-ASCII (comments/strings), so the
+        ''' breakpoint list is typically orders of magnitude smaller than the scalar count — the
+        ''' dominant per-encode allocation of the fused split pass (two <see cref="Integer"/> arrays
+        ''' of scalar-count length before this change) shrinks to a handful of entries. A pure-ASCII
+        ''' string has an empty breakpoint list and is handled by <see cref="ByteToNetCached"/> /
+        ''' <see cref="IsBoundaryCached"/> as byte==net identity.
+        '''
+        ''' Each breakpoint records the non-ASCII scalar's start byte offset, its UTF-8 byte length
+        ''' and the cumulative excess (byteOff - net) BEFORE it. A query byte offset b maps to the
+        ''' net index as: b - excessBefore when b is inside the scalar, or b - excessAfter (the next
+        ''' breakpoint's excessBefore, or the final total excess) when b lies in the ASCII run after
+        ''' it. This reproduces the full per-scalar index exactly for every boundary query.
+        ''' </summary>
         Private Shared Function BuildScalarIndex(s As String) As ScalarBoundaryIndex
             If s Is Nothing OrElse s.Length = 0 Then
-                Return New ScalarBoundaryIndex(Array.Empty(Of Integer)(), Array.Empty(Of Integer)(), 0)
+                Return New ScalarBoundaryIndex(Array.Empty(Of Integer)(), Array.Empty(Of Integer)(), Array.Empty(Of Integer)(), 0)
             End If
-            Dim count As Integer = Utf8Helpers.ScalarCount(s)
-            Dim utf8Starts(count - 1) As Integer
-            Dim netStarts(count - 1) As Integer
+            ' Pass 1: count the non-ASCII scalars (utf8Len > netLen) to size the arrays exactly.
             Dim net As Integer = 0
+            Dim nonAscii As Integer = 0
+            While net < s.Length
+                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(s, net)
+                net += Utf8Helpers.NetLengthOfCodePoint(cp)
+                If Utf8Helpers.Utf8LengthOfCodePoint(cp) > 1 Then nonAscii += 1
+            End While
+            If nonAscii = 0 Then
+                Return New ScalarBoundaryIndex(Array.Empty(Of Integer)(), Array.Empty(Of Integer)(), Array.Empty(Of Integer)(), s.Length)
+            End If
+            ' Pass 2: emit one breakpoint per non-ASCII scalar.
+            Dim breaks(nonAscii - 1) As Integer
+            Dim excesses(nonAscii - 1) As Integer
+            Dim lens(nonAscii - 1) As Integer
             Dim byteOff As Integer = 0
+            net = 0
+            Dim excess As Integer = 0
             Dim idx As Integer = 0
             While net < s.Length
-                utf8Starts(idx) = byteOff
-                netStarts(idx) = net
                 Dim cp As Integer = UnicodePredicates.ScalarCodePoint(s, net)
-                byteOff += Utf8Helpers.Utf8LengthOfCodePoint(cp)
-                net += Utf8Helpers.NetLengthOfCodePoint(cp)
-                idx += 1
+                Dim utf8Len As Integer = Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                Dim netLen As Integer = Utf8Helpers.NetLengthOfCodePoint(cp)
+                If utf8Len > netLen Then
+                    breaks(idx) = byteOff
+                    excesses(idx) = excess ' excess BEFORE this scalar (= byteOff - net)
+                    lens(idx) = utf8Len
+                    idx += 1
+                End If
+                byteOff += utf8Len
+                net += netLen
+                excess += utf8Len - netLen
             End While
-            Return New ScalarBoundaryIndex(utf8Starts, netStarts, byteOff)
+            Return New ScalarBoundaryIndex(breaks, excesses, lens, byteOff)
         End Function
 
         ''' <summary>Lazily built scalar boundary index for the original string (never mutates).</summary>
@@ -292,24 +359,43 @@ Namespace Internal
 
         ''' <summary>
         ''' Converts a UTF-8 byte offset to a .NET string index using a cached boundary index.
-        ''' Semantics match <see cref="Utf8Helpers.ByteToNetIndex"/>.
+        ''' Semantics match <see cref="Utf8Helpers.ByteToNetIndex"/>: floors to the enclosing scalar
+        ''' start. A pure-ASCII index (empty breakpoints, from <see cref="BuildScalarIndex"/>) maps
+        ''' byte offset to net index by identity; a sparse breakpoint index maps b to
+        ''' <c>b - excess</c>, where the excess is constant between non-ASCII scalars (excessBefore
+        ''' inside the scalar, excessAfter in the ASCII run following it).
         ''' </summary>
         Private Shared Function ByteToNetCached(index As ScalarBoundaryIndex, s As String, byteOffset As Integer) As Integer
             If byteOffset <= 0 Then Return 0
             If byteOffset >= index.Utf8Len Then Return s.Length
+            If index.BreakBytes.Length = 0 Then Return byteOffset ' pure ASCII: identity
+            ' Binary search for the last breakpoint whose start byte offset is <= byteOffset.
             Dim lo As Integer = 0
-            Dim hi As Integer = index.Utf8Starts.Length - 1
-            Dim result As Integer = 0
+            Dim hi As Integer = index.BreakBytes.Length - 1
+            Dim i As Integer = -1
             While lo <= hi
                 Dim mid As Integer = (lo + hi) \ 2
-                If index.Utf8Starts(mid) <= byteOffset Then
-                    result = index.NetStarts(mid)
+                If index.BreakBytes(mid) <= byteOffset Then
+                    i = mid
                     lo = mid + 1
                 Else
                     hi = mid - 1
                 End If
             End While
-            Return result
+            If i < 0 Then Return byteOffset ' before the first non-ASCII scalar: excess is 0
+            ' Inside (or at the start of) the non-ASCII scalar: floor to the scalar's net start.
+            If byteOffset < index.BreakBytes(i) + index.BreakLens(i) Then
+                Return index.BreakBytes(i) - index.BreakExcess(i)
+            End If
+            ' In the ASCII run after the scalar: excess is constant at the value AFTER the scalar
+            ' (== the next breakpoint's excessBefore, or the final total excess).
+            Dim excessAfter As Integer
+            If i + 1 < index.BreakBytes.Length Then
+                excessAfter = index.BreakExcess(i + 1)
+            Else
+                excessAfter = index.Utf8Len - s.Length
+            End If
+            Return byteOffset - excessAfter
         End Function
 
         ''' <summary>
@@ -318,20 +404,23 @@ Namespace Internal
         ''' </summary>
         Private Shared Function IsBoundaryCached(index As ScalarBoundaryIndex, byteOffset As Integer) As Boolean
             If byteOffset <= 0 OrElse byteOffset >= index.Utf8Len Then Return True
+            If index.BreakBytes.Length = 0 Then Return True ' pure ASCII: every byte offset is a scalar boundary
+            ' Binary search for the last breakpoint whose start byte offset is <= byteOffset.
             Dim lo As Integer = 0
-            Dim hi As Integer = index.Utf8Starts.Length - 1
+            Dim hi As Integer = index.BreakBytes.Length - 1
+            Dim i As Integer = -1
             While lo <= hi
                 Dim mid As Integer = (lo + hi) \ 2
-                Dim start As Integer = index.Utf8Starts(mid)
-                If start < byteOffset Then
+                If index.BreakBytes(mid) <= byteOffset Then
+                    i = mid
                     lo = mid + 1
-                ElseIf start > byteOffset Then
-                    hi = mid - 1
                 Else
-                    Return True
+                    hi = mid - 1
                 End If
             End While
-            Return False
+            If i < 0 Then Return True ' before the first non-ASCII scalar: all bytes are ASCII boundaries
+            If byteOffset = index.BreakBytes(i) Then Return True ' the scalar's start is a boundary
+            Return byteOffset >= index.BreakBytes(i) + index.BreakLens(i) ' inside the scalar -> not a boundary
         End Function
 
         ''' <summary>
@@ -550,6 +639,137 @@ Namespace Internal
             End If
             result._originalShift = _originalShift + originalRange.Item1
             Return result
+        End Function
+
+        ''' <summary>
+        ''' Creates a no-track lazy slice view of this NormalizedString over the normalized byte
+        ''' range [startByte, endByte), WITHOUT reading or building the alignment list. Only valid
+        ''' when this instance is no-track AND identity-aligned (normalized bytes == original
+        ''' bytes) — exactly the pieces produced by <see cref="FromStringNoTrack"/> before any
+        ''' transform. The count-only path never reads a piece's original offsets, so the identity
+        ''' original range (== the normalized range) is sufficient. Kept distinct from
+        ''' <see cref="Slice"/> because Slice resolves offsets through the alignment list, which is
+        ''' unavailable here. Both substrings materialize lazily on first access.
+        ''' </summary>
+        Public Function SliceNoTrack(startByte As Integer, endByte As Integer) As NormalizedString
+            Dim result As New NormalizedString()
+            result._trackAlignments = False
+            result._root = Me
+            result._viewNormStart = startByte
+            result._viewNormEnd = endByte
+            result._viewOrigStart = startByte
+            result._viewOrigEnd = endByte
+            result._alignments = _emptyAlignments
+            result._original = Nothing
+            result._normalized = Nothing
+            result._originalShift = Me._originalShift + startByte
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Slices this NormalizedString by <paramref name="range"/> and applies the ByteLevel
+        ''' byte→char mapping in the same step, returning a piece whose <see cref="Get"/> is the
+        ''' mapped string and whose original offsets / alignments are byte-identical to
+        ''' <c>Slice(range)</c> followed by the pure-map ByteLevel transform
+        ''' (<c>AppendByteTransform</c> + <c>Transform(dest, 0)</c>). Used by the fused
+        ''' pre-tokenizer fast path (<see cref="PreTokenizedString.FuseIsolatedSplitsWithByteMap"/>)
+        ''' to fold a trailing pure-map ByteLevel pre-tokenizer into the fused split pass and skip
+        ''' the independent second traversal of the pieces.
+        '''
+        ''' On a no-track source (the OffsetType.None count path) the mapped string is built
+        ''' directly from this instance's scalars in one pass — no intermediate (Char, Integer)
+        ''' transform-item list and no per-piece view re-walk. On a tracked source the piece is
+        ''' produced by the exact existing ByteLevel transform (slice + AppendByteTransform +
+        ''' Transform) so the per-byte alignment list is byte-identical to the sequential reference.
+        ''' </summary>
+        Friend Function SliceWithByteMap(range As OffsetRange) As NormalizedString
+            If Not Me._trackAlignments Then
+                Return SliceWithByteMapNoTrack(range)
+            End If
+            ' Tracked: delegate to the exact ByteLevel transform so the alignment list matches
+            ' the sequential reference byte for byte.
+            Dim slice As NormalizedString = Me.Slice(range)
+            Dim transformations As New List(Of (Char, Integer))()
+            Dim hint As Integer = slice.Len()
+            If transformations.Capacity < hint Then transformations.Capacity = hint
+            slice.AppendByteTransform(transformations)
+            slice.Transform(transformations, 0)
+            Return slice
+        End Function
+
+        Private Function SliceWithByteMapNoTrack(range As OffsetRange) As NormalizedString
+            ' Mirror Slice's range resolution (the root keeps its alignment list even when
+            ' no-track, so ConvertOffsets below works exactly as in Slice).
+            Dim fullRangeOpt As OffsetRange? = ValidateRange(range)
+            If Not fullRangeOpt.HasValue Then
+                Throw New InvalidOperationException("NormalizedString bad slice: range not on char boundaries.")
+            End If
+            Dim fullRange As OffsetRange = fullRangeOpt.Value
+
+            Dim normalizedRange As (Integer, Integer)
+            Dim originalRange As (Integer, Integer)
+            If fullRange.IsOriginal Then
+                Dim converted = ConvertOffsets(fullRange)
+                If Not converted.HasValue Then Throw SliceConversionFailure()
+                normalizedRange = converted.Value
+                originalRange = fullRange.IntoFullRange(OriginalUtf8LenCached())
+            Else
+                normalizedRange = fullRange.IntoFullRange(NormalizedUtf8LenCached())
+                Dim converted = ConvertOffsets(fullRange)
+                If Not converted.HasValue Then Throw SliceConversionFailure()
+                originalRange = converted.Value
+            End If
+
+            Dim normStart As Integer = normalizedRange.Item1
+            Dim normEnd As Integer = normalizedRange.Item2
+
+            Dim result As New NormalizedString()
+            result._trackAlignments = False
+            result._originalShift = Me._originalShift + originalRange.Item1
+            result._normalized = ToByteMappedString(normStart, normEnd)
+            result._alignments = _emptyAlignments
+            result._original = Nothing
+            result._root = Me
+            result._viewNormStart = normStart
+            result._viewNormEnd = normEnd
+            result._viewOrigStart = originalRange.Item1
+            result._viewOrigEnd = originalRange.Item2
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' Returns the GPT-2 byte-mapped string for the normalized byte range
+        ''' <c>[startByte, endByte)</c> of this NormalizedString: each UTF-8 byte of each scalar in
+        ''' the range is mapped through the byte→char table and written directly into a rented
+        ''' <see cref="Char"/> buffer (ArrayPool), then copied once into the returned
+        ''' <see cref="String"/>. This is the exact inner loop
+        ''' <see cref="SliceWithByteMapNoTrack"/> uses to build a piece's mapped string, extracted
+        ''' so the M2 range-driven count path (<see cref="PreTokenizedString.CountFusedRanges"/>)
+        ''' can build the same string without materializing a piece
+        ''' <see cref="NormalizedString"/>. A lazy no-track source is materialized on demand
+        ''' (via <see cref="NormalizedIndex"/>), so the string is byte-identical to
+        ''' <c>SliceWithByteMap(range).Get</c>. Lone surrogates map as U+FFFD (3 bytes), exactly
+        ''' like <see cref="BytesToUnicodeTable.AppendByteTransformChars"/>.
+        ''' </summary>
+        Friend Function ToByteMappedString(startByte As Integer, endByte As Integer) As String
+            If endByte <= startByte Then Return String.Empty
+            Dim nBytes As Integer = endByte - startByte
+            Dim buf As Char() = ArrayPool(Of Char).Shared.Rent(nBytes)
+            Try
+                Dim idx As ScalarBoundaryIndex = NormalizedIndex()
+                Dim netA As Integer = ByteToNetCached(idx, _normalized, startByte)
+                Dim netB As Integer = ByteToNetCached(idx, _normalized, endByte)
+                Dim net As Integer = netA
+                Dim count As Integer = 0
+                While net < netB
+                    Dim cp As Integer = UnicodePredicates.ScalarCodePoint(_normalized, net)
+                    count += BytesToUnicodeTable.AppendByteTransformChars(buf, count, cp)
+                    net += Utf8Helpers.NetLengthOfCodePoint(cp)
+                End While
+                Return New String(buf, 0, count)
+            Finally
+                ArrayPool(Of Char).Shared.Return(buf)
+            End Try
         End Function
 
         ''' <summary>

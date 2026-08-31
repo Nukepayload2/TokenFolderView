@@ -144,6 +144,21 @@ Namespace Models
             New ThreadLocal(Of MergeScratch)(AddressOf CreateMergeScratch)
 
         ''' <summary>
+        ''' Per-thread reusable symbol list for <see cref="BuildSymbols"/>. A cache-miss word is
+        ''' first decomposed into its per-scalar (id, byteLen) symbols by BuildSymbols and that
+        ''' list is then consumed by <see cref="MergeAllSymbols"/>, which reads it into the
+        ''' thread-local merge scratch and produces a NEW result list. The BuildSymbols input list
+        ''' is therefore dead after each miss and can be cleared and refilled by the next miss,
+        ''' instead of allocating a fresh <see cref="List(Of (Integer, Integer))"/> (object +
+        ''' backing-array growth) per cache miss — the dominant per-miss allocation on
+        ''' high-piece-density corpora. Thread-local (never shared), matching the word cache and
+        ''' merge scratch; never exposed outside CountTokens / MergeWord, so reusing it cannot
+        ''' alias a cached value.
+        ''' </summary>
+        Private Shared ReadOnly _symbolScratch As ThreadLocal(Of List(Of (Integer, Integer))) =
+            New ThreadLocal(Of List(Of (Integer, Integer)))(Function() New List(Of (Integer, Integer))())
+
+        ''' <summary>
         ''' Creates a BPE model.
         ''' </summary>
         ''' <param name="vocab">Token to id mapping.</param>
@@ -495,7 +510,7 @@ Namespace Models
                     ' Words longer than the cache-eligibility limit bypass the cache entirely:
                     ' no lookup, no insert, but still merged normally (identical result).
                     cache.RecordSkip()
-                    symbols = MergeWord(word)
+                    symbols = MergeWord(word, _symbolScratch.Value)
                 Else
                     Dim cv As CacheValue = cache.GetValue(word)
                     If cv.Count > 0 Then
@@ -508,7 +523,7 @@ Namespace Models
             End If
 
             If symbols Is Nothing Then
-                symbols = MergeWord(word)
+                symbols = MergeWord(word, _symbolScratch.Value)
                 If useCache Then
                     Dim cache As Cache(Of String, CacheValue) = _cache.Value
                     If symbols.Count = 1 Then

@@ -299,7 +299,37 @@ Imports Tokenizers.Serialization
         ''' tokens, and finally adds the post-processor's added special tokens when requested.
         ''' </summary>
         Private Function EncodeCountCore(text As String, addSpecialTokens As Boolean) As Integer
-            Dim pts As PreTokenizedString = Me.AddedVocabulary.ExtractAndNormalize(text, Me.Normalizer)
+            ' M2 fast path detection first (independent of the normalizer): when the pre-tokenizer
+            ' is exactly a fused manual-Isolated-split run followed by a pure-map ByteLevel (e.g.
+            ' DeepSeek's 3 splits + ByteLevel), the model is driven straight from the fused ranges
+            ' instead of materializing the per-piece Split / NormalizedString objects the fuse pass
+            ' would escape to Me.Splits.
+            Dim isFusedCountConfig As Boolean = False
+            Dim fusedPatterns As New List(Of Pattern)()
+            If Me.PreTokenizer IsNot Nothing Then
+                Dim seq As PreTokenizerSequence = TryCast(Me.PreTokenizer, PreTokenizerSequence)
+                If seq IsNot Nothing Then
+                    isFusedCountConfig = seq.TryGetFusedCountConfig(fusedPatterns)
+                End If
+            End If
+
+            ' M3: only use the no-track extract (ExtractAndNormalizeNoTrack, which builds the root
+            ' NormalizedString and every piece WITHOUT the per-byte alignment list — the dominant
+            ' allocation of the tracked extract) when the count-only path is guaranteed never to
+            ' read _alignments downstream: the normalizer is identity AND the pre-tokenizer is
+            ' either Nothing (TokenizeCount only reads Get) or the M2 fused-count config
+            ' (FusedRangesBySplit + CountFusedRanges never touch _alignments). Any other
+            ' pre-tokenizer (e.g. Metaspace's Replace) reads _alignments, so it must receive a
+            ' fully tracked extract whose alignment data is present.
+            Dim useNoTrackExtract As Boolean = IsIdentityNormalizer(Me.Normalizer) AndAlso
+                (Me.PreTokenizer Is Nothing OrElse isFusedCountConfig)
+
+            Dim pts As PreTokenizedString
+            If useNoTrackExtract Then
+                pts = Me.AddedVocabulary.ExtractAndNormalizeNoTrack(text)
+            Else
+                pts = Me.AddedVocabulary.ExtractAndNormalize(text, Me.Normalizer)
+            End If
 
             ' Same no-track alignment skipping as the offset-free EncodeSingleSequence path.
             For Each s As Split In pts.Splits
@@ -307,6 +337,23 @@ Imports Tokenizers.Serialization
             Next
 
             If Me.PreTokenizer IsNot Nothing Then
+                ' M2 fast path: when the pre-tokenizer is exactly a fused manual-Isolated-split run
+                ' followed by a pure-map ByteLevel (e.g. DeepSeek's 3 splits + ByteLevel), drive the
+                ' model straight from the fused ranges instead of materializing the per-piece
+                ' Split / NormalizedString objects the fuse pass would escape to Me.Splits. Each
+                ' range builds its byte-mapped string once (NormalizedString.ToByteMappedString) and
+                ' feeds Model.CountTokens directly; the mapped string itself is unavoidable (the
+                ' model consumes a String), but the per-piece objects are eliminated.
+                If isFusedCountConfig Then
+                    Dim rangesBySplit As List(Of (NormalizedString, List(Of (Integer, Integer)))) =
+                        pts.FusedRangesBySplit(fusedPatterns)
+                    Dim m2Count As Integer = pts.CountFusedRanges(
+                        rangesBySplit, Function(mapped As String) Me.Model.CountTokens(mapped))
+                    If addSpecialTokens AndAlso Me.PostProcessor IsNot Nothing Then
+                        m2Count += Me.PostProcessor.GetAddedTokens(False)
+                    End If
+                    Return m2Count
+                End If
                 Me.PreTokenizer.PreTokenize(pts)
             End If
 
@@ -321,6 +368,21 @@ Imports Tokenizers.Serialization
         End Function
 
         ''' <summary>
+        ''' Whether the given normalizer is a no-op (identity): Nothing, an empty
+        ''' <see cref="NormalizerSequence"/>, or a <see cref="PrecompiledNormalizer"/> with an
+        ''' empty charsmap. When identity, the normalized text equals the original, so the
+        ''' count-only fast path (M3) can skip building the per-byte alignment list entirely.
+        ''' </summary>
+        Private Shared Function IsIdentityNormalizer(n As INormalizer) As Boolean
+            If n Is Nothing Then Return True
+            Dim seq As NormalizerSequence = TryCast(n, NormalizerSequence)
+            If seq IsNot Nothing Then Return seq.IsEmpty
+            Dim pc As PrecompiledNormalizer = TryCast(n, PrecompiledNormalizer)
+            If pc IsNot Nothing Then Return pc.IsNoOp
+            Return False
+        End Function
+
+        ''' <summary>
         ''' Diagnostic (dev-only): runs the same three stages as the <see cref="EncodeCount"/>
         ''' count-only fast path and returns per-stage wall ticks and allocated bytes. Single-threaded;
         ''' callers should warm up (JIT + thread-local caches) before timing. Allocations use
@@ -331,9 +393,28 @@ Imports Tokenizers.Serialization
             Dim profile As New EncodeCountStageProfile()
             profile.InputCharCount = text.Length
 
+            ' Mirror EncodeCountCore: M2 detection first (independent of the normalizer), then gate
+            ' the no-track extract on identity normalizer AND (no pre-tokenizer OR the M2
+            ' fused-count config) so the count-only path never touches an empty _alignments.
+            Dim isFusedCountConfig As Boolean = False
+            Dim fusedPatterns As New List(Of Pattern)()
+            If Me.PreTokenizer IsNot Nothing Then
+                Dim seq As PreTokenizerSequence = TryCast(Me.PreTokenizer, PreTokenizerSequence)
+                If seq IsNot Nothing Then
+                    isFusedCountConfig = seq.TryGetFusedCountConfig(fusedPatterns)
+                End If
+            End If
+            Dim useNoTrackExtract As Boolean = IsIdentityNormalizer(Me.Normalizer) AndAlso
+                (Me.PreTokenizer Is Nothing OrElse isFusedCountConfig)
+
             Dim s1 As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
             Dim a1 As Long = GC.GetAllocatedBytesForCurrentThread()
-            Dim pts As PreTokenizedString = Me.AddedVocabulary.ExtractAndNormalize(text, Me.Normalizer)
+            Dim pts As PreTokenizedString
+            If useNoTrackExtract Then
+                pts = Me.AddedVocabulary.ExtractAndNormalizeNoTrack(text)
+            Else
+                pts = Me.AddedVocabulary.ExtractAndNormalize(text, Me.Normalizer)
+            End If
             For Each s As Split In pts.Splits
                 s.Normalized.SetTrackAlignments(False)
             Next
@@ -342,24 +423,51 @@ Imports Tokenizers.Serialization
 
             Dim s2 As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
             Dim a2 As Long = GC.GetAllocatedBytesForCurrentThread()
+            ' M2 range-driven path: when the pre-tokenizer qualifies (fused manual-Isolated run +
+            ' pure-map ByteLevel, the whole sequence), the fuse produces only final ranges — no
+            ' per-piece Split/NormalizedString. The mapped strings are built in the Model phase
+            ' below, so FusedSplit's allocation here is just the ranges themselves.
+            Dim m2Ranges As List(Of (NormalizedString, List(Of (Integer, Integer)))) = Nothing
+            Dim pieceCount As Integer = 0
             If Me.PreTokenizer IsNot Nothing Then
-                If TypeOf Me.PreTokenizer Is PreTokenizerSequence Then
-                    Dim subProfile As PreTokenizeStageProfile =
-                        DirectCast(Me.PreTokenizer, PreTokenizerSequence).PreTokenizeProfiled(pts)
-                    profile.FusedSplitTicks = subProfile.FusedSplitTicks
-                    profile.FusedSplitAllocated = subProfile.FusedSplitAllocated
-                    profile.RemainingStages = subProfile.Remaining
+                If isFusedCountConfig Then
+                    m2Ranges = pts.FusedRangesBySplit(fusedPatterns)
+                    For Each sp As Split In pts.Splits
+                        If sp.Tokens IsNot Nothing Then pieceCount += 1
+                    Next
+                    For Each pair As (NormalizedString, List(Of (Integer, Integer))) In m2Ranges
+                        pieceCount += pair.Item2.Count
+                    Next
+                    profile.FusedSplitTicks = s2.ElapsedTicks
+                    profile.FusedSplitAllocated = GC.GetAllocatedBytesForCurrentThread() - a2
                 Else
-                    Me.PreTokenizer.PreTokenize(pts)
+                    Dim seq As PreTokenizerSequence = TryCast(Me.PreTokenizer, PreTokenizerSequence)
+                    If seq IsNot Nothing Then
+                        Dim subProfile As PreTokenizeStageProfile = seq.PreTokenizeProfiled(pts)
+                        profile.FusedSplitTicks = subProfile.FusedSplitTicks
+                        profile.FusedSplitAllocated = subProfile.FusedSplitAllocated
+                        profile.RemainingStages = subProfile.Remaining
+                        pieceCount = pts.Splits.Count
+                    Else
+                        Me.PreTokenizer.PreTokenize(pts)
+                        pieceCount = pts.Splits.Count
+                    End If
                 End If
+            Else
+                pieceCount = pts.Splits.Count
             End If
             profile.PretokenizeTicks = s2.ElapsedTicks
             profile.PretokenizeAllocated = GC.GetAllocatedBytesForCurrentThread() - a2
-            profile.PieceCount = pts.Splits.Count
+            profile.PieceCount = pieceCount
 
             Dim s3 As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
             Dim a3 As Long = GC.GetAllocatedBytesForCurrentThread()
-            Dim n As Integer = pts.TokenizeCount(Function(nm As NormalizedString) Me.Model.CountTokens(nm.Get))
+            Dim n As Integer
+            If m2Ranges IsNot Nothing Then
+                n = pts.CountFusedRanges(m2Ranges, Function(mapped As String) Me.Model.CountTokens(mapped))
+            Else
+                n = pts.TokenizeCount(Function(nm As NormalizedString) Me.Model.CountTokens(nm.Get))
+            End If
             profile.ModelTicks = s3.ElapsedTicks
             profile.ModelAllocated = GC.GetAllocatedBytesForCurrentThread() - a3
 

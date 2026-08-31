@@ -31,6 +31,13 @@ Namespace Normalizers
             _mapping(grapheme) = replacement
         End Sub
 
+        ''' <summary>Whether the underlying charsmap is empty, making this normalizer a no-op (identity).</summary>
+        Public ReadOnly Property IsNoOp As Boolean
+            Get
+                Return _precompiledCharsmap.Length = 0
+            End Get
+        End Property
+
         Public Sub Normalize(normalized As Internal.NormalizedString) Implements INormalizer.Normalize
             If _precompiledCharsmap.Length = 0 Then Return
 

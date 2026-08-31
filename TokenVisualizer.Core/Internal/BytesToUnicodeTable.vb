@@ -111,6 +111,41 @@ Namespace Internal
                 Return 4
             End If
         End Function
+
+        ''' <summary>
+        ''' Fills <paramref name="dest"/> starting at <paramref name="index"/> with the byte-level
+        ''' mapped characters for a Unicode scalar value (one mapped <see cref="Char"/> per UTF-8
+        ''' byte), and returns the number of chars written. Mirror of
+        ''' <see cref="AppendByteTransform"/> that writes plain chars instead of (Char, Integer)
+        ''' transform items — used by the fused ByteLevel path
+        ''' (<see cref="NormalizedString.SliceWithByteMap"/>) to build the mapped string directly.
+        ''' Both methods must emit the same chars in the same order; keep in sync (guarded by a
+        ''' differential test). Lone surrogates are mapped as U+FFFD (3 bytes), exactly matching
+        ''' <see cref="AppendByteTransform"/>.
+        ''' </summary>
+        Public Function AppendByteTransformChars(dest As Char(), index As Integer, cp As Integer) As Integer
+            If cp >= &HD800 AndAlso cp <= &HDFFF Then cp = &HFFFD
+            Dim table As Char() = BytesToCharTable
+            If cp < &H80 Then
+                dest(index) = table(cp)
+                Return 1
+            ElseIf cp < &H800 Then
+                dest(index) = table(&HC0 Or (cp >> 6))
+                dest(index + 1) = table(&H80 Or (cp And &H3F))
+                Return 2
+            ElseIf cp < &H10000 Then
+                dest(index) = table(&HE0 Or (cp >> 12))
+                dest(index + 1) = table(&H80 Or ((cp >> 6) And &H3F))
+                dest(index + 2) = table(&H80 Or (cp And &H3F))
+                Return 3
+            Else
+                dest(index) = table(&HF0 Or (cp >> 18))
+                dest(index + 1) = table(&H80 Or ((cp >> 12) And &H3F))
+                dest(index + 2) = table(&H80 Or ((cp >> 6) And &H3F))
+                dest(index + 3) = table(&H80 Or (cp And &H3F))
+                Return 4
+            End If
+        End Function
     End Module
 
 End Namespace

@@ -32,6 +32,19 @@ Namespace PreTokenizers
             _useRegex = useRegex
         End Sub
 
+        ''' <summary>
+        ''' Whether this ByteLevel is a pure byte→char mapper: no GPT-2 regex split and no
+        ''' prefix-space insertion (e.g. DeepSeek's trailing ByteLevel use_regex:=False,
+        ''' add_prefix_space:=False). A pure mapper changes no split boundaries and can be folded
+        ''' into the fused Isolated-split pass
+        ''' (<see cref="PreTokenizedString.FuseIsolatedSplitsWithByteMap"/>).
+        ''' </summary>
+        Friend ReadOnly Property IsPureMap As Boolean
+            Get
+                Return Not _useRegex AndAlso Not _addPrefixSpace
+            End Get
+        End Property
+
         Public Sub New()
             Me.New(True, True, True)
         End Sub
