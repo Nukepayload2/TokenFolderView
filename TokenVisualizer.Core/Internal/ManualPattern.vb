@@ -23,23 +23,35 @@ Namespace Internal
     Public MustInherit Class ManualPatternBase
         Inherits Pattern
 
-        ''' <summary>Emits all match spans for <paramref name="inside"/> into <paramref name="result"/>.</summary>
-        Protected MustOverride Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
+        ''' <summary>
+        ''' Emits all match spans for the <paramref name="inside"/>(<paramref name="startNet"/>,
+        ''' startNet + <paramref name="lenNet"/>) slice into <paramref name="result"/>. Byte offsets
+        ''' in emitted matches are relative to the slice start. <paramref name="totalBytes"/> is set
+        ''' to the slice's total UTF-8 byte length so the caller can fill the trailing gap.
+        ''' </summary>
+        Protected MustOverride Sub Scan(inside As String, startNet As Integer, lenNet As Integer,
+                                        result As List(Of MatchInfo), ByRef prev As Integer, ByRef totalBytes As Integer)
 
         Protected Overrides Sub FindMatchesCore(inside As String, result As List(Of MatchInfo))
             If inside Is Nothing Then inside = String.Empty
-            If inside.Length = 0 Then
+            FindMatchesCore(inside, 0, inside.Length, result)
+        End Sub
+
+        Protected Overrides Sub FindMatchesCore(inside As String, startNet As Integer, lenNet As Integer, result As List(Of MatchInfo))
+            If inside Is Nothing Then inside = String.Empty
+            If lenNet <= 0 Then
                 result.Add(New MatchInfo(0, 0, False))
                 Return
             End If
 
             ' The scanner emits MatchInfo entries directly (with implicit gap filling via
-            ' <see cref="EmitMatch"/>), so no intermediate (start,end) span list is materialized.
+            ' <see cref="EmitMatch"/>) with byte offsets relative to the slice start, so no
+            ' intermediate (start,end) span list and no slice substring are materialized.
             Dim prev As Integer = 0
-            Me.Scan(inside, result, prev)
-            Dim total As Integer = Utf8Helpers.Utf8Length(inside)
-            If prev < total Then
-                result.Add(New MatchInfo(prev, total, False))
+            Dim totalBytes As Integer = 0
+            Me.Scan(inside, startNet, lenNet, result, prev, totalBytes)
+            If prev < totalBytes Then
+                result.Add(New MatchInfo(prev, totalBytes, False))
             End If
         End Sub
 
@@ -91,9 +103,12 @@ Namespace Internal
 
         Private Shared ReadOnly Contractions As String() = {"s", "t", "re", "ve", "m", "ll", "d"}
 
-        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
-            Dim n As Integer = inside.Length
-            Dim net As Integer = 0
+        Protected Overrides Sub Scan(inside As String, startNet As Integer, lenNet As Integer,
+                                     result As List(Of MatchInfo), ByRef prev As Integer, ByRef totalBytes As Integer)
+            ' net is an absolute index into <c>inside</c> bounded to the slice; byteOff stays
+            ' relative to the slice start, so emitted match byte offsets are slice-relative.
+            Dim n As Integer = startNet + lenNet
+            Dim net As Integer = startNet
             Dim byteOff As Integer = 0
             While net < n
                 Dim startByte As Integer = byteOff
@@ -268,6 +283,8 @@ Namespace Internal
                 net += sc.NetLen
                 byteOff += sc.Utf8Len
             End While
+            ' The scan consumed the whole slice, so byteOff is the slice's total UTF-8 byte length.
+            totalBytes = byteOff
         End Sub
     End Class
 
@@ -280,9 +297,12 @@ Namespace Internal
 
         Public Const Canonical As String = "\p{N}{1,3}"
 
-        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
-            Dim n As Integer = inside.Length
-            Dim net As Integer = 0
+        Protected Overrides Sub Scan(inside As String, startNet As Integer, lenNet As Integer,
+                                     result As List(Of MatchInfo), ByRef prev As Integer, ByRef totalBytes As Integer)
+            ' net is an absolute index into <c>inside</c> bounded to the slice; byteOff stays
+            ' relative to the slice start, so emitted match byte offsets are slice-relative.
+            Dim n As Integer = startNet + lenNet
+            Dim net As Integer = startNet
             Dim byteOff As Integer = 0
             While net < n
                 Dim startByte As Integer = byteOff
@@ -308,6 +328,8 @@ Namespace Internal
                     byteOff += sc.Utf8Len
                 End If
             End While
+            ' The scan consumed the whole slice, so byteOff is the slice's total UTF-8 byte length.
+            totalBytes = byteOff
         End Sub
     End Class
 
@@ -321,9 +343,12 @@ Namespace Internal
 
         Public Const Canonical As String = "[一-龥぀-ゟ゠-ヿ]+"
 
-        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
-            Dim n As Integer = inside.Length
-            Dim net As Integer = 0
+        Protected Overrides Sub Scan(inside As String, startNet As Integer, lenNet As Integer,
+                                     result As List(Of MatchInfo), ByRef prev As Integer, ByRef totalBytes As Integer)
+            ' net is an absolute index into <c>inside</c> bounded to the slice; byteOff stays
+            ' relative to the slice start, so emitted match byte offsets are slice-relative.
+            Dim n As Integer = startNet + lenNet
+            Dim net As Integer = startNet
             Dim byteOff As Integer = 0
             While net < n
                 Dim startByte As Integer = byteOff
@@ -347,6 +372,8 @@ Namespace Internal
                     byteOff += sc.Utf8Len
                 End If
             End While
+            ' The scan consumed the whole slice, so byteOff is the slice's total UTF-8 byte length.
+            totalBytes = byteOff
         End Sub
     End Class
 
@@ -367,9 +394,12 @@ Namespace Internal
             "| ?[\p{P}\p{S}]+[" & ControlChars.Cr & ControlChars.Lf & "]*" &
             "|\s*[" & ControlChars.Cr & ControlChars.Lf & "]+|\s+(?!\S)|\s+"
 
-        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
-            Dim n As Integer = inside.Length
-            Dim net As Integer = 0
+        Protected Overrides Sub Scan(inside As String, startNet As Integer, lenNet As Integer,
+                                     result As List(Of MatchInfo), ByRef prev As Integer, ByRef totalBytes As Integer)
+            ' net is an absolute index into <c>inside</c> bounded to the slice; byteOff stays
+            ' relative to the slice start, so emitted match byte offsets are slice-relative.
+            Dim n As Integer = startNet + lenNet
+            Dim net As Integer = startNet
             Dim byteOff As Integer = 0
             While net < n
                 Dim startByte As Integer = byteOff
@@ -558,6 +588,8 @@ Namespace Internal
                 net += sc.NetLen
                 byteOff += sc.Utf8Len
             End While
+            ' The scan consumed the whole slice, so byteOff is the slice's total UTF-8 byte length.
+            totalBytes = byteOff
         End Sub
     End Class
 
@@ -569,9 +601,12 @@ Namespace Internal
 
         Public Const Canonical As String = "\w+|[^\w\s]+"
 
-        Protected Overrides Sub Scan(inside As String, result As List(Of MatchInfo), ByRef prev As Integer)
-            Dim n As Integer = inside.Length
-            Dim net As Integer = 0
+        Protected Overrides Sub Scan(inside As String, startNet As Integer, lenNet As Integer,
+                                     result As List(Of MatchInfo), ByRef prev As Integer, ByRef totalBytes As Integer)
+            ' net is an absolute index into <c>inside</c> bounded to the slice; byteOff stays
+            ' relative to the slice start, so emitted match byte offsets are slice-relative.
+            Dim n As Integer = startNet + lenNet
+            Dim net As Integer = startNet
             Dim byteOff As Integer = 0
             While net < n
                 Dim startByte As Integer = byteOff
@@ -609,6 +644,8 @@ Namespace Internal
                     byteOff += sc.Utf8Len
                 End If
             End While
+            ' The scan consumed the whole slice, so byteOff is the slice's total UTF-8 byte length.
+            totalBytes = byteOff
         End Sub
     End Class
 

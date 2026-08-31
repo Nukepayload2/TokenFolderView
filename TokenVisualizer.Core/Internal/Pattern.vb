@@ -49,7 +49,19 @@ Namespace Internal
         ''' </summary>
         Friend Sub FindMatchesInto(inside As String, result As List(Of MatchInfo))
             result.Clear()
-            FindMatchesCore(inside, result)
+            FindMatchesCore(inside, 0, inside.Length, result)
+        End Sub
+
+        ''' <summary>
+        ''' Slice-aware overload: matches the <paramref name="inside"/>(<paramref name="startNet"/>,
+        ''' startNet + <paramref name="lenNet"/>) slice. The default materializes the slice and
+        ''' delegates to the full-string scanner (semantics unchanged); the hot fused-split path's
+        ''' manual scanners override <see cref="FindMatchesCore(String, Integer, Integer, List(Of MatchInfo))"/>
+        ''' to scan the slice in place, avoiding the substring allocation.
+        ''' </summary>
+        Friend Sub FindMatchesInto(inside As String, startNet As Integer, lenNet As Integer, result As List(Of MatchInfo))
+            result.Clear()
+            FindMatchesCore(inside, startNet, lenNet, result)
         End Sub
 
         ''' <summary>
@@ -57,6 +69,16 @@ Namespace Internal
         ''' (which is pre-cleared). Subclasses implement the pattern-specific scanning here.
         ''' </summary>
         Protected MustOverride Sub FindMatchesCore(inside As String, result As List(Of MatchInfo))
+
+        ''' <summary>
+        ''' Slice match scan. The default materializes the slice substring and delegates to
+        ''' <see cref="FindMatchesCore(String, List(Of MatchInfo))"/>, so patterns that are not in
+        ''' the fused hot path (regex, string, invert) keep their exact current behaviour.
+        ''' </summary>
+        Protected Overridable Sub FindMatchesCore(inside As String, startNet As Integer, lenNet As Integer, result As List(Of MatchInfo))
+            Dim seg As String = inside.Substring(startNet, lenNet)
+            FindMatchesCore(seg, result)
+        End Sub
 
         ''' <summary>
         ''' Factory used by later phases to dispatch to the right pattern implementation.

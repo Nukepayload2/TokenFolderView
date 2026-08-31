@@ -127,15 +127,15 @@ Namespace Internal
                         Dim b1 As Integer = r.Item1
                         Dim b2 As Integer = r.Item2
                         If b2 <= b1 Then Continue For
-                        ' Extract the piece's normalized substring via the cached boundary index
-                        ' (binary search), then run the next pattern exactly as the sequential
-                        ' path does (FindMatches on that substring), offsetting matches back to the
-                        ' root normalized byte referential.
+                        ' Run the next pattern directly on the text slice via the cached boundary
+                        ' index (binary search): the manual scanners accept a (string, start, length)
+                        ' slice and scan it in place, so no per-(piece × pattern) substring is
+                        ' materialized. Matches come back with byte offsets relative to the slice
+                        ' and are offset back to the root normalized byte referential below.
                         Dim n1 As Integer = ns.ByteToNetIndexCached(b1)
                         Dim n2 As Integer = ns.ByteToNetIndexCached(b2)
                         If n2 <= n1 Then Continue For
-                        Dim seg As String = text.Substring(n1, n2 - n1)
-                        p.FindMatchesInto(seg, scratch)
+                        p.FindMatchesInto(text, n1, n2 - n1, scratch)
                         For i As Integer = 0 To scratch.Count - 1
                             Dim m As MatchInfo = scratch(i)
                             Dim mb1 As Integer = m.Start

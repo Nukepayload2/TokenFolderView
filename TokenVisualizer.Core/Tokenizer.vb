@@ -321,6 +321,53 @@ Imports Tokenizers.Serialization
         End Function
 
         ''' <summary>
+        ''' Diagnostic (dev-only): runs the same three stages as the <see cref="EncodeCount"/>
+        ''' count-only fast path and returns per-stage wall ticks and allocated bytes. Single-threaded;
+        ''' callers should warm up (JIT + thread-local caches) before timing. Allocations use
+        ''' <see cref="GC.GetAllocatedBytesForCurrentThread"/>, which is immune to GC-state noise.
+        ''' Mirrors <see cref="EncodeCountCore"/> — keep in sync if that fast path changes.
+        ''' </summary>
+        Public Function ProfileCountStages(text As String) As EncodeCountStageProfile
+            Dim profile As New EncodeCountStageProfile()
+            profile.InputCharCount = text.Length
+
+            Dim s1 As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+            Dim a1 As Long = GC.GetAllocatedBytesForCurrentThread()
+            Dim pts As PreTokenizedString = Me.AddedVocabulary.ExtractAndNormalize(text, Me.Normalizer)
+            For Each s As Split In pts.Splits
+                s.Normalized.SetTrackAlignments(False)
+            Next
+            profile.ExtractTicks = s1.ElapsedTicks
+            profile.ExtractAllocated = GC.GetAllocatedBytesForCurrentThread() - a1
+
+            Dim s2 As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+            Dim a2 As Long = GC.GetAllocatedBytesForCurrentThread()
+            If Me.PreTokenizer IsNot Nothing Then
+                If TypeOf Me.PreTokenizer Is PreTokenizerSequence Then
+                    Dim subProfile As PreTokenizeStageProfile =
+                        DirectCast(Me.PreTokenizer, PreTokenizerSequence).PreTokenizeProfiled(pts)
+                    profile.FusedSplitTicks = subProfile.FusedSplitTicks
+                    profile.FusedSplitAllocated = subProfile.FusedSplitAllocated
+                    profile.RemainingStages = subProfile.Remaining
+                Else
+                    Me.PreTokenizer.PreTokenize(pts)
+                End If
+            End If
+            profile.PretokenizeTicks = s2.ElapsedTicks
+            profile.PretokenizeAllocated = GC.GetAllocatedBytesForCurrentThread() - a2
+            profile.PieceCount = pts.Splits.Count
+
+            Dim s3 As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
+            Dim a3 As Long = GC.GetAllocatedBytesForCurrentThread()
+            Dim n As Integer = pts.TokenizeCount(Function(nm As NormalizedString) Me.Model.CountTokens(nm.Get))
+            profile.ModelTicks = s3.ElapsedTicks
+            profile.ModelAllocated = GC.GetAllocatedBytesForCurrentThread() - a3
+
+            profile.TokenCount = n
+            Return profile
+        End Function
+
+        ''' <summary>
         ''' Encodes with character offsets and returns per-token (id, char start, char end) spans,
         ''' used by the colored view. The pipeline's char offsets are SCALAR offsets (matching the
         ''' Rust/Python <c>offset_type="char"</c>), but .NET <c>String.Substring</c> uses UTF-16 code
