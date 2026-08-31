@@ -232,7 +232,7 @@ Namespace Views
             TokenLines.ItemsSource = Nothing
             TblFileName.Text = ""
             TblFileMeta.Text = ""
-            TblEmpty.IsVisible = True
+            TokenLines.IsEmptyVisible = True
         End Sub
 
         Private Async Sub LoadFileAsync(node As ScanTreeNode)
@@ -242,9 +242,9 @@ Namespace Views
 
             TblFileName.Text = node.Name
             TblFileMeta.Text = "加载中…"
-            TblEmpty.IsVisible = True
+            TokenLines.IsEmptyVisible = True
             TokenLines.ItemsSource = Nothing
-            TokenScroll.Offset = New Vector(0, 0)
+            TokenLines.ResetScroll()
 
             Try
                 Dim result = Await Task.Run(Function() BuildLines(node.FullPath, tokenizer))
@@ -253,14 +253,12 @@ Namespace Views
                 TblFileName.Text = result.fileName
                 TblFileMeta.Text = $"{FormatBytes(result.byteLength)} · {result.charCount:N0} 字符 · {result.tokenCount:N0} tokens"
                 TokenLines.ItemsSource = result.lines
-                TblEmpty.IsVisible = False
+                TokenLines.IsEmptyVisible = False
             Catch ex As OperationCanceledException
             Catch ex As Exception
                 If gen <> _loadGeneration Then Return
                 TblFileMeta.Text = ""
-                TokenLines.ItemsSource = Nothing
-                TokenLines.ItemsSource = New List(Of TokenLine)() From {TokenLine.FromPlainText($"无法读取文件：{ex.Message}")}
-                TblEmpty.IsVisible = False
+                TokenLines.ShowText($"无法读取文件：{ex.Message}")
             End Try
         End Sub
 
@@ -289,11 +287,7 @@ Namespace Views
                 Dim text As String = Encoding.UTF8.GetString(buffer, 0, bytesRead)
 
                 Dim spans = tokenizer.EncodeWithSpans(text)
-                Dim source = TokenSource.Create(text, spans)
-                Dim lines As New List(Of TokenLine)(source.Lines.Length)
-                For i As Integer = 0 To source.Lines.Length - 1
-                    lines.Add(New TokenLine(source, i))
-                Next
+                Dim lines = TokenizedTextView.BuildLines(text, spans)
                 Return (fileName, length, text.Length, spans.Count, lines)
             Finally
                 ArrayPool(Of Byte).Shared.Return(buffer)

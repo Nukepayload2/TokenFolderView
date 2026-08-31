@@ -9,10 +9,11 @@ Namespace Controls
 
     ''' <summary>
     ''' Builds the shared brushes and the per-line <see cref="InlineCollection"/>s used by the
-    ''' virtualized file reader. The accent brush is resolved once and cached; accent runs get the
-    ''' accent foreground plus a translucent gray background so odd tokens are easy to spot. The heavy
-    ''' per-line data is precomputed on the background thread in the Explorer page; this module only
-    ''' runs on the UI thread and only for lines that are actually materialized by the virtualizer.
+    ''' virtualized token-colored view. The accent brush is resolved once and cached; accent runs get
+    ''' the accent foreground plus a translucent gray background so odd tokens are easy to spot. The
+    ''' heavy per-line data is precomputed on the background thread via <see cref="BuildLines"/>;
+    ''' the brush resolution and per-line inlines run on the UI thread and only for lines that are
+    ''' actually materialized by the virtualizer.
     ''' </summary>
     Public Module TokenizedTextView
 
@@ -50,6 +51,23 @@ Namespace Controls
                 End If
             End SyncLock
             Return _accentBgBrush
+        End Function
+
+        ''' <summary>
+        ''' Builds the virtualized line objects for a decoded text and its token spans. Runs on the
+        ''' background thread; only the cheap per-line records and one tiny <see cref="TokenLine"/> per
+        ''' line are built here. The per-line run tuples and <see cref="InlineCollection"/>s are computed
+        ''' lazily on the UI thread by <see cref="TokenLine.Inlines"/> when a virtualized container is
+        ''' materialized.
+        ''' </summary>
+        Public Function BuildLines(text As String,
+                                   spans As IReadOnlyList(Of (Integer, Integer, Integer))) As List(Of TokenLine)
+            Dim source = TokenSource.Create(text, spans)
+            Dim lines As New List(Of TokenLine)(source.Lines.Length)
+            For i As Integer = 0 To source.Lines.Length - 1
+                lines.Add(New TokenLine(source, i))
+            Next
+            Return lines
         End Function
 
         ''' <summary>

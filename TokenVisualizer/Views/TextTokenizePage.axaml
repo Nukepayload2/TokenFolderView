@@ -1,0 +1,47 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:controls="using:TokenVisualizer.Controls"
+             mc:Ignorable="d" d:DesignWidth="1200" d:DesignHeight="800"
+             x:Class="TokenVisualizer.Views.TextTokenizePage">
+
+    <Grid RowDefinitions="Auto,*">
+
+        <!-- Row 0: page header + toolbar -->
+        <Grid ColumnDefinitions="*,Auto" Margin="20,16,20,0">
+            <StackPanel Spacing="2">
+                <TextBlock Text="文本分词" FontSize="28" FontWeight="Bold"/>
+                <TextBlock Text="输入任意文本，点击「统计」查看逐 token 着色。" Opacity="0.6"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                <TextBlock x:Name="TblStats" FontSize="12" Opacity="0.7" VerticalAlignment="Center"/>
+                <Button x:Name="BtnAnalyze" Content="统计" Classes="accent" Padding="16,8"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- Row 1: body — left plain-text input, right token-colored view -->
+        <Grid Grid.Row="1" ColumnDefinitions="*,4,*" Margin="20,12,20,16">
+
+            <!-- Left: plain text input (NoWrap + monospace so lines match the right view) -->
+            <Grid RowDefinitions="Auto,*">
+                <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,0,0,6">
+                    <TextBlock Text="输入文本" FontWeight="SemiBold"/>
+                </StackPanel>
+                <TextBox x:Name="TxtInput" Grid.Row="1"
+                         AcceptsReturn="True" AcceptsTab="True"
+                         FontFamily="Cascadia Code,Consolas,Courier New"
+                         TextWrapping="NoWrap"
+                         PlaceholderText="在此粘贴或输入文本，点击「统计」查看 token 着色"/>
+            </Grid>
+
+            <!-- Splitter -->
+            <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Center" VerticalAlignment="Stretch"/>
+
+            <!-- Right: token-colored view (shared container control) -->
+            <controls:TokenizedViewer x:Name="TokenView" Grid.Column="2" EmptyHint="点击「统计」查看 token 着色"/>
+
+        </Grid>
+
+    </Grid>
+</UserControl>

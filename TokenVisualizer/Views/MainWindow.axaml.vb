@@ -15,6 +15,7 @@ Namespace Views
 
         Private _currentPage As Control
         Private _explorerPage As ExplorerPage
+        Private _textTokenizePage As TextTokenizePage
         Private _tokenizerPage As TokenizerPage
         Private _settingsPage As SettingsPage
         Private _searchQuery As String = ""
@@ -57,12 +58,17 @@ Namespace Views
                 .Tag = "explore",
                 .IconSource = New FASymbolIconSource With {.Symbol = FASymbol.OpenFolder}
             }
+            Dim textTokenizeItem As New FANavigationViewItem With {
+                .Content = "文本分词",
+                .Tag = "text-tokenize",
+                .IconSource = New FASymbolIconSource With {.Symbol = FASymbol.Edit}
+            }
             Dim tokenizerItem As New FANavigationViewItem With {
                 .Content = "分词器",
                 .Tag = "tokenizers",
                 .IconSource = New FASymbolIconSource With {.Symbol = FASymbol.Setting}
             }
-            NavView.MenuItemsSource = {exploreItem, tokenizerItem}
+            NavView.MenuItemsSource = {exploreItem, textTokenizeItem, tokenizerItem}
             NavView.SelectedItem = exploreItem
         End Sub
 
@@ -87,6 +93,8 @@ Namespace Views
 
         Private Sub ShowPage(kind As String)
             Select Case kind
+                Case "text-tokenize"
+                    ShowTextTokenizePage()
                 Case "tokenizers"
                     ShowTokenizerPage()
                 Case "settings"
@@ -104,6 +112,14 @@ Namespace Views
             NavView.Content = _explorerPage
             _explorerPage.RefreshStatus()
             _explorerPage.ApplySearchFilter(_searchQuery)
+        End Sub
+
+        Private Sub ShowTextTokenizePage()
+            If _textTokenizePage Is Nothing Then
+                _textTokenizePage = New TextTokenizePage()
+            End If
+            _currentPage = _textTokenizePage
+            NavView.Content = _textTokenizePage
         End Sub
 
         Private Sub ShowTokenizerPage()
