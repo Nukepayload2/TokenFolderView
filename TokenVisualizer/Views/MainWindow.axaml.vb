@@ -7,6 +7,7 @@ Imports Avalonia.Media
 Imports Avalonia.Threading
 Imports Avalonia.VisualTree
 Imports FluentAvalonia.UI.Controls
+Imports Tokenizers.Scanning
 Imports TokenVisualizer.Services
 
 Namespace Views
@@ -174,7 +175,7 @@ Namespace Views
                 TxtTotalTokens.Text = $"总计 {root.TokenCount:N0} tokens"
                 TxtFilesScanned.Text = $"文件 {root.FileCount:N0}"
                 TxtFilesSkipped.Text = $"跳过 {If(progress IsNot Nothing, progress.ReadFilesSkipped(), 0):N0}"
-                TxtScanStatus.Text = "完成"
+                TxtScanStatus.Text = "完成" & BuildSpeedSuffix(progress, root)
                 ScanProgressBar.IsVisible = False
                 BtnCancelScan.IsVisible = False
             Else
@@ -186,6 +187,28 @@ Namespace Views
                 BtnCancelScan.IsVisible = False
             End If
         End Sub
+
+        ''' <summary>
+        ''' Appends the last completed scan's load speed (" · 2.1M tokens/s · 84.2 MB/s") to the
+        ''' status label. Elapsed time is measured inside the scanner (<see cref="ScanProgress"/>),
+        ''' so the figure is exact even though the UI only polls every 200 ms. Returns "" when no
+        ''' scan has run or it finished too fast to measure.
+        ''' </summary>
+        Private Shared Function BuildSpeedSuffix(progress As ScanProgress, root As ScanTreeNode) As String
+            If progress Is Nothing Then Return ""
+            Dim elapsed As Double = progress.Elapsed.TotalSeconds
+            If elapsed <= 0 Then Return ""
+            Dim tokensPerSec As Double = root.TokenCount / elapsed
+            Dim bytesPerSec As Double = root.FileSize / elapsed
+            Return $" · {tokensPerSec:N0} tokens/s · {FormatBytes(bytesPerSec)}/s"
+        End Function
+
+        Private Shared Function FormatBytes(bytes As Double) As String
+            If bytes < 1024 Then Return $"{bytes:N0} B"
+            If bytes < 1024 * 1024 Then Return $"{bytes / 1024.0:N1} KB"
+            If bytes < 1024L * 1024 * 1024 Then Return $"{bytes / (1024.0 * 1024.0):N1} MB"
+            Return $"{bytes / (1024.0 * 1024.0 * 1024.0):N1} GB"
+        End Function
 
         Private Sub BtnCancelScan_Click() Handles BtnCancelScan.Click
             Dim scan = AppState.Current.ActiveScan

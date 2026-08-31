@@ -1,4 +1,5 @@
 Imports System
+Imports System.Diagnostics
 Imports System.Threading
 
 Namespace Scanning
@@ -14,6 +15,7 @@ Namespace Scanning
         Private _filesSkipped As Long
         Private _totalTokens As Long
         Private _filesWithErrors As Long
+        Private ReadOnly _stopwatch As New Stopwatch()
 
         ''' <summary>The token source the UI uses to request cancellation of a running scan.</summary>
         Public ReadOnly Property Cancellation As CancellationTokenSource = New CancellationTokenSource()
@@ -49,6 +51,23 @@ Namespace Scanning
         Public Function ReadFilesWithErrors() As Long
             Return Interlocked.Read(_filesWithErrors)
         End Function
+
+        ''' <summary>Starts the elapsed-time measurement. Called once at the start of <see cref="FolderScanner.ScanAsync"/>.</summary>
+        Public Sub Start()
+            _stopwatch.Restart()
+        End Sub
+
+        ''' <summary>Freezes the elapsed-time measurement. Called when the scan finishes so the UI can report load speed.</summary>
+        Public Sub [Stop]()
+            _stopwatch.Stop()
+        End Sub
+
+        ''' <summary>Elapsed scan time (stable once <see cref="Stop"/> has been called).</summary>
+        Public ReadOnly Property Elapsed As TimeSpan
+            Get
+                Return _stopwatch.Elapsed
+            End Get
+        End Property
 
     End Class
 End Namespace

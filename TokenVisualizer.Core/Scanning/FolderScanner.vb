@@ -42,6 +42,10 @@ Namespace Scanning
         Public Async Function ScanAsync(rootPath As String, Optional ct As CancellationToken = Nothing) As Task(Of ScanTreeNode)
             If String.IsNullOrWhiteSpace(rootPath) Then Throw New ArgumentException("Path must not be empty.", NameOf(rootPath))
 
+            ' Time the whole load (enumeration + tokenization + tree build) so the status bar
+            ' can report tokens/s and MB/s when the scan completes.
+            ScanProgress.Start()
+
             ' 1. Enumerate every file recursively (blacklisted folders are pruned by name).
             Dim files As New List(Of (relativePath As String, fullPath As String, length As Long))()
             EnumerateFiles(rootPath, String.Empty, files, ct)
@@ -65,7 +69,9 @@ Namespace Scanning
             ' 3. Pure tree construction.
             Dim rootName As String = Path.GetFileName(rootPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
             If String.IsNullOrEmpty(rootName) Then rootName = rootPath
-            Return BuildTree(rootName, rootPath, results)
+            Dim rootNode As ScanTreeNode = BuildTree(rootName, rootPath, results)
+            ScanProgress.Stop()
+            Return rootNode
         End Function
 
         ''' <summary>
