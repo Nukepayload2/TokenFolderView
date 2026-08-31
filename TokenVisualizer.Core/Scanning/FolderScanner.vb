@@ -6,19 +6,23 @@ Imports System.IO
 Imports System.Linq
 Imports System.Text
 Imports System.Threading
+Imports System.Threading.Channels
 Imports System.Threading.Tasks
 
 Namespace Scanning
 
     ''' <summary>
     ''' Walks a directory tree, filters blacklisted / binary / oversized files, and counts tokens
-    ''' for every remaining file using <see cref="Tokenizer.EncodeCount"/>. The scan is split into
-    ''' a sequential enumeration phase and a parallel tokenization phase; the pure
+    ''' for every remaining file using <see cref="Tokenizer.EncodeCount"/>. Enumeration and
+    ''' tokenization run as a producer/consumer pipeline over a bounded channel; the pure
     ''' <see cref="BuildTree"/> turns the flat results into a <see cref="ScanTreeNode"/> hierarchy.
     ''' </summary>
     Public NotInheritable Class FolderScanner
 
         Private Const BinaryHeadBytes As Integer = 4096
+
+        ''' <summary>Upper bound on files buffered between the enumeration task and the workers.</summary>
+        Private Const ChannelCapacity As Integer = 1024
 
         Private ReadOnly _tokenizer As Tokenizer
         Private ReadOnly _options As ScanOptions
@@ -36,8 +40,8 @@ Namespace Scanning
 
         ''' <summary>
         ''' Scans <paramref name="rootPath"/> recursively and returns the aggregated root node.
-        ''' The parallel tokenization pass runs on the thread pool and honours
-        ''' <paramref name="ct"/> for cooperative cancellation.
+        ''' The enumeration task feeds a bounded channel that worker tasks drain in parallel;
+        ''' <paramref name="ct"/> is honoured cooperatively by both sides.
         ''' </summary>
         Public Async Function ScanAsync(rootPath As String, Optional ct As CancellationToken = Nothing) As Task(Of ScanTreeNode)
             If String.IsNullOrWhiteSpace(rootPath) Then Throw New ArgumentException("Path must not be empty.", NameOf(rootPath))
@@ -46,25 +50,62 @@ Namespace Scanning
             ' can report tokens/s and MB/s when the scan completes.
             ScanProgress.Start()
 
-            ' 1. Enumerate every file recursively (blacklisted folders are pruned by name).
-            Dim files As New List(Of (relativePath As String, fullPath As String, length As Long))()
-            EnumerateFiles(rootPath, String.Empty, files, ct)
+            ' Producer/consumer pipeline: the enumeration task pushes files into a bounded channel
+            ' while the worker tasks tokenize them as they arrive. Enumeration overlaps tokenization
+            ' (no "collect everything first" pause), and the bounded channel caps how far the
+            ' producer can run ahead, bounding the memory held between the two stages.
+            ' The variable is named "pipeline", not "channel": VB identifiers are case-insensitive,
+            ' so a variable named "channel" would shadow the Channel type and break the factory call.
+            Dim pipeline As Channel(Of (relativePath As String, fullPath As String, length As Long)) =
+                Channel.CreateBounded(Of (relativePath As String, fullPath As String, length As Long))(
+                    New BoundedChannelOptions(ChannelCapacity) With {
+                        .FullMode = BoundedChannelFullMode.Wait,
+                        .SingleWriter = True,
+                        .SingleReader = False
+                    })
 
-            ' 2. Parallel tokenization pass. Cap workers at one per physical core: logical
-            '    processor count includes SMT siblings that add little for CPU-bound counting,
-            '    and leaving half the machine free keeps the UI responsive while the scan runs.
             Dim results As New ConcurrentBag(Of (relativePath As String, length As Long, tokenCount As Integer))()
-            Dim parallelOptions As New ParallelOptions With {
-                .MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount \ 2),
-                .CancellationToken = ct
-            }
-            Await Task.Run(
-                Sub()
-                    Parallel.ForEach(files, parallelOptions,
-                        Sub(file)
-                            ProcessFile(file.relativePath, file.fullPath, file.length, results)
-                        End Sub)
-                End Sub, ct)
+
+            ' Cap workers at one per physical core: logical processor count includes SMT siblings
+            ' that add little for CPU-bound counting, and leaving half the machine free keeps the
+            ' UI responsive while the scan runs.
+            Dim workerCount As Integer = Math.Max(1, Environment.ProcessorCount \ 2)
+
+            ' Producer: recursively enumerate, writing each file into the channel. The writer is
+            ' always completed (even on error/cancel) so the consumers never hang. (The lambda is
+            ' bound to a delegate first: VB forbids code after End Function on a multi-line lambda.)
+            Dim produce As Func(Of Task) = Async Function()
+                Try
+                    Await EnumerateFilesAsync(rootPath, String.Empty, pipeline.Writer, ct)
+                Finally
+                    pipeline.Writer.Complete()
+                End Try
+            End Function
+            Dim producer As Task = Task.Run(produce, ct)
+
+            ' Consumers: one task per physical core reads files off the channel and token-counts them.
+            ' (No Try/Finally here: VB forbids Await inside Finally, and the channel reader holds no
+            ' OS resources, so abandoning the enumerator on cancellation is harmless.)
+            Dim consume As Func(Of Task) = Async Function()
+                Dim enumerator = pipeline.Reader.ReadAllAsync(ct).GetAsyncEnumerator()
+                While Await enumerator.MoveNextAsync()
+                    ProcessFile(enumerator.Current.relativePath,
+                                enumerator.Current.fullPath,
+                                enumerator.Current.length, results)
+                End While
+                Await enumerator.DisposeAsync()
+            End Function
+            Dim consumers As New List(Of Task)(workerCount)
+            For i As Integer = 0 To workerCount - 1
+                consumers.Add(Task.Run(consume, ct))
+            Next
+
+            ' Drain the consumers first so the whole channel is processed, then surface any
+            ' producer fault (e.g. an I/O error or cancellation during enumeration) — without this
+            ' await, a mid-enumeration error would be silently swallowed and the scan would return
+            ' a partial tree.
+            Await Task.WhenAll(consumers)
+            Await producer
 
             ' 3. Pure tree construction.
             Dim rootName As String = Path.GetFileName(rootPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
@@ -194,27 +235,31 @@ Namespace Scanning
             Return read
         End Function
 
-        ''' <summary>Recursively collects files, pruning blacklisted folders by name at any depth.</summary>
-        Private Sub EnumerateFiles(dirFullPath As String,
-                                   relativePath As String,
-                                   files As List(Of (relativePath As String, fullPath As String, length As Long)),
-                                   ct As CancellationToken)
+        ''' <summary>
+        ''' Recursively collects files (pruning blacklisted folders by name at any depth) and writes
+        ''' each one into the channel for the worker tasks to consume. Backpressure on the bounded
+        ''' channel naturally paces enumeration against tokenization.
+        ''' </summary>
+        Private Async Function EnumerateFilesAsync(dirFullPath As String,
+                                                   relativePath As String,
+                                                   writer As ChannelWriter(Of (relativePath As String, fullPath As String, length As Long)),
+                                                   ct As CancellationToken) As Task
             ct.ThrowIfCancellationRequested()
 
             For Each subDirectory As String In Directory.EnumerateDirectories(dirFullPath)
                 Dim name As String = Path.GetFileName(subDirectory)
                 If ScanFilter.ShouldSkipFolder(name, _options.FolderBlacklist) Then Continue For
                 Dim rel As String = If(relativePath.Length = 0, name, relativePath & "/" & name)
-                EnumerateFiles(subDirectory, rel, files, ct)
+                Await EnumerateFilesAsync(subDirectory, rel, writer, ct)
             Next
 
             For Each filePath As String In Directory.EnumerateFiles(dirFullPath)
                 Dim name As String = Path.GetFileName(filePath)
                 Dim rel As String = If(relativePath.Length = 0, name, relativePath & "/" & name)
                 Dim fi As New FileInfo(filePath)
-                files.Add((rel, filePath, fi.Length))
+                Await writer.WriteAsync((rel, filePath, fi.Length), ct)
             Next
-        End Sub
+        End Function
 
         ''' <summary>Post-order pass that folds descendant counts into each directory node.</summary>
         Private Shared Function AggregateNode(node As ScanTreeNode) As (tokens As Long, files As Long, size As Long)
