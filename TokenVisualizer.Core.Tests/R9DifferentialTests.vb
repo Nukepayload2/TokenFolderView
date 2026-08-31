@@ -739,6 +739,77 @@ Namespace TokenVisualizer.Core.Tests
         End Sub
 
         ''' <summary>
+        ''' M8 differential: the streaming fused-range pass
+        ''' (<see cref="PreTokenizedString.StreamFusedRangesBySplit"/>, the M8 count-path
+        ''' replacement) produces exactly the same (startByte, endByte) final ranges, per split and
+        ''' in the same order, as the list-based <see cref="PreTokenizedString.FusedRangesBySplit"/>,
+        ''' over the M2 battery. Guards the streaming producer
+        ''' (<see cref="PreTokenizedString.FuseRangesStreaming"/> / StreamRangesInto, which must
+        ''' visit exactly the ranges FillRangesInto would have written) against a
+        ''' dropped/extra/reordered range, and proves the count-only path's per-range input is
+        ''' unchanged by M8. Read-only.
+        ''' </summary>
+        <TestMethod>
+        Public Sub M8_StreamedRanges_MatchListedRanges()
+            Dim patterns As New List(Of Pattern)() From {
+                New DeepSeekNumbersPattern(),
+                New DeepSeekCjkPattern(),
+                New DeepSeekGpt2Pattern()
+            }
+            Dim setTrack As MethodInfo = GetType(NormalizedString).GetMethod(
+                "SetTrackAlignments", BindingFlags.Instance Or BindingFlags.NonPublic)
+            Dim fusedRanges As MethodInfo = GetType(PreTokenizedString).GetMethod(
+                "FusedRangesBySplit", BindingFlags.Instance Or BindingFlags.NonPublic)
+            Dim streamRanges As MethodInfo = GetType(PreTokenizedString).GetMethod(
+                "StreamFusedRangesBySplit", BindingFlags.Instance Or BindingFlags.NonPublic)
+            Assert.IsNotNull(fusedRanges, "FusedRangesBySplit must exist (Friend M2 method)")
+            Assert.IsNotNull(streamRanges, "StreamFusedRangesBySplit must exist (Friend M8 method)")
+
+            For Each txt In M2TextBattery()
+                Dim pts As PreTokenizedString = PreTokenizedString.FromString(txt)
+                For Each s As Split In pts.Splits
+                    setTrack.Invoke(s.Normalized, New Object() {False})
+                Next
+
+                ' List-based reference.
+                Dim listObj As Object = fusedRanges.Invoke(pts, New Object() {patterns})
+                Dim listed As List(Of (NormalizedString, List(Of (Integer, Integer)))) =
+                    DirectCast(listObj, List(Of (NormalizedString, List(Of (Integer, Integer)))))
+
+                ' Streaming: collect the visited ranges per split into a test-local visitor.
+                Dim collector As New CollectingFusedRangeVisitor()
+                streamRanges.Invoke(pts, New Object() {patterns, collector})
+
+                Assert.AreEqual(listed.Count, collector.RangesBySplit.Count,
+                    $"streamed split count for '{txt}' (listed {listed.Count} != streamed {collector.RangesBySplit.Count})")
+                For i As Integer = 0 To listed.Count - 1
+                    Dim expected As List(Of (Integer, Integer)) = listed(i).Item2
+                    Dim actual As List(Of (Integer, Integer)) = collector.RangesBySplit(i)
+                    Assert.AreEqual(expected.Count, actual.Count,
+                        $"range count for split {i} of '{txt}' (listed {expected.Count} != streamed {actual.Count})")
+                    For k As Integer = 0 To expected.Count - 1
+                        Assert.AreEqual(expected(k), actual(k),
+                            $"range[{k}] for split {i} of '{txt}': listed {expected(k)} != streamed {actual(k)}")
+                    Next
+                Next
+            Next
+        End Sub
+
+        ''' <summary>Test-local <see cref="IFusedRangeVisitor"/> that collects the streamed ranges per split.</summary>
+        Private NotInheritable Class CollectingFusedRangeVisitor
+            Implements IFusedRangeVisitor
+            Public ReadOnly RangesBySplit As New List(Of List(Of (Integer, Integer)))()
+            Private _current As List(Of (Integer, Integer))
+            Public Sub BeginSplit(normalized As NormalizedString) Implements IFusedRangeVisitor.BeginSplit
+                _current = New List(Of (Integer, Integer))()
+                RangesBySplit.Add(_current)
+            End Sub
+            Public Sub Visit(startByte As Integer, endByte As Integer) Implements IFusedRangeVisitor.Visit
+                _current.Add((startByte, endByte))
+            End Sub
+        End Class
+
+        ''' <summary>
         ''' Independent sequential reference for <see cref="PreTokenizedString.ComputeFusedRanges"/>:
         ''' starts from the whole-text range, then for each pattern splits every current range by
         ''' <see cref="Pattern.FindMatches"/> on a materialized substring (fresh match list, reference

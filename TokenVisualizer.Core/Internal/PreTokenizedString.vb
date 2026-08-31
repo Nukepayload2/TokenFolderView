@@ -30,6 +30,23 @@ Namespace Internal
     End Class
 
     ''' <summary>
+    ''' Streaming consumer of the fused manual-Isolated-split range pass: called once per final
+    ''' piece range (byte offsets in a split's normalized referential) as the final pattern's scan
+    ''' produces them, so the final range list is never materialized (M8). A visitor instance is
+    ''' reusable: the caller holds one (a field or <see cref="ThreadLocal(Of T)"/>) and resets its
+    ''' per-call state before each use. <see cref="BeginSplit"/> is invoked once per split before
+    ''' its ranges stream, so a visitor that needs the split's <see cref="NormalizedString"/>
+    ''' (e.g. to build the piece or its byte-mapped string) can hold it in a field instead of
+    ''' capturing it per call (zero closure).
+    ''' </summary>
+    Public Interface IFusedRangeVisitor
+        ''' <summary>Called before a split's ranges stream, to set the split context.</summary>
+        Sub BeginSplit(normalized As NormalizedString)
+        ''' <summary>Called once per final piece range (byte offsets in the split's normalized text).</summary>
+        Sub Visit(startByte As Integer, endByte As Integer)
+    End Interface
+
+    ''' <summary>
     ''' Holds a string to be pre-tokenized as a list of <see cref="Split"/>s. Mirrors the Rust
     ''' <c>PreTokenizedString</c> for the parts needed by pre-tokenizers (P7 adds
     ''' <c>tokenize</c>/<c>into_encoding</c>).
@@ -128,28 +145,56 @@ Namespace Internal
 
         Private Sub FuseIsolatedSplitsCore(patterns As List(Of Pattern), applyByteMap As Boolean)
             Dim newSplits As New List(Of Split)()
+            Dim builder As SplitBuildingVisitor = s_splitBuilder.Value
+            builder.NewSplits = newSplits
+            builder.ApplyByteMap = applyByteMap
             For Each split As Split In Me.Splits
                 If split.Tokens IsNot Nothing Then
                     newSplits.Add(split)
                     Continue For
                 End If
-
-                Dim ns As NormalizedString = split.Normalized
-                Dim ranges As List(Of (Integer, Integer)) = ComputeFusedRanges(ns, patterns)
-                For Each r In ranges
-                    If r.Item2 > r.Item1 Then
-                        If applyByteMap Then
-                            newSplits.Add(Split.FromNormalizedString(
-                                ns.SliceWithByteMap(New OffsetRange(False, r.Item1, r.Item2))))
-                        Else
-                            Dim slice As NormalizedString = ns.Slice(New OffsetRange(False, r.Item1, r.Item2))
-                            newSplits.Add(Split.FromNormalizedString(slice))
-                        End If
-                    End If
-                Next
+                builder.BeginSplit(split.Normalized)
+                FuseRangesStreaming(split.Normalized, patterns, builder)
             Next
             Me.Splits = newSplits
         End Sub
+
+        ''' <summary>
+        ''' Reusable <see cref="IFusedRangeVisitor"/> for <see cref="FuseIsolatedSplitsCore"/>: each
+        ''' <see cref="Visit"/> materializes the piece (<see cref="NormalizedString.Slice"/> or
+        ''' <see cref="NormalizedString.SliceWithByteMap"/>) and appends it to
+        ''' <see cref="NewSplits"/>. Fields, not captured locals, so the instance is zero-allocation
+        ''' reusable across calls; the caller sets <see cref="NewSplits"/> / <see cref="ApplyByteMap"/>
+        ''' per call and <see cref="BeginSplit"/> sets the per-split source. M8: switching the
+        ''' tracked fused path to the streaming producer removes the final range list this path
+        ''' used to materialize (<see cref="ComputeFusedRanges"/>).
+        ''' </summary>
+        Private NotInheritable Class SplitBuildingVisitor
+            Implements IFusedRangeVisitor
+
+            ''' <summary>The split list being built (set once per <see cref="FuseIsolatedSplitsCore"/> call).</summary>
+            Public NewSplits As List(Of Split)
+            ''' <summary>Whether the pure-map ByteLevel mapping is folded into the piece (set per call).</summary>
+            Public ApplyByteMap As Boolean
+
+            Private _ns As NormalizedString
+
+            Public Sub BeginSplit(normalized As NormalizedString) Implements IFusedRangeVisitor.BeginSplit
+                Me._ns = normalized
+            End Sub
+
+            Public Sub Visit(startByte As Integer, endByte As Integer) Implements IFusedRangeVisitor.Visit
+                If endByte > startByte Then
+                    If ApplyByteMap Then
+                        NewSplits.Add(Split.FromNormalizedString(
+                            _ns.SliceWithByteMap(New OffsetRange(False, startByte, endByte))))
+                    Else
+                        NewSplits.Add(Split.FromNormalizedString(
+                            _ns.Slice(New OffsetRange(False, startByte, endByte))))
+                    End If
+                End If
+            End Sub
+        End Class
 
         ''' <summary>
         ''' Runs the fused manual-Isolated-split patterns over one split's normalized text and
@@ -177,6 +222,9 @@ Namespace Internal
             Function() New List(Of (Integer, Integer))(16))
         Private Shared ReadOnly s_matchScratch As New ThreadLocal(Of List(Of MatchInfo))(
             Function() New List(Of MatchInfo)(16))
+        ''' <summary>Per-thread reusable <see cref="SplitBuildingVisitor"/> for the tracked fused path (M8).</summary>
+        Private Shared ReadOnly s_splitBuilder As New ThreadLocal(Of SplitBuildingVisitor)(
+            Function() New SplitBuildingVisitor())
         Private Shared Function ComputeFusedRanges(ns As NormalizedString, patterns As List(Of Pattern)) As List(Of (Integer, Integer))
             Dim text As String = ns.Get
             Dim utf8Len As Integer = ns.Len()
@@ -265,6 +313,86 @@ Namespace Internal
         End Sub
 
         ''' <summary>
+        ''' M8 streaming twin of <see cref="ComputeFusedRanges"/>: runs the same fused manual-Isolated
+        ''' patterns over one split's normalized text, but the FINAL pattern's output is streamed to
+        ''' <paramref name="visitor"/> (one <see cref="IFusedRangeVisitor.Visit"/> per final piece
+        ''' range) instead of being materialized into a fresh list. The intermediate patterns still
+        ''' write into the two per-thread alternating range buffers (<see cref="s_rangeBufferA"/> /
+        ''' <see cref="s_rangeBufferB"/>, M7) so their per-piece geometric growth stays eliminated;
+        ''' only the final range list (the dominant remaining FusedSplit allocation, ~249 MB in the
+        ''' 235-sample harness) is not built. Shares the per-thread scratch match list
+        ''' (<see cref="s_matchScratch"/>).
+        ''' </summary>
+        Private Shared Sub FuseRangesStreaming(ns As NormalizedString, patterns As List(Of Pattern),
+                                               visitor As IFusedRangeVisitor)
+            Dim text As String = ns.Get
+            Dim utf8Len As Integer = ns.Len()
+            If patterns.Count = 0 Then
+                visitor.Visit(0, utf8Len)
+                Return
+            End If
+
+            Dim scratch As List(Of MatchInfo) = s_matchScratch.Value
+            Dim needScratchCap As Integer = Math.Max(16, text.Length \ 32)
+            If scratch.Capacity < needScratchCap Then scratch.Capacity = needScratchCap
+
+            Dim bufA As List(Of (Integer, Integer)) = s_rangeBufferA.Value
+            Dim bufB As List(Of (Integer, Integer)) = s_rangeBufferB.Value
+            bufA.Clear()
+            bufA.Add((0, utf8Len))
+            Dim ranges As List(Of (Integer, Integer)) = bufA
+
+            For pi As Integer = 0 To patterns.Count - 1
+                Dim p As Pattern = patterns(pi)
+                If pi = patterns.Count - 1 Then
+                    ' Final pattern: stream each final range directly to the visitor; no list is
+                    ' built (the M8 target).
+                    StreamRangesInto(ns, text, p, ranges, scratch, visitor)
+                    Return
+                End If
+                ' Intermediate pattern: reuse the other alternating buffer (same loop as
+                ' ComputeFusedRanges, so the intermediate partitions are byte-identical).
+                Dim target As List(Of (Integer, Integer)) = If(ranges Is bufA, bufB, bufA)
+                Dim preSize As Integer = Math.Max(16, ranges.Count * 2)
+                If target.Capacity < preSize Then target.Capacity = preSize
+                target.Clear()
+                FillRangesInto(ns, text, p, ranges, scratch, target)
+                ranges = target
+            Next
+            ' Unreachable when patterns.Count > 0 (the final pattern returns above).
+        End Sub
+
+        ''' <summary>
+        ''' Runs one pattern's scan over every range of <paramref name="ranges"/> and streams the
+        ''' resulting sub-ranges to <paramref name="visitor"/> (the same loop body as
+        ''' <see cref="FillRangesInto"/>, but calling <see cref="IFusedRangeVisitor.Visit"/> instead
+        ''' of writing to a target list). The scanner writes into <paramref name="scratch"/>
+        ''' (pre-cleared by <c>FindMatchesInto</c>); match offsets are slice-relative and are offset
+        ''' back to the root normalized byte referential before being visited.
+        ''' </summary>
+        Private Shared Sub StreamRangesInto(ns As NormalizedString, text As String, p As Pattern,
+                                            ranges As List(Of (Integer, Integer)), scratch As List(Of MatchInfo),
+                                            visitor As IFusedRangeVisitor)
+            For Each r In ranges
+                Dim b1 As Integer = r.Item1
+                Dim b2 As Integer = r.Item2
+                If b2 <= b1 Then Continue For
+                Dim n1 As Integer = ns.ByteToNetIndexCached(b1)
+                Dim n2 As Integer = ns.ByteToNetIndexCached(b2)
+                If n2 <= n1 Then Continue For
+                p.FindMatchesInto(text, n1, n2 - n1, scratch)
+                For i As Integer = 0 To scratch.Count - 1
+                    Dim m As MatchInfo = scratch(i)
+                    Dim mb1 As Integer = m.Start
+                    Dim mb2 As Integer = m.End
+                    If mb2 > mb1 Then
+                        visitor.Visit(b1 + mb1, b1 + mb2)
+                    End If
+                Next
+            Next
+        End Sub
+
+        ''' <summary>
         ''' M2 range-driven twin of the fused pre-tokenization: computes the final ranges (byte
         ''' offsets in each untokenized split's normalized text) that
         ''' <see cref="FuseIsolatedSplitsCore"/> would produce, WITHOUT materializing the per-range
@@ -309,6 +437,48 @@ Namespace Internal
                 Next
             Next
             Return total
+        End Function
+
+        ''' <summary>
+        ''' M8 streaming twin of <see cref="FusedRangesBySplit"/>: computes the final ranges (byte
+        ''' offsets in each untokenized split's normalized text) that
+        ''' <see cref="FuseIsolatedSplitsCore"/> would produce, WITHOUT materializing the per-range
+        ''' list or the per-piece <see cref="Split"/> / <see cref="NormalizedString"/> objects.
+        ''' Splits that already carry tokens are skipped. Each final range is streamed to
+        ''' <paramref name="visitor"/> (<see cref="IFusedRangeVisitor.BeginSplit"/> once per split,
+        ''' then <see cref="IFusedRangeVisitor.Visit"/> per range) as the final pattern's scan
+        ''' produces it.
+        ''' </summary>
+        Friend Sub StreamFusedRangesBySplit(patterns As List(Of Pattern), visitor As IFusedRangeVisitor)
+            For Each split As Split In Me.Splits
+                If split.Tokens IsNot Nothing Then Continue For
+                visitor.BeginSplit(split.Normalized)
+                FuseRangesStreaming(split.Normalized, patterns, visitor)
+            Next
+        End Sub
+
+        ''' <summary>
+        ''' M8 streaming twin of <see cref="CountFusedRanges"/>: counts the tokens the fused ranges
+        ''' would yield without materializing the per-range list. Splits that already carry attached
+        ''' tokens contribute their token count; every other split's final ranges are streamed to
+        ''' <paramref name="visitor"/> (a reusable <see cref="FusedRangeCountVisitor"/>), which
+        ''' builds each range's byte-mapped string via
+        ''' <see cref="NormalizedString.ToByteMappedString"/> and calls its count function. Returns
+        ''' exactly the total that <c>FuseIsolatedSplitsWithByteMap</c> followed by
+        ''' <see cref="TokenizeCount"/> would report. The visitor must be
+        ''' <see cref="FusedRangeCountVisitor.Reset"/> before each call.
+        ''' </summary>
+        Friend Function CountFusedRangesStreaming(patterns As List(Of Pattern), visitor As FusedRangeCountVisitor) As Integer
+            Dim total As Integer = 0
+            For Each split As Split In Me.Splits
+                If split.Tokens IsNot Nothing Then
+                    total += split.Tokens.Count
+                Else
+                    visitor.BeginSplit(split.Normalized)
+                    FuseRangesStreaming(split.Normalized, patterns, visitor)
+                End If
+            Next
+            Return total + visitor.Total
         End Function
 
         ''' <summary>
@@ -534,6 +704,44 @@ Namespace Internal
             End If
             Return Nothing
         End Function
+    End Class
+
+    ''' <summary>
+    ''' Reusable <see cref="IFusedRangeVisitor"/> for the M8 range-driven count path: each
+    ''' <see cref="Visit"/> builds the byte-mapped string of the range (via
+    ''' <see cref="NormalizedString.ToByteMappedString"/>) and counts it via the held
+    ''' <see cref="IModel"/> directly (no delegate), summing into <see cref="Total"/>. State is
+    ''' fields, not captured locals, so the instance is zero-allocation reusable across calls — no
+    ''' closure and no per-call <see cref="Func(Of String, Integer)"/> delegate; the caller resets
+    ''' per-call state via <see cref="Reset"/> before each encode and reads <see cref="Total"/>
+    ''' afterwards.
+    ''' </summary>
+    Friend NotInheritable Class FusedRangeCountVisitor
+        Implements IFusedRangeVisitor
+
+        ''' <summary>The model whose <c>CountTokens</c> counts each range's mapped string; set by <see cref="Reset"/>.</summary>
+        Private _model As IModel
+        ''' <summary>Accumulated token count over the ranges visited since the last <see cref="Reset"/>.</summary>
+        Public Total As Integer
+
+        Private _ns As NormalizedString
+
+        ''' <summary>Resets per-call state; the instance is then ready for a new encode.</summary>
+        Public Sub Reset(model As IModel)
+            Me._model = model
+            Me.Total = 0
+            Me._ns = Nothing
+        End Sub
+
+        Public Sub BeginSplit(normalized As NormalizedString) Implements IFusedRangeVisitor.BeginSplit
+            Me._ns = normalized
+        End Sub
+
+        Public Sub Visit(startByte As Integer, endByte As Integer) Implements IFusedRangeVisitor.Visit
+            If endByte > startByte Then
+                Total += _model.CountTokens(_ns.ToByteMappedString(startByte, endByte))
+            End If
+        End Sub
     End Class
 
 End Namespace

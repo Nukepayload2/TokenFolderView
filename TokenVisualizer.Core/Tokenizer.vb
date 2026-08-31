@@ -1,5 +1,6 @@
 Imports System.IO
 Imports System.Linq
+Imports System.Threading
 Imports System.Text.Json
 Imports System.Text.Json.Nodes
 Imports Tokenizers.Decoders
@@ -56,7 +57,36 @@ Imports Tokenizers.Serialization
             Me.AddedVocabulary = New AddedVocabulary()
             Me.AddedVocabulary.ModelVocab = model.GetVocab()
             Me.AddedVocabulary.Normalizer = Nothing
+            Me._countVisitor = New ThreadLocal(Of FusedRangeCountVisitor)(Function() New FusedRangeCountVisitor())
+            Me._rangeCounter = New ThreadLocal(Of RangeCountingVisitor)(Function() New RangeCountingVisitor())
         End Sub
+
+        ' M8: reusable per-thread streaming consumers of the fused-range count path. The count
+        ' visitor maps+counts each streamed range (state is fields, not captured locals, so the
+        ' instance is zero-allocation reusable across calls); the range counter is the profile's
+        ' FusedSplit-stage attribution visitor (it only counts ranges, no map/count). Each is a
+        ' ThreadLocal so concurrent EncodeCount / ProfileCountStages on the same Tokenizer stay
+        ' isolated and the instance is reused across calls on the same thread.
+        Private ReadOnly _countVisitor As ThreadLocal(Of FusedRangeCountVisitor)
+        Private ReadOnly _rangeCounter As ThreadLocal(Of RangeCountingVisitor)
+
+        ''' <summary>
+        ''' Counts final fused ranges without mapping/counting them. Used only by
+        ''' <see cref="ProfileCountStages"/> to attribute the FusedSplit-stage allocation of the M8
+        ''' streaming path (the real count pass runs the count visitor separately).
+        ''' </summary>
+        Private NotInheritable Class RangeCountingVisitor
+            Implements IFusedRangeVisitor
+
+            Public Count As Integer
+
+            Public Sub BeginSplit(normalized As NormalizedString) Implements IFusedRangeVisitor.BeginSplit
+            End Sub
+
+            Public Sub Visit(startByte As Integer, endByte As Integer) Implements IFusedRangeVisitor.Visit
+                If endByte > startByte Then Count += 1
+            End Sub
+        End Class
 
         ' ------------------------------------------------------------------
         #Region "Component configuration"
@@ -317,10 +347,11 @@ Imports Tokenizers.Serialization
             ' NormalizedString and every piece WITHOUT the per-byte alignment list — the dominant
             ' allocation of the tracked extract) when the count-only path is guaranteed never to
             ' read _alignments downstream: the normalizer is identity AND the pre-tokenizer is
-            ' either Nothing (TokenizeCount only reads Get) or the M2 fused-count config
-            ' (FusedRangesBySplit + CountFusedRanges never touch _alignments). Any other
-            ' pre-tokenizer (e.g. Metaspace's Replace) reads _alignments, so it must receive a
-            ' fully tracked extract whose alignment data is present.
+            ' either Nothing (TokenizeCount only reads Get) or the M2/M8 fused-count config
+            ' (StreamFusedRangesBySplit + CountFusedRangesStreaming never touch _alignments — the
+            ' streaming scan reads Get/Len/ByteToNetIndexCached and ToByteMappedString only). Any
+            ' other pre-tokenizer (e.g. Metaspace's Replace) reads _alignments, so it must receive
+            ' a fully tracked extract whose alignment data is present.
             Dim useNoTrackExtract As Boolean = IsIdentityNormalizer(Me.Normalizer) AndAlso
                 (Me.PreTokenizer Is Nothing OrElse isFusedCountConfig)
 
@@ -345,10 +376,13 @@ Imports Tokenizers.Serialization
                 ' feeds Model.CountTokens directly; the mapped string itself is unavoidable (the
                 ' model consumes a String), but the per-piece objects are eliminated.
                 If isFusedCountConfig Then
-                    Dim rangesBySplit As List(Of (NormalizedString, List(Of (Integer, Integer)))) =
-                        pts.FusedRangesBySplit(fusedPatterns)
-                    Dim m2Count As Integer = pts.CountFusedRanges(
-                        rangesBySplit, Function(mapped As String) Me.Model.CountTokens(mapped))
+                    ' M8: stream the fused final ranges straight into the reusable count visitor
+                    ' (map+count), so the final range list is never materialized (the ~249 MB M7
+                    ' remnant). The visitor is per-thread and reset per encode; its accumulator is a
+                    ' field, so the streaming path allocates no closure and no list.
+                    Dim cv As FusedRangeCountVisitor = Me._countVisitor.Value
+                    cv.Reset(Me.Model)
+                    Dim m2Count As Integer = pts.CountFusedRangesStreaming(fusedPatterns, cv)
                     If addSpecialTokens AndAlso Me.PostProcessor IsNot Nothing Then
                         m2Count += Me.PostProcessor.GetAddedTokens(False)
                     End If
@@ -423,20 +457,26 @@ Imports Tokenizers.Serialization
 
             Dim s2 As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
             Dim a2 As Long = GC.GetAllocatedBytesForCurrentThread()
-            ' M2 range-driven path: when the pre-tokenizer qualifies (fused manual-Isolated run +
-            ' pure-map ByteLevel, the whole sequence), the fuse produces only final ranges — no
-            ' per-piece Split/NormalizedString. The mapped strings are built in the Model phase
-            ' below, so FusedSplit's allocation here is just the ranges themselves.
-            Dim m2Ranges As List(Of (NormalizedString, List(Of (Integer, Integer)))) = Nothing
+            ' M8 streaming path: when the pre-tokenizer qualifies (fused manual-Isolated run +
+            ' pure-map ByteLevel, the whole sequence), the fuse streams its final ranges straight
+            ' into the count visitor (map+count) in the Model phase below. The FusedSplit phase is
+            ' measured here by streaming into a range-counting visitor (no map/count), so the
+            ' stage's allocation is the range production only — the per-thread intermediate buffers
+            ' + scratch; the final ranges are never materialized as a list. The profile re-runs the
+            ' fuse scan once (in the Model phase below) for the attribution, so its stage ticks
+            ' include that extra scan; the allocation numbers are the real path's (the second scan
+            ' reuses the per-thread buffers, allocating ~0).
+            Dim isM2 As Boolean = False
             Dim pieceCount As Integer = 0
             If Me.PreTokenizer IsNot Nothing Then
                 If isFusedCountConfig Then
-                    m2Ranges = pts.FusedRangesBySplit(fusedPatterns)
+                    isM2 = True
+                    Dim rc As RangeCountingVisitor = Me._rangeCounter.Value
+                    rc.Count = 0
+                    pts.StreamFusedRangesBySplit(fusedPatterns, rc)
+                    pieceCount = rc.Count
                     For Each sp As Split In pts.Splits
                         If sp.Tokens IsNot Nothing Then pieceCount += 1
-                    Next
-                    For Each pair As (NormalizedString, List(Of (Integer, Integer))) In m2Ranges
-                        pieceCount += pair.Item2.Count
                     Next
                     profile.FusedSplitTicks = s2.ElapsedTicks
                     profile.FusedSplitAllocated = GC.GetAllocatedBytesForCurrentThread() - a2
@@ -463,8 +503,12 @@ Imports Tokenizers.Serialization
             Dim s3 As System.Diagnostics.Stopwatch = System.Diagnostics.Stopwatch.StartNew()
             Dim a3 As Long = GC.GetAllocatedBytesForCurrentThread()
             Dim n As Integer
-            If m2Ranges IsNot Nothing Then
-                n = pts.CountFusedRanges(m2Ranges, Function(mapped As String) Me.Model.CountTokens(mapped))
+            If isM2 Then
+                ' M8: the real streaming count pass — stream the fused ranges into the reusable
+                ' count visitor (map+count). The final range list is never built.
+                Dim cv As FusedRangeCountVisitor = Me._countVisitor.Value
+                cv.Reset(Me.Model)
+                n = pts.CountFusedRangesStreaming(fusedPatterns, cv)
             Else
                 n = pts.TokenizeCount(Function(nm As NormalizedString) Me.Model.CountTokens(nm.Get))
             End If
