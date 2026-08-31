@@ -157,7 +157,7 @@ Namespace Views
                 End Try
             End If
 
-            Dim scanner As New FolderScanner(tokenizer, New ScanOptions())
+            Dim scanner As New FolderScanner(tokenizer, BuildScanOptions())
             AppState.Current.ActiveScan = scanner
             AppState.Current.RootNode = Nothing
             AppState.Current.IsScanning = True
@@ -188,6 +188,20 @@ Namespace Views
                 AppState.Current.IsScanning = False
                 RefreshStatus()
             End Try
+        End Function
+
+        ''' <summary>
+        ''' Builds the scanner options from the persisted settings (folder blacklist, max file size,
+        ''' binary detection). Settings live in <see cref="AppSettings"/>; ScanOptions is the
+        ''' scanner's per-scan value snapshot, so each scan reads the latest saved values.
+        ''' </summary>
+        Private Shared Function BuildScanOptions() As ScanOptions
+            Dim settings = SettingsService.Load()
+            Return New ScanOptions With {
+                .FolderBlacklist = settings.BlacklistedFolderNames,
+                .MaxFileSizeBytes = CLng(settings.MaxFileSizeMb * 1024 * 1024),
+                .CheckBinary = settings.CheckBinary
+            }
         End Function
 
         Private Sub ExpandAllNodes()
