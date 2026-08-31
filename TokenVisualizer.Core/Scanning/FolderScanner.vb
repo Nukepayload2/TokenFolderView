@@ -46,10 +46,12 @@ Namespace Scanning
             Dim files As New List(Of (relativePath As String, fullPath As String, length As Long))()
             EnumerateFiles(rootPath, String.Empty, files, ct)
 
-            ' 2. Parallel tokenization pass.
+            ' 2. Parallel tokenization pass. Cap workers at one per physical core: logical
+            '    processor count includes SMT siblings that add little for CPU-bound counting,
+            '    and leaving half the machine free keeps the UI responsive while the scan runs.
             Dim results As New ConcurrentBag(Of (relativePath As String, length As Long, tokenCount As Integer))()
             Dim parallelOptions As New ParallelOptions With {
-                .MaxDegreeOfParallelism = Environment.ProcessorCount,
+                .MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount \ 2),
                 .CancellationToken = ct
             }
             Await Task.Run(
