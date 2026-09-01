@@ -917,6 +917,46 @@ Namespace TokenVisualizer.Core.Tests
             Next
         End Sub
 
+        ''' <summary>
+        ''' M11 (merged added-token walk) gate: texts that actually CONTAIN the DeepSeek added-token
+        ''' literals force the merged single-pass walk's match-emission paths for BOTH tries (the
+        ''' special trie — <c>Normalized=False</c> tokens like <c>&lt;think&gt;</c> — and the
+        ''' normalized trie — <c>Normalized=True</c> tokens). The count-only NoTrack path
+        ''' (<see cref="Tokenizer.EncodeCount"/>, which runs <c>FindMatchesMerged</c> under the
+        ''' guard) must equal the tracked two-pass (<see cref="Tokenizer.Encode"/>). The plain
+        ''' DeepSeek real-file test never generates a full sentinel sequence, so it never exercises
+        ''' the merged walk's match branches; this one does.
+        ''' </summary>
+        <TestMethod>
+        Public Sub M11_MergedAddedWalk_MatchesTrackedOnRealSpecialTokens()
+            Dim path As String = "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+            If Not IO.File.Exists(path) Then
+                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Return
+            End If
+            Dim tokenizer As Tokenizer = Tokenizer.FromFile(path)
+            ' Assert the merged walk is actually the active path: guard on (no flagged tokens AND
+            ' encodeSpecialTokens off) — DeepSeek satisfies both, so the merged fast path runs.
+            Assert.IsFalse(tokenizer.AddedVocabulary.GetEncodeSpecialTokens(), "guard: encodeSpecialTokens must be off")
+            Assert.IsTrue(tokenizer.AddedVocabulary.Count > 0, "DeepSeek has added tokens")
+
+            Dim texts As String() = {
+                "before <think> after",
+                "<think>reasoning</think> and then",
+                "|User| hello <|EOT|> world",
+                "<think><think>double</think></think>",
+                "混排 <think> 中文 </think> 尾部",
+                "plain text with no sentinels here",
+                "<dsml:python>code</dsml:python> tail",
+                "x <think>y<think>z"
+            }
+            For Each t As String In texts
+                Dim tracked As Integer = tokenizer.Encode(t, False).Ids.Count
+                Dim merged As Integer = tokenizer.EncodeCount(t, False)
+                Assert.AreEqual(tracked, merged, $"M11 merged vs tracked '{t}'")
+            Next
+        End Sub
+
         ''' <summary>Test-local <see cref="IFusedRangeVisitor"/> that collects the streamed ranges per split.</summary>
         Private NotInheritable Class CollectingFusedRangeVisitor
             Implements IFusedRangeVisitor

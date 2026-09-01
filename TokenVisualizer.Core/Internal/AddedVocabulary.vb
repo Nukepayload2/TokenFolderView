@@ -109,6 +109,19 @@ Namespace Internal
         Private _splitNormalizedTrie As CharTrie
         Private _splitNormalizedTrieIds As New Dictionary(Of String, Integer)()
         Private _encodeSpecialTokens As Boolean
+        ''' <summary>
+        ''' Whether the count-only NoTrack extract can use the single merged added-token walk
+        ''' (<see cref="FindMatchesMerged"/>) instead of the two-pass (<see cref="SplitUsingTrieNoTrack"/>
+        ''' then per-piece <see cref="FindMatches"/>). The merged walk is EXACTLY equivalent to the
+        ''' two-pass only when no added token has <see cref="AddedToken.SingleWord"/> /
+        ''' <see cref="AddedToken.LStrip"/> / <see cref="AddedToken.RStrip"/> and
+        ''' <see cref="SetEncodeSpecialTokens"/> is off — those are the only behaviors that depend on
+        ''' the two-phase gap structure (pass A splits the text by special tokens, pass B splits the
+        ''' gaps by normalized tokens). Under the guard both reduce to "emit matches, advance
+        ''' non-matches", which one merged pass replicates byte-identically. Any other tokenizer falls
+        ''' back to the two-pass (unchanged behaviour).
+        ''' </summary>
+        Private _mergeAllowed As Boolean
 
         ''' <summary>
         ''' The underlying model vocabulary (token content to id). Used to assign ids to added
@@ -197,6 +210,7 @@ Namespace Internal
 
         Public Sub SetEncodeSpecialTokens(value As Boolean)
             _encodeSpecialTokens = value
+            _mergeAllowed = (Not value) AndAlso Not HasFlaggedAddedTokens()
         End Sub
 
         Public Function GetEncodeSpecialTokens() As Boolean
@@ -355,6 +369,28 @@ Namespace Internal
         Public Function ExtractAndNormalizeNoTrack(rawText As String) As PreTokenizedString
             Dim pretokenized As PreTokenizedString = PreTokenizedString.FromStringNoTrack(rawText)
 
+            If Me._mergeAllowed Then
+                ' M11: single merged walk over the whole text checking both added-token tries in one
+                ' pass (guarded — no singleWord/lstrip/rstrip and encodeSpecialTokens off — so the
+                ' merged walk is byte-identical to the two-pass below, but reads the text once
+                ' instead of twice). The root is one split, so one merged walk covers it.
+                Dim mergedSplits As New List(Of Split)()
+                For Each split In pretokenized.Splits
+                    If split.Tokens IsNot Nothing Then
+                        mergedSplits.Add(split)
+                        Continue For
+                    End If
+                    Dim matches As List(Of (Integer?, (Integer, Integer))) =
+                        Me.FindMatchesMerged(split.Normalized.Get, Me._splitTrie, Me._splitTrieIds,
+                                             Me._splitNormalizedTrie, Me._splitNormalizedTrieIds)
+                    AppendMatchesNoTrack(split, matches, mergedSplits)
+                Next
+                pretokenized.Splits = mergedSplits
+                Return pretokenized
+            End If
+
+            ' Fallback (added tokens with SingleWord/LStrip/RStrip, or encodeSpecialTokens on): the
+            ' two-pass, whose phase structure those behaviors depend on.
             ' 1. Extract all the non-normalized tokens from the non-normalized string.
             Me.SplitUsingTrieNoTrack(pretokenized, Me._splitTrie, Me._splitTrieIds)
 
@@ -510,7 +546,14 @@ Namespace Internal
                 Next
                 _splitNormalizedTrie = trie
             End If
+            _mergeAllowed = (Not _encodeSpecialTokens) AndAlso Not HasFlaggedAddedTokens()
         End Sub
+
+        ''' <summary>Whether any added token carries a SingleWord / LStrip / RStrip flag (which the
+        ''' merged added-token walk cannot replicate; such tokenizers keep the two-pass).</summary>
+        Private Function HasFlaggedAddedTokens() As Boolean
+            Return _addedTokensMapR.Values.Any(Function(t) t.SingleWord OrElse t.LStrip OrElse t.RStrip)
+        End Function
 
         ''' <summary>
         ''' Finds any AddedToken in the given sentence using the provided trie. Returns a list of
@@ -603,6 +646,100 @@ Namespace Internal
                 result.Add((Nothing, (startOffset, totalByteLen)))
             End If
 
+            Return result
+        End Function
+
+        ''' <summary>
+        ''' M11: single merged added-token walk for the count-only NoTrack path. Walks the sentence
+        ''' ONCE, checking both the special trie (<paramref name="specialTrie"/>, the
+        ''' <c>Normalized=False</c> added tokens) and the normalized trie
+        ''' (<paramref name="normTrie"/>, the <c>Normalized=True</c> ones) at each position, with
+        ''' special tokens taking priority (pass A split them first in the two-pass).
+        '''
+        ''' This is only EXACTLY equivalent to the two-pass when the caller has verified
+        ''' <see cref="_mergeAllowed"/>: no added token has SingleWord/LStrip/RStrip and
+        ''' <c>_encodeSpecialTokens</c> is off. Under that guard both passes reduce to "emit matches,
+        ''' advance non-matches", so one merged walk reproduces the two-pass result byte-for-byte —
+        ''' reading the text once instead of twice (pass A over the whole text, pass B over the gaps).
+        '''
+        ''' A normalized match that would SPAN a special token's start is invalidated (pass A split
+        ''' the text there, so pass B could never match across it): the lookahead detects a special
+        ''' start inside the span and treats the position as a non-match, so the walk naturally
+        ''' advances to the special and emits it with the correct gap.
+        ''' </summary>
+        Private Function FindMatchesMerged(sentence As String, specialTrie As CharTrie, specialIds As Dictionary(Of String, Integer),
+                                           normTrie As CharTrie, normIds As Dictionary(Of String, Integer)) As List(Of (Integer?, (Integer, Integer)))
+            Dim result As New List(Of (Integer?, (Integer, Integer)))()
+            If sentence Is Nothing OrElse sentence.Length = 0 Then
+                result.Add((Nothing, (0, 0)))
+                Return result
+            End If
+
+            Dim byteLen As Integer = Utf8Helpers.Utf8Length(sentence)
+            Dim startOffset As Integer = 0
+            Dim netLen As Integer = sentence.Length
+            Dim netIdx As Integer = 0
+            Dim byteOff As Integer = 0
+            While netIdx < netLen
+                Dim specialEnd As Integer = 0
+                If specialTrie IsNot Nothing Then specialEnd = specialTrie.FindLongestPrefix(sentence, netIdx)
+                Dim normEnd As Integer = 0
+                If normTrie IsNot Nothing Then normEnd = normTrie.FindLongestPrefix(sentence, netIdx)
+
+                If specialEnd > netIdx Then
+                    ' Special token wins (split first in the two-pass): emit gap + special.
+                    Dim matched As String = sentence.Substring(netIdx, specialEnd - netIdx)
+                    Dim id As Integer = specialIds(matched)
+                    Dim startByte As Integer = byteOff
+                    Dim matchEndByte As Integer = byteOff + Utf8Helpers.Utf8Length(matched)
+                    If startOffset < startByte Then
+                        result.Add((Nothing, (startOffset, startByte)))
+                    End If
+                    result.Add((id, (startByte, matchEndByte)))
+                    startOffset = matchEndByte
+                    byteOff = matchEndByte
+                    netIdx = specialEnd
+                    Continue While
+                End If
+
+                If normEnd > netIdx Then
+                    ' Normalized candidate: valid only if no special token starts inside its span
+                    ' (pass A split the text there, so pass B could never match across it).
+                    Dim spansSpecial As Boolean = False
+                    If specialTrie IsNot Nothing Then
+                        For k As Integer = netIdx + 1 To normEnd - 1
+                            If specialTrie.FindLongestPrefix(sentence, k) > k Then
+                                spansSpecial = True
+                                Exit For
+                            End If
+                        Next
+                    End If
+                    If Not spansSpecial Then
+                        Dim matched As String = sentence.Substring(netIdx, normEnd - netIdx)
+                        Dim id As Integer = normIds(matched)
+                        Dim startByte As Integer = byteOff
+                        Dim matchEndByte As Integer = byteOff + Utf8Helpers.Utf8Length(matched)
+                        If startOffset < startByte Then
+                            result.Add((Nothing, (startOffset, startByte)))
+                        End If
+                        result.Add((id, (startByte, matchEndByte)))
+                        startOffset = matchEndByte
+                        byteOff = matchEndByte
+                        netIdx = normEnd
+                        Continue While
+                    End If
+                    ' Invalid normalized (spans a special): fall through to advance one scalar.
+                End If
+
+                ' No match: advance one scalar.
+                Dim cp As Integer = UnicodePredicates.ScalarCodePoint(sentence, netIdx)
+                byteOff += Utf8Helpers.Utf8LengthOfCodePoint(cp)
+                netIdx += ScalarNetLen(sentence, netIdx)
+            End While
+
+            If startOffset <> byteLen Then
+                result.Add((Nothing, (startOffset, byteLen)))
+            End If
             Return result
         End Function
 
