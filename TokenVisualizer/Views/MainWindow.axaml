@@ -20,11 +20,7 @@
         <!-- Row 1: navigation -->
         <ui:FANavigationView Grid.Row="1" x:Name="NavView"
                              AlwaysShowHeader="False" PaneDisplayMode="Left" IsSettingsVisible="True"
-                             OpenPaneLength="280" IsBackButtonVisible="False" IsPaneToggleButtonVisible="True">
-            <ui:FANavigationView.Content>
-                <TextBlock x:Name="PlaceholderText" Text="打开一个文件夹开始扫描。" HorizontalAlignment="Center" VerticalAlignment="Center" Opacity="0.5" FontSize="16"/>
-            </ui:FANavigationView.Content>
-        </ui:FANavigationView>
+                             OpenPaneLength="280" IsBackButtonVisible="False" IsPaneToggleButtonVisible="True"/>
         <!-- Row 2: status bar -->
         <Border Grid.Row="2" Height="34" BorderThickness="0,1,0,0" Background="{DynamicResource ApplicationPageBackgroundThemeBrush}">
             <Grid ColumnDefinitions="*,Auto">

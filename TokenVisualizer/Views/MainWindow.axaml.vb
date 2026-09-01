@@ -17,7 +17,6 @@ Namespace Views
         Private _currentPage As Control
         Private _explorerPage As ExplorerPage
         Private _textTokenizePage As TextTokenizePage
-        Private _tokenizerPage As TokenizerPage
         Private _settingsPage As SettingsPage
         Private _searchQuery As String = ""
         Private WithEvents _searchTimer As DispatcherTimer
@@ -55,7 +54,7 @@ Namespace Views
 
         Private Sub BuildNavigationMenu()
             Dim exploreItem As New FANavigationViewItem With {
-                .Content = "浏览",
+                .Content = "词元统计",
                 .Tag = "explore",
                 .IconSource = New FASymbolIconSource With {.Symbol = FASymbol.OpenFolder}
             }
@@ -64,12 +63,7 @@ Namespace Views
                 .Tag = "text-tokenize",
                 .IconSource = New FASymbolIconSource With {.Symbol = FASymbol.Edit}
             }
-            Dim tokenizerItem As New FANavigationViewItem With {
-                .Content = "分词器",
-                .Tag = "tokenizers",
-                .IconSource = New FASymbolIconSource With {.Symbol = FASymbol.Setting}
-            }
-            NavView.MenuItemsSource = {exploreItem, textTokenizeItem, tokenizerItem}
+            NavView.MenuItemsSource = {exploreItem, textTokenizeItem}
             NavView.SelectedItem = exploreItem
         End Sub
 
@@ -96,8 +90,6 @@ Namespace Views
             Select Case kind
                 Case "text-tokenize"
                     ShowTextTokenizePage()
-                Case "tokenizers"
-                    ShowTokenizerPage()
                 Case "settings"
                     ShowSettingsPage()
                 Case Else
@@ -121,14 +113,6 @@ Namespace Views
             End If
             _currentPage = _textTokenizePage
             NavView.Content = _textTokenizePage
-        End Sub
-
-        Private Sub ShowTokenizerPage()
-            If _tokenizerPage Is Nothing Then
-                _tokenizerPage = New TokenizerPage()
-            End If
-            _currentPage = _tokenizerPage
-            NavView.Content = _tokenizerPage
         End Sub
 
         Private Sub ShowSettingsPage()

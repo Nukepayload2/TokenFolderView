@@ -23,9 +23,14 @@ Namespace Views
 
         Private _currentQuery As String = ""
 
+        ' Cap on nodes auto-expanded by a search. A broad query (e.g. a single character) can match a
+        ' large share of the tree; TreeView is non-virtualizing, so expanding every ancestor realizes
+        ' and measures the whole tree and freezes the UI. The budget bounds that work.
+        Private Const MaxExpandedNodes As Integer = 500
+        Private _expandBudget As Integer
+
         Public Sub New()
             InitializeComponent()
-            TxtActiveTokenizer.Text = "正在加载…"
         End Sub
 
         ' ------------------------------------------------------------------
@@ -34,17 +39,7 @@ Namespace Views
 
         Private Async Sub ExplorerPage_Loaded() Handles Me.Loaded
             Await Task.Run(Sub() AppState.EnsureActiveTokenizer())
-            UpdateTokenizerLabel()
             RefreshStatus()
-        End Sub
-
-        Private Sub UpdateTokenizerLabel()
-            Dim state = AppState.Current
-            If state.ActiveTokenizer IsNot Nothing Then
-                TxtActiveTokenizer.Text = state.ActiveTokenizerName
-            Else
-                TxtActiveTokenizer.Text = "未找到 tokenizer.json"
-            End If
         End Sub
 
         ' ------------------------------------------------------------------
@@ -62,32 +57,29 @@ Namespace Views
             If root Is Nothing Then Return
 
             If String.IsNullOrEmpty(_currentQuery) Then
+                ' No search: show the whole tree but only expand the root node.
                 FileTree.ItemsSource = {root}
-                Return
-            End If
-
-            Dim filtered = FilterNode(root, _currentQuery)
-            If filtered Is Nothing Then
-                FileTree.ItemsSource = Nothing
+                ExpandRootOnly()
             Else
-                FileTree.ItemsSource = {filtered}
+                Dim filtered = FilterNode(root, _currentQuery)
+                If filtered Is Nothing Then
+                    FileTree.ItemsSource = Nothing
+                Else
+                    FileTree.ItemsSource = {filtered}
+                    ' Every node in the filtered tree is either a match or an ancestor of one;
+                    ' expanding them all reveals every match.
+                    ExpandToMatches()
+                End If
             End If
         End Sub
 
-        ''' <summary>Refreshes the root-count label and the scan state UI.</summary>
+        ''' <summary>Refreshes the scan state UI (button enablement, cancel visibility).</summary>
         Public Sub RefreshStatus()
-            Dim root = AppState.Current.RootNode
-            If root IsNot Nothing Then
-                TblRootCount.Text = $"{root.FileCount:N0} 个文件 · {root.TokenCount:N0} tokens"
-            Else
-                TblRootCount.Text = ""
-            End If
             UpdateScanUi()
         End Sub
 
         Private Sub UpdateScanUi()
             Dim scanning = AppState.Current.IsScanning
-            BtnCancelScan.IsVisible = scanning
             BtnOpenFolder.IsEnabled = Not scanning
             BtnRescan.IsEnabled = (Not scanning) AndAlso Not String.IsNullOrEmpty(AppState.Current.CurrentScanPath)
         End Sub
@@ -99,7 +91,7 @@ Namespace Views
         Private Async Sub BtnOpenFolder_Click() Handles BtnOpenFolder.Click
             AppState.EnsureActiveTokenizer()
             If AppState.Current.ActiveTokenizer Is Nothing Then
-                UpdateTokenizerLabel()
+                TokenLines.ShowText("未找到分词器，请先在「设置」中添加。")
                 Return
             End If
 
@@ -125,20 +117,10 @@ Namespace Views
             If String.IsNullOrEmpty(path) Then Return
             AppState.EnsureActiveTokenizer()
             If AppState.Current.ActiveTokenizer Is Nothing Then
-                UpdateTokenizerLabel()
+                TokenLines.ShowText("未找到分词器，请先在「设置」中添加。")
                 Return
             End If
             Await StartScanAsync(path)
-        End Sub
-
-        Private Sub BtnCancelScan_Click() Handles BtnCancelScan.Click
-            Dim scan = AppState.Current.ActiveScan
-            If scan IsNot Nothing Then
-                Try
-                    scan.ScanProgress.Cancellation.Cancel()
-                Catch
-                End Try
-            End If
         End Sub
 
         ' ------------------------------------------------------------------
@@ -175,15 +157,13 @@ Namespace Views
 
                 AppState.Current.RootNode = root
                 ApplySearchFilter(_currentQuery)
-                ExpandAllNodes()
             Catch ex As OperationCanceledException
                 AppState.Current.RootNode = Nothing
                 FileTree.ItemsSource = Nothing
             Catch ex As Exception
                 AppState.Current.RootNode = Nothing
                 FileTree.ItemsSource = Nothing
-                TblRootCount.Text = ""
-                TxtActiveTokenizer.Text = $"扫描失败：{ex.Message}"
+                TokenLines.ShowText($"扫描失败：{ex.Message}")
             Finally
                 AppState.Current.IsScanning = False
                 RefreshStatus()
@@ -204,29 +184,59 @@ Namespace Views
             }
         End Function
 
-        Private Sub ExpandAllNodes()
+        Private Sub ExpandToMatches()
+            _expandBudget = MaxExpandedNodes
             Dispatcher.UIThread.Post(Sub() ExpandContainers(FileTree), DispatcherPriority.Loaded)
+        End Sub
+
+        ''' <summary>
+        ''' Expands only the root container, leaving the rest of the tree collapsed. Used when the
+        ''' search box is empty. The container is realized after the layout pass that follows the
+        ''' ItemsSource assignment, so the expansion is posted at Loaded priority.
+        ''' </summary>
+        Private Sub ExpandRootOnly()
+            Dispatcher.UIThread.Post(Sub()
+                Dim c = TryCast(FileTree.ContainerFromIndex(0), TreeViewItem)
+                If c IsNot Nothing Then c.IsExpanded = True
+            End Sub, DispatcherPriority.Loaded)
         End Sub
 
         Private Sub ExpandContainers(tree As TreeView)
             For i As Integer = 0 To tree.ItemCount - 1
                 Dim c = TryCast(tree.ContainerFromIndex(i), TreeViewItem)
-                If c IsNot Nothing Then
-                    c.IsExpanded = True
-                    ExpandChildren(c)
-                End If
+                If c IsNot Nothing Then ExpandItem(c)
             Next
         End Sub
 
-        Private Sub ExpandChildren(item As TreeViewItem)
-            For i As Integer = 0 To item.ItemCount - 1
-                Dim c = TryCast(item.ContainerFromIndex(i), TreeViewItem)
-                If c IsNot Nothing Then
-                    c.IsExpanded = True
-                    ExpandChildren(c)
-                End If
-            Next
+        Private Sub ExpandItem(item As TreeViewItem)
+            Dim node = TryCast(item.DataContext, ScanTreeNode)
+            If node Is Nothing Then Return
+
+            ' A node whose name matches the query is itself a result: its parent is already expanded
+            ' so it is visible, but it must not be expanded — otherwise a matched folder dumps its
+            ' whole subtree into the results.
+            If IsMatch(node) Then Return
+
+            ' Bound the total work; stop auto-expanding once the budget is spent.
+            If _expandBudget <= 0 Then Return
+            _expandBudget -= 1
+
+            item.IsExpanded = True
+            ' Child containers are realized only after the next layout pass, which runs at Render
+            ' priority before the next Loaded job (MediaContext schedules the render at Render).
+            ' Post each level to Loaded so a layout pass happens in between; a synchronous
+            ' recursion here would find no child containers and expand only the first level.
+            Dispatcher.UIThread.Post(Sub()
+                For i As Integer = 0 To item.ItemCount - 1
+                    Dim c = TryCast(item.ContainerFromIndex(i), TreeViewItem)
+                    If c IsNot Nothing Then ExpandItem(c)
+                Next
+            End Sub, DispatcherPriority.Loaded)
         End Sub
+
+        Private Function IsMatch(node As ScanTreeNode) As Boolean
+            Return node.Name.IndexOf(_currentQuery, StringComparison.OrdinalIgnoreCase) >= 0
+        End Function
 
         ' ------------------------------------------------------------------
         ' File selection + colored token view
@@ -244,8 +254,6 @@ Namespace Views
         Private Sub ClearContentView()
             Interlocked.Increment(_loadGeneration)
             TokenLines.ItemsSource = Nothing
-            TblFileName.Text = ""
-            TblFileMeta.Text = ""
             TokenLines.IsEmptyVisible = True
         End Sub
 
@@ -254,24 +262,19 @@ Namespace Views
             Dim tokenizer = AppState.Current.ActiveTokenizer
             If tokenizer Is Nothing Then Return
 
-            TblFileName.Text = node.Name
-            TblFileMeta.Text = "加载中…"
             TokenLines.IsEmptyVisible = True
             TokenLines.ItemsSource = Nothing
             TokenLines.ResetScroll()
 
             Try
-                Dim result = Await Task.Run(Function() BuildLines(node.FullPath, tokenizer))
+                Dim lines = Await Task.Run(Function() BuildLines(node.FullPath, tokenizer))
                 If gen <> _loadGeneration Then Return ' stale load, superseded by a newer selection
 
-                TblFileName.Text = result.fileName
-                TblFileMeta.Text = $"{FormatBytes(result.byteLength)} · {result.charCount:N0} 字符 · {result.tokenCount:N0} tokens"
-                TokenLines.ItemsSource = result.lines
+                TokenLines.ItemsSource = lines
                 TokenLines.IsEmptyVisible = False
             Catch ex As OperationCanceledException
             Catch ex As Exception
                 If gen <> _loadGeneration Then Return
-                TblFileMeta.Text = ""
                 TokenLines.ShowText($"无法读取文件：{ex.Message}")
             End Try
         End Sub
@@ -283,8 +286,7 @@ Namespace Views
         ''' virtualized container is materialized.
         ''' </summary>
         Private Shared Function BuildLines(fullPath As String,
-                                           tokenizer As Tokenizer) As (fileName As String, byteLength As Long, charCount As Integer, tokenCount As Integer, lines As List(Of TokenLine))
-            Dim fileName = Path.GetFileName(fullPath)
+                                           tokenizer As Tokenizer) As List(Of TokenLine)
             Dim fi As New FileInfo(fullPath)
             Dim length = fi.Length
             If length > Integer.MaxValue Then
@@ -301,8 +303,7 @@ Namespace Views
                 Dim text As String = Encoding.UTF8.GetString(buffer, 0, bytesRead)
 
                 Dim spans = tokenizer.EncodeWithSpans(text)
-                Dim lines = TokenizedTextView.BuildLines(text, spans)
-                Return (fileName, length, text.Length, spans.Count, lines)
+                Return TokenizedTextView.BuildLines(text, spans)
             Finally
                 ArrayPool(Of Byte).Shared.Return(buffer)
             End Try
@@ -352,13 +353,6 @@ Namespace Views
                 result.Children.Add(k)
             Next
             Return result
-        End Function
-
-        Private Shared Function FormatBytes(bytes As Long) As String
-            If bytes < 1024 Then Return $"{bytes} B"
-            If bytes < 1024 * 1024 Then Return $"{bytes / 1024.0:N1} KB"
-            If bytes < 1024L * 1024 * 1024 Then Return $"{bytes / (1024.0 * 1024.0):N1} MB"
-            Return $"{bytes / (1024.0 * 1024.0 * 1024.0):N1} GB"
         End Function
 
     End Class

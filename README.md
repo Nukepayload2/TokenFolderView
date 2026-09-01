@@ -51,20 +51,15 @@ dotnet publish TokenVisualizer -c Release -r osx-arm64
 
 ## 用法
 
-### 1. Token 浏览（Explorer 页）
+### 1. 词元统计（Explorer 页）
 
 - 点击 **打开文件夹** 选择要扫描的目录；扫描完成后左侧树显示每个文件 / 文件夹的 token 计数，底部状态栏显示总计、扫描 / 跳过文件数。
 - 点选任意文件，右侧以等宽字体逐 token 着色展示切分结果（不同颜色区分不同 token）。
 - 顶部标题栏搜索框可按名称过滤文件 / 文件夹；**重新扫描** 可在修改过滤设置后重扫。
 
-### 2. 分词器（Tokenizer 页）
+### 2. 设置（Settings 页）
 
-- **添加分词器…**：选择任意 `tokenizer.json`（可选配套 `tokenizer_config.json`）并命名，即可注册新分词器。
-- 列表中选择当前使用的分词器；用户添加的分词器可删除，内置的 deepseek 分词器不可删除。
-- 每项显示模型类型与词表规模（如 `BPE · 128,000 vocab · 路径`）。
-
-### 3. 设置（Settings 页）
-
+- **分词器**：管理 tokenizer 模型——添加（选择 tokenizer.json 与 tokenizer_config.json）、设为当前使用、删除（内置 deepseek 不可删）。
 - **扫描**：最大文件大小（MB，默认 10，超过跳过）、是否跳过二进制文件（默认开启）、文件夹黑名单（每行一个，默认含 `bin`、`obj`、`node_modules`、`.git` 等）。
 - **外观**：主题（跟随系统 / 浅色 / 深色）。
 
@@ -74,7 +69,7 @@ dotnet publish TokenVisualizer -c Release -r osx-arm64
 - Linux：`~/.local/share/TokenVisualizer/settings.json`
 - macOS：`~/Library/Application Support/TokenVisualizer/settings.json`
 
-### 4. 核心库（TokenVisualizer.Core）
+### 3. 核心库（TokenVisualizer.Core）
 
 ```vb
 Imports Tokenizers
@@ -89,7 +84,7 @@ Dim text As String = tok.Decode(enc.Ids)                       ' 解码回文本
 
 常用 API：`Encode` / `EncodeFast` / `EncodeCount` / `EncodeBatch` / `EncodeCharOffsets`、`Decode` / `DecodeBatch` / `DecodeStream`、`Tokenizer.Load` / `FromFile`。
 
-### 5. 性能基准（dev-only）
+### 4. 性能基准（dev-only）
 
 `tests/performance/bench.ps1` 将 `TokenVisualizer.Core` 与 Python `tokenizers` 参考实现跑同一份确定性文本并对比（`tests/performance/bench` 控制台工程不参与 slnx 构建）：
 

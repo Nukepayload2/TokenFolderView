@@ -3,6 +3,7 @@
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:ui="using:FluentAvalonia.UI.Controls"
+             xmlns:controls="using:TokenVisualizer.Controls"
              mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="600"
              x:Class="TokenVisualizer.Views.SettingsPage">
 
@@ -10,6 +11,11 @@
         <StackPanel Margin="24,16" Spacing="16" MaxWidth="700">
 
             <TextBlock Text="设置" FontSize="28" FontWeight="Bold"/>
+
+            <!-- 分词器 -->
+            <ui:FASettingsExpander Header="分词器" Description="管理 tokenizer 模型（tokenizer.json + tokenizer_config.json）" IconSource="Setting">
+                <controls:TokenizerSettingsSection/>
+            </ui:FASettingsExpander>
 
             <!-- 扫描 -->
             <ui:FASettingsExpander Header="扫描" Description="控制扫描的过滤规则、文件大小上限与二进制检测" IconSource="FolderOpen">
