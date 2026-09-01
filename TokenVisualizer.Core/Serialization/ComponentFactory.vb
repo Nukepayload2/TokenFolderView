@@ -84,7 +84,7 @@ Namespace Serialization
             Dim byteFallback As Boolean = SerializationHelpers.GetBool(obj, "byte_fallback").GetValueOrDefault(False)
             Dim ignoreMerges As Boolean = SerializationHelpers.GetBool(obj, "ignore_merges").GetValueOrDefault(False)
             Return New BpeModel(vocab, merges, prefix, eow, unk, fuseUnk, byteFallback, dropout, ignoreMerges,
-                                cacheCapacity:=If(cacheCapacity.HasValue, cacheCapacity.Value, 10000),
+                                cacheCapacity:=If(cacheCapacity.HasValue, cacheCapacity.Value, Models.BpeModel.DefaultCacheCapacity),
                                 maxWordLength:=cacheMaxWord)
         End Function
 

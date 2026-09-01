@@ -19,6 +19,15 @@ Namespace Models
     Public NotInheritable Class BpeModel
         Implements IModel
 
+        ''' <summary>
+        ''' Default per-thread word-cache capacity. The old 10000 sat below the real-code working
+        ''' set (~24k distinct words per pass), so the FIFO churned and re-merged constantly
+        ''' (~25% of EncodeCount CPU on a 114M-char corpus). 50000 (≈2x the working set) gives a
+        ''' 100% steady-state hit rate on the measured corpus; per-thread memory is ~1MB of
+        ''' pre-sized buckets + entries as filled. Bumped 2026-09-01 after the capacity sweep.
+        ''' </summary>
+        Public Const DefaultCacheCapacity As Integer = 50000
+
         Private ReadOnly _vocab As IReadOnlyDictionary(Of String, Integer)
         Private ReadOnly _vocabR As IReadOnlyDictionary(Of Integer, String)
         Private ReadOnly _merges As Dictionary(Of (Integer, Integer), (Integer, Integer))
@@ -183,7 +192,7 @@ Namespace Models
                        Optional byteFallback As Boolean = False,
                        Optional dropout As Double? = Nothing,
                        Optional ignoreMerges As Boolean = False,
-                       Optional cacheCapacity As Integer = 10000,
+                       Optional cacheCapacity As Integer = DefaultCacheCapacity,
                        Optional seededRandom As Object = Nothing,
                        Optional maxWordLength As Integer? = Nothing)
             If dropout.HasValue AndAlso (dropout.Value < 0.0 OrElse dropout.Value > 1.0) Then
