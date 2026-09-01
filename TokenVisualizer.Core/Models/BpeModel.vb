@@ -28,6 +28,15 @@ Namespace Models
         ''' </summary>
         Public Const DefaultCacheCapacity As Integer = 50000
 
+        ''' <summary>
+        ''' Capacity of the shared L2 word cache. L2 is the cross-worker / cross-scan layer: every
+        ''' thread's L1 miss first consults it (locked), so a word merged once by any worker is
+        ''' reused by every other worker and by later scans. Sized well above the measured real-code
+        ''' working set (~24k distinct pieces per scan) so it rarely evicts during a session;
+        ''' <see cref="CompactWordCache"/> can drop it entirely when the client is idle.
+        ''' </summary>
+        Public Const SharedCacheCapacity As Integer = 200000
+
         Private ReadOnly _vocab As IReadOnlyDictionary(Of String, Integer)
         Private ReadOnly _vocabR As IReadOnlyDictionary(Of Integer, String)
         Private ReadOnly _merges As Dictionary(Of (Integer, Integer), (Integer, Integer))
@@ -37,7 +46,20 @@ Namespace Models
         ''' <c>EncodeCount</c> callers (e.g. the scanner's <c>Parallel.ForEach</c>) never contend on
         ''' shared mutable state. <c>Nothing</c> when the cache is disabled (capacity &lt;= 0).
         ''' </summary>
-        Private ReadOnly _cache As ThreadLocal(Of Cache(Of String, CacheValue))
+        Private _cache As ThreadLocal(Of Cache(Of String, CacheValue))
+        Private ReadOnly _cacheCapacity As Integer
+        ''' <summary>
+        ''' Shared L2 word cache: a bounded FIFO shared across all threads (guarded by
+        ''' <see cref="_sharedLock"/>), consulted on a per-thread L1 miss before the BPE merge runs.
+        ''' Eliminates the cold-scan cross-worker redundancy (a word seen by N workers merges once
+        ''' instead of N times) and carries warmth across scans (L1s are dropped by
+        ''' <see cref="CompactWordCache"/>, L2 survives). <c>Nothing</c> when the cache is disabled
+        ''' (capacity &lt;= 0). The <see cref="CacheValue"/> it stores is deterministic per word, so
+        ''' sharing a value (and its <see cref="CacheValue.Many"/> list, never mutated) across
+        ''' threads is safe.
+        ''' </summary>
+        Private _sharedCache As Cache(Of String, CacheValue)
+        Private ReadOnly _sharedLock As Object
         Private ReadOnly _dropout As Double?
         Private ReadOnly _unkToken As String
         Private ReadOnly _continuingSubwordPrefix As String
@@ -194,6 +216,7 @@ Namespace Models
                        Optional ignoreMerges As Boolean = False,
                        Optional cacheCapacity As Integer = DefaultCacheCapacity,
                        Optional seededRandom As Object = Nothing,
+                       Optional sharedCacheCapacity As Integer = SharedCacheCapacity,
                        Optional maxWordLength As Integer? = Nothing)
             If dropout.HasValue AndAlso (dropout.Value < 0.0 OrElse dropout.Value > 1.0) Then
                 Throw New ArgumentOutOfRangeException(NameOf(dropout), "dropout must be in the range [0.0, 1.0]")
@@ -276,8 +299,10 @@ Namespace Models
                 _merges((aId, bId)) = (i, newId)
             Next
 
+            _cacheCapacity = If(cacheCapacity > 0, cacheCapacity, 0)
             If cacheCapacity <= 0 Then
                 _cache = Nothing
+                _sharedCache = Nothing
             Else
                 ' One bounded FIFO cache per thread, created lazily on first access. Capacity and
                 ' eviction are kept per-thread, matching the Rust thread-local cache. The value is
@@ -290,6 +315,15 @@ Namespace Models
                 ' the default string comparer, so cache semantics are unchanged.
                 _cache = New ThreadLocal(Of Cache(Of String, CacheValue))(
                     Function() New Cache(Of String, CacheValue)(cacheCapacity, comparer:=New StringMemoryAlternateComparer()))
+                If sharedCacheCapacity > 0 Then
+                    ' Shared L2: cross-worker/cross-scan layer. Every thread's L1 miss first consults
+                    ' it (guarded by _sharedLock) before merging, so a word is BPE-merged once
+                    ' globally instead of once per worker that sees it (the cold-scan cross-worker
+                    ' redundancy, ~10pp of hit rate at 8 workers) and L2 survives
+                    ' <see cref="CompactWordCache"/> to warm the next scan.
+                    _sharedCache = New Cache(Of String, CacheValue)(sharedCacheCapacity, comparer:=New StringMemoryAlternateComparer())
+                    _sharedLock = New Object()
+                End If
             End If
         End Sub
 
@@ -333,6 +367,29 @@ Namespace Models
             If _cache Is Nothing Then Return New CacheStats()
             Return _cache.Value.GetStats()
         End Function
+
+        ''' <summary>
+        ''' Drops the per-thread L1 word caches, freeing their memory on a client while preserving
+        ''' the shared L2 (the cross-scan warmth layer). MUST be called only when no
+        ''' <c>EncodeCount</c>/<c>CountTokens</c> is in flight (e.g. after a scan's workers all
+        ''' finish, or on idle) — disposing a <see cref="ThreadLocal"/> racing another thread's
+        ''' <c>Value</c> access is unsafe. Each thread lazily re-creates its L1 on the next access
+        ''' and re-warms from L2 via the lookaside path.
+        ''' </summary>
+        ''' <param name="dropShared">When <c>True</c>, also clears the shared L2, freeing its memory
+        ''' too (a fully-idle client).</param>
+        Public Sub CompactWordCache(Optional dropShared As Boolean = False)
+            If _cache IsNot Nothing Then
+                _cache.Dispose()
+                _cache = New ThreadLocal(Of Cache(Of String, CacheValue))(
+                    Function() New Cache(Of String, CacheValue)(_cacheCapacity, comparer:=New StringMemoryAlternateComparer()))
+            End If
+            If dropShared AndAlso _sharedCache IsNot Nothing Then
+                SyncLock _sharedLock
+                    _sharedCache.Clear()
+                End SyncLock
+            End If
+        End Sub
 
         ''' <summary>Maps a token to its vocabulary id, or <c>Nothing</c> if absent.</summary>
         Public Function TokenToId(token As String) As Integer? Implements IModel.TokenToId
@@ -584,13 +641,40 @@ Namespace Models
                     ' Cache hit via memory alternate lookup: zero String allocation (M9 target).
                     Return cv.Count
                 End If
-                ' Cache miss: materialize the String once, merge, insert (CountTokens' miss tail).
+                ' L1 miss: consult the shared L2 before merging. A word already merged by any
+                ' other worker / earlier scan hits here (locked read), so the expensive BPE merge
+                ' runs once globally, not once per thread that sees the word. L2 hit inserts into
+                ' this thread's L1 so subsequent lookups stay lock-free.
+                If _sharedCache IsNot Nothing Then
+                    Dim sharedValue As CacheValue
+                    SyncLock _sharedLock
+                        sharedValue = _sharedCache.GetValueMemory(word)
+                    End SyncLock
+                    If sharedValue.Count > 0 Then
+                        cache.Insert(word.ToString(), sharedValue)
+                        Return sharedValue.Count
+                    End If
+                End If
+                ' L1 + L2 miss: materialize the String once, merge, insert into L1 and L2
+                ' (CountTokens' miss tail, plus the shared write-through).
                 Dim materialized As String = word.ToString()
                 Dim symbols As List(Of (Integer, Integer)) = MergeWord(materialized, _symbolScratch.Value)
                 If symbols.Count = 1 Then
-                    cache.Insert(materialized, New CacheValue(1, symbols(0), Nothing))
+                    Dim singleValue As CacheValue = New CacheValue(1, symbols(0), Nothing)
+                    cache.Insert(materialized, singleValue)
+                    If _sharedCache IsNot Nothing Then
+                        SyncLock _sharedLock
+                            _sharedCache.Insert(materialized, singleValue)
+                        End SyncLock
+                    End If
                 ElseIf symbols.Count > 1 Then
-                    cache.Insert(materialized, New CacheValue(symbols.Count, Nothing, symbols))
+                    Dim manyValue As CacheValue = New CacheValue(symbols.Count, Nothing, symbols)
+                    cache.Insert(materialized, manyValue)
+                    If _sharedCache IsNot Nothing Then
+                        SyncLock _sharedLock
+                            _sharedCache.Insert(materialized, manyValue)
+                        End SyncLock
+                    End If
                 End If
                 Return symbols.Count
             End If

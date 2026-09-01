@@ -1,6 +1,7 @@
 Imports System.Collections.Generic
 Imports System.Linq
 Imports System.Reflection
+Imports System.Threading.Tasks
 Imports Tokenizers
 Imports Tokenizers.Internal
 Imports Tokenizers.Models
@@ -850,6 +851,70 @@ Namespace TokenVisualizer.Core.Tests
             Dim stats As CacheStats = bpe.GetCacheStats()
             Assert.IsGreaterThanOrEqualTo(words.Length, stats.Hits,
                 "memory alternate lookups must hit the String-seeded word cache")
+        End Sub
+
+        ''' <summary>
+        ''' M10 (shared L2 cache) gate: <c>CountTokensMemory</c> is safe and correct when many
+        ''' threads share one <see cref="BpeModel"/> — every thread's L1 miss consults the shared L2
+        ''' (locked) and writes through to it, so a word merged by any worker is reused by all.
+        ''' Verifies (a) parallel counts match a cache-less single-threaded reference under 8-way
+        ''' contention, (b) <see cref="BpeModel.CompactWordCache"/> (drop L1s, keep L2) preserves
+        ''' results, and (c) fully dropping L2 also preserves them.
+        ''' </summary>
+        <TestMethod>
+        Public Sub M10_SharedL2_ParallelCountMatchesReference_AndCompactPreserves()
+            Dim bpe As BpeModel = BuildBpe(cacheCapacity:=50000)
+            Dim reference As BpeModel = BuildBpe(cacheCapacity:=0) ' cache-less ground truth
+
+            ' Word corpus with heavy cross-worker repetition (each word repeated 8x, shuffled by the
+            ' Parallel scheduler), so multiple workers collide on the shared L2 for the same key.
+            Dim baseWords As String() = {
+                "", "a", "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+                "hello", "world", "tokenization", "abc", "xyzzy", "zz", "abc123",
+                "a" & ChrW(&H3042), "３", "你好世界", "the quick brown fox",
+                "the quick brown fox jumps over the lazy dog",
+                String.Join("", Enumerable.Repeat("ab", 40)),
+                "x" & String.Concat(Enumerable.Repeat("x", 200))
+            }
+            Dim corpus As New List(Of String)()
+            For r As Integer = 0 To 7
+                For Each w In baseWords
+                    corpus.Add(w)
+                Next
+            Next
+
+            Dim expected As Integer() = New Integer(corpus.Count - 1) {}
+            For i As Integer = 0 To corpus.Count - 1
+                expected(i) = reference.CountTokensMemory(corpus(i).AsMemory())
+            Next
+
+            ' Pass 1: 8-way parallel contention on the shared L2.
+            Dim actual As Integer() = New Integer(corpus.Count - 1) {}
+            Parallel.For(0, corpus.Count,
+                Sub(i As Integer)
+                    actual(i) = bpe.CountTokensMemory(corpus(i).AsMemory())
+                End Sub)
+            For i As Integer = 0 To corpus.Count - 1
+                Assert.AreEqual(expected(i), actual(i), $"parallel pass1 '{corpus(i)}'")
+            Next
+
+            ' Compact: drop per-thread L1s, keep L2. Results unchanged (fresh L1s re-warm via L2).
+            bpe.CompactWordCache()
+            Dim actual2 As Integer() = New Integer(corpus.Count - 1) {}
+            Parallel.For(0, corpus.Count,
+                Sub(i As Integer)
+                    actual2(i) = bpe.CountTokensMemory(corpus(i).AsMemory())
+                End Sub)
+            For i As Integer = 0 To corpus.Count - 1
+                Assert.AreEqual(expected(i), actual2(i), $"parallel pass2 (post-compact) '{corpus(i)}'")
+            Next
+
+            ' Fully drop the shared L2 too; results still correct (each word merges fresh once).
+            bpe.CompactWordCache(dropShared:=True)
+            For Each w In baseWords
+                Assert.AreEqual(reference.CountTokensMemory(w.AsMemory()), bpe.CountTokensMemory(w.AsMemory()),
+                    $"post-dropShared '{w}'")
+            Next
         End Sub
 
         ''' <summary>Test-local <see cref="IFusedRangeVisitor"/> that collects the streamed ranges per split.</summary>

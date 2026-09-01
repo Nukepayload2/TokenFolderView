@@ -34,7 +34,8 @@ Namespace Serialization
         ''' </summary>
         Public Shared Function FromModel(node As JsonNode,
                                          Optional cacheCapacity As Integer? = Nothing,
-                                         Optional cacheMaxWord As Integer? = Nothing) As Object
+                                         Optional cacheMaxWord As Integer? = Nothing,
+                                         Optional sharedCacheCapacity As Integer? = Nothing) As Object
             If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
             Dim obj As JsonObject = DirectCast(node, JsonObject)
 
@@ -42,7 +43,7 @@ Namespace Serialization
             If tag IsNot Nothing Then
                 Select Case tag
                     Case "BPE"
-                        Return BuildBpe(obj, cacheCapacity, cacheMaxWord)
+                        Return BuildBpe(obj, cacheCapacity, cacheMaxWord, sharedCacheCapacity)
                     Case "WordPiece"
                         Return BuildWordPiece(obj)
                     Case "WordLevel"
@@ -73,7 +74,8 @@ Namespace Serialization
 
         Private Shared Function BuildBpe(obj As JsonObject,
                                          Optional cacheCapacity As Integer? = Nothing,
-                                         Optional cacheMaxWord As Integer? = Nothing) As BpeModel
+                                         Optional cacheMaxWord As Integer? = Nothing,
+                                         Optional sharedCacheCapacity As Integer? = Nothing) As BpeModel
             Dim vocab As Dictionary(Of String, Integer) = ParseVocab(SerializationHelpers.GetNode(obj, "vocab"))
             Dim merges As List(Of String) = ParseMerges(SerializationHelpers.GetNode(obj, "merges"))
             Dim dropout As Double? = SerializationHelpers.GetDouble(obj, "dropout")
@@ -85,7 +87,8 @@ Namespace Serialization
             Dim ignoreMerges As Boolean = SerializationHelpers.GetBool(obj, "ignore_merges").GetValueOrDefault(False)
             Return New BpeModel(vocab, merges, prefix, eow, unk, fuseUnk, byteFallback, dropout, ignoreMerges,
                                 cacheCapacity:=If(cacheCapacity.HasValue, cacheCapacity.Value, Models.BpeModel.DefaultCacheCapacity),
-                                maxWordLength:=cacheMaxWord)
+                                maxWordLength:=cacheMaxWord,
+                                sharedCacheCapacity:=If(sharedCacheCapacity.HasValue, sharedCacheCapacity.Value, Models.BpeModel.SharedCacheCapacity))
         End Function
 
         Private Shared Function BuildWordPiece(obj As JsonObject) As WordPieceModel

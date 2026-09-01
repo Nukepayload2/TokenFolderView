@@ -719,7 +719,8 @@ Imports Tokenizers.Serialization
         ''' </summary>
         Public Shared Function FromJson(json As String,
                                         Optional cacheCapacity As Integer? = Nothing,
-                                        Optional cacheMaxWord As Integer? = Nothing) As Tokenizer
+                                        Optional cacheMaxWord As Integer? = Nothing,
+                                        Optional sharedCacheCapacity As Integer? = Nothing) As Tokenizer
             Dim node As JsonNode = JsonNode.Parse(json)
             If node Is Nothing OrElse TypeOf node IsNot JsonObject Then
                 Throw New ArgumentException("Invalid tokenizer JSON")
@@ -732,7 +733,7 @@ Imports Tokenizers.Serialization
             End If
 
             Dim modelNode As JsonNode = SerializationHelpers.GetNode(obj, "model")
-            Dim model As Object = ComponentFactory.FromModel(modelNode, cacheCapacity, cacheMaxWord)
+            Dim model As Object = ComponentFactory.FromModel(modelNode, cacheCapacity, cacheMaxWord, sharedCacheCapacity)
             If model Is Nothing Then
                 Throw New ArgumentException("Model missing.")
             End If
@@ -772,16 +773,18 @@ Imports Tokenizers.Serialization
         ''' <summary>Loads a tokenizer from a tokenizer.json file.</summary>
         Public Shared Function FromFile(path As String,
                                         Optional cacheCapacity As Integer? = Nothing,
-                                        Optional cacheMaxWord As Integer? = Nothing) As Tokenizer
+                                        Optional cacheMaxWord As Integer? = Nothing,
+                                        Optional sharedCacheCapacity As Integer? = Nothing) As Tokenizer
             Dim json As String = File.ReadAllText(path)
-            Return FromJson(json, cacheCapacity, cacheMaxWord)
+            Return FromJson(json, cacheCapacity, cacheMaxWord, sharedCacheCapacity)
         End Function
 
         ''' <summary>Alias for <see cref="FromFile"/>.</summary>
         Public Shared Function Load(path As String,
                                     Optional cacheCapacity As Integer? = Nothing,
-                                    Optional cacheMaxWord As Integer? = Nothing) As Tokenizer
-            Return FromFile(path, cacheCapacity, cacheMaxWord)
+                                    Optional cacheMaxWord As Integer? = Nothing,
+                                    Optional sharedCacheCapacity As Integer? = Nothing) As Tokenizer
+            Return FromFile(path, cacheCapacity, cacheMaxWord, sharedCacheCapacity)
         End Function
 
         ''' <summary>Serializes this tokenizer to a tokenizer.json string.</summary>

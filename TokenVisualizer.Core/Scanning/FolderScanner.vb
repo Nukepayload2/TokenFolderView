@@ -107,6 +107,13 @@ Namespace Scanning
             Await Task.WhenAll(consumers)
             Await producer
 
+            ' All encoding workers are drained — no EncodeCount is in flight, so it is safe to drop
+            ' the per-thread L1 word caches (freeing their memory on a client). The shared L2
+            ' survives to warm the next scan, so a follow-up scan re-warms each worker's L1 from L2
+            ' instead of starting cold.
+            Dim bpe As Models.BpeModel = TryCast(_tokenizer.Model, Models.BpeModel)
+            If bpe IsNot Nothing Then bpe.CompactWordCache()
+
             ' 3. Pure tree construction.
             Dim rootName As String = Path.GetFileName(rootPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
             If String.IsNullOrEmpty(rootName) Then rootName = rootPath
