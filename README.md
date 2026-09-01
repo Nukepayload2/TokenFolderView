@@ -4,7 +4,7 @@
 
 核心库 `TokenVisualizer.Core`（命名空间 `Tokenizers`）实现了与 HuggingFace [tokenizers](https://github.com/huggingface/tokenizers) 相同的分词管线语义（normalization / pre-tokenization / model / truncation / post-processing / padding），分词结果与参考实现一致（有 golden vector 与 parity 测试校验），并支持 `tokenizer.json` 的加载与序列化，可直接作为库使用。
 
-> 性能：实测仅统计 token 数的用例下，本库单线程速度约为 Python 版 hf tokenizers（Rust 参考实现, 提交 828e4830f7c9e0ff8b75a2433d9814b802b43c3d）的两倍。
+> 性能：实测仅统计 token 数的用例下，本库单线程速度约为 Python 版 hf tokenizers（Rust 参考实现, 提交 828e4830f7c9e0ff8b75a2433d9814b802b43c3d）的[五倍](tests/performance/)。
 
 ## 目标平台
 
