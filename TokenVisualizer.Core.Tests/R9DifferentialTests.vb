@@ -32,7 +32,8 @@ Namespace TokenVisualizer.Core.Tests
                                           Optional maxWordLength As Integer? = Nothing,
                                           Optional cacheCapacity As Integer = 10000,
                                           Optional dropout As Double? = Nothing,
-                                          Optional seededRandom As Object = Nothing) As BpeModel
+                                          Optional seededRandom As Object = Nothing,
+                                          Optional sharedCacheCapacity As Integer = BpeModel.SharedCacheCapacity) As BpeModel
             Dim vocab As New Dictionary(Of String, Integer)()
             Dim id As Integer = 0
             For Each c As Char In " abcdefghijklmnopqrstuvwxyz0123456789.,!?".ToCharArray()
@@ -73,7 +74,8 @@ Namespace TokenVisualizer.Core.Tests
                 cacheCapacity:=cacheCapacity,
                 maxWordLength:=maxWordLength,
                 dropout:=dropout,
-                seededRandom:=seededRandom)
+                seededRandom:=seededRandom,
+                sharedCacheCapacity:=sharedCacheCapacity)
         End Function
 
         ''' <summary>
@@ -914,6 +916,111 @@ Namespace TokenVisualizer.Core.Tests
             For Each w In baseWords
                 Assert.AreEqual(reference.CountTokensMemory(w.AsMemory()), bpe.CountTokensMemory(w.AsMemory()),
                     $"post-dropShared '{w}'")
+            Next
+        End Sub
+
+        ''' <summary>
+        ''' M13A (striped L2) gate: <c>CountTokensMemory</c> is safe and correct when the shared L2 is
+        ''' lock-striped across K shards (#27). A tiny <c>sharedCacheCapacity</c> (64) makes each
+        ''' shard hold only a handful of entries, so the cross-worker corpus forces eviction across
+        ''' every shard — exercising the per-shard lock, per-shard insert, and per-shard eviction
+        ''' under 8-way parallel contention. Every parallel count must match the cache-less
+        ''' single-threaded reference, both before and after
+        ''' <see cref="BpeModel.CompactWordCache"/> with <c>dropShared:=True</c> (which clears every
+        ''' shard). Read-only.
+        ''' </summary>
+        <TestMethod>
+        Public Sub M13A_StripedL2_ParallelCountMatchesReference_WithEviction()
+            Dim bpe As BpeModel = BuildBpe(cacheCapacity:=50000, sharedCacheCapacity:=64)
+            Dim reference As BpeModel = BuildBpe(cacheCapacity:=0) ' cache-less ground truth
+
+            ' Word corpus with heavy cross-worker repetition (each word repeated 8x, shuffled by the
+            ' Parallel scheduler), so workers collide on the shared L2 for the same key while the
+            ' tiny per-shard capacity evicts aggressively.
+            Dim baseWords As String() = {
+                "", "a", "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+                "hello", "world", "tokenization", "abc", "xyzzy", "zz", "abc123",
+                "a" & ChrW(&H3042), "３", "你好世界", "the quick brown fox",
+                "the quick brown fox jumps over the lazy dog",
+                String.Join("", Enumerable.Repeat("ab", 40)),
+                "x" & String.Concat(Enumerable.Repeat("x", 200))
+            }
+            Dim corpus As New List(Of String)()
+            For r As Integer = 0 To 7
+                For Each w In baseWords
+                    corpus.Add(w)
+                Next
+            Next
+
+            Dim expected As Integer() = New Integer(corpus.Count - 1) {}
+            For i As Integer = 0 To corpus.Count - 1
+                expected(i) = reference.CountTokensMemory(corpus(i).AsMemory())
+            Next
+
+            ' Pass 1: 8-way parallel contention on the striped L2.
+            Dim actual As Integer() = New Integer(corpus.Count - 1) {}
+            Parallel.For(0, corpus.Count,
+                Sub(i As Integer)
+                    actual(i) = bpe.CountTokensMemory(corpus(i).AsMemory())
+                End Sub)
+            For i As Integer = 0 To corpus.Count - 1
+                Assert.AreEqual(expected(i), actual(i), $"parallel pass1 '{corpus(i)}'")
+            Next
+
+            ' Drop L1s and clear every L2 shard; results unchanged (fresh merges re-warm L2).
+            bpe.CompactWordCache(dropShared:=True)
+            Dim actual2 As Integer() = New Integer(corpus.Count - 1) {}
+            Parallel.For(0, corpus.Count,
+                Sub(i As Integer)
+                    actual2(i) = bpe.CountTokensMemory(corpus(i).AsMemory())
+                End Sub)
+            For i As Integer = 0 To corpus.Count - 1
+                Assert.AreEqual(expected(i), actual2(i), $"parallel pass2 (post-dropShared) '{corpus(i)}'")
+            Next
+        End Sub
+
+        ''' <summary>
+        ''' M13B (CharTrie ASCII array) differential: the <see cref="CharTrie"/> ASCII fast channel
+        ''' (#28) must produce byte-identical <see cref="CharTrie.FindLongestPrefix"/> results to the
+        ''' generic <see cref="Trie(Of Char)"/> reference, for token sets mixing ASCII and non-ASCII
+        ''' literals and probes covering no-match / prefix / full-match / non-ASCII-start /
+        ''' ASCII-then-non-ASCII / boundary-crossing cases, at every start index. Read-only.
+        ''' </summary>
+        <TestMethod>
+        Public Sub M13B_CharTrieAsciiArray_MatchesGenericTrie()
+            Dim tokens As String() = {"<think>", "<|EOT|>", "Ġhello", "你好", "aa", "ab", "b<"}
+            Dim charTrie As New CharTrie()
+            Dim genericTrie As New Trie(Of Char)()
+            For Each t In tokens
+                charTrie.Push(t)
+                genericTrie.Push(t)
+            Next
+
+            Dim probes As String() = {
+                "",
+                "a",
+                "hello",
+                "<think>reasoning",
+                "<think>",
+                "你好世界",
+                "你好",
+                "x你好",
+                "aaab",
+                "ab",
+                "zz",
+                "b<|EOT|>",
+                "Ġhello world",
+                "ab<think>",
+                "<think>ab",
+                "Ġ你好"
+            }
+            For Each probe As String In probes
+                If probe Is Nothing Then Continue For
+                For start As Integer = 0 To probe.Length
+                    Dim expected As Integer = genericTrie.FindLongestPrefix(probe.ToList(), start)
+                    Dim actual As Integer = charTrie.FindLongestPrefix(probe, start)
+                    Assert.AreEqual(expected, actual, $"FindLongestPrefix('{probe}', {start})")
+                Next
             Next
         End Sub
 

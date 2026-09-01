@@ -49,17 +49,24 @@ Namespace Models
         Private _cache As ThreadLocal(Of Cache(Of String, CacheValue))
         Private ReadOnly _cacheCapacity As Integer
         ''' <summary>
-        ''' Shared L2 word cache: a bounded FIFO shared across all threads (guarded by
-        ''' <see cref="_sharedLock"/>), consulted on a per-thread L1 miss before the BPE merge runs.
-        ''' Eliminates the cold-scan cross-worker redundancy (a word seen by N workers merges once
-        ''' instead of N times) and carries warmth across scans (L1s are dropped by
-        ''' <see cref="CompactWordCache"/>, L2 survives). <c>Nothing</c> when the cache is disabled
-        ''' (capacity &lt;= 0). The <see cref="CacheValue"/> it stores is deterministic per word, so
-        ''' sharing a value (and its <see cref="CacheValue.Many"/> list, never mutated) across
-        ''' threads is safe.
+        ''' Shared L2 word cache, lock-striped: <see cref="_sharedCaches"/> holds K bounded FIFOs (one
+        ''' per shard) and <see cref="_sharedLocks"/> holds the K locks guarding them. Consulted on a
+        ''' per-thread L1 miss before the BPE merge runs, eliminating the cold-scan cross-worker
+        ''' redundancy (a word seen by N workers merges once instead of N times) and carrying warmth
+        ''' across scans (L1s are dropped by <see cref="CompactWordCache"/>, L2 survives). K is a
+        ''' power of two (capped at 64, floored at 1) so the shard is selected with
+        ''' <c>And <see cref="_sharedShardMask"/></c>, and each shard's capacity is the total
+        ''' <see cref="SharedCacheCapacity"/> / K — the aggregate capacity stays ~=
+        ''' sharedCacheCapacity while cross-worker lock contention spreads over K locks instead of
+        ''' one. Lookup (memory form) and insert (String form) both shard on the word's hash, which
+        ''' hashes identically in both forms (see <see cref="StringMemoryAlternateComparer"/>), so a
+        ''' word always lands on the same shard. <c>Nothing</c> when the cache is disabled (capacity
+        ''' &lt;= 0). The <see cref="CacheValue"/> it stores is deterministic per word, so sharing a
+        ''' value (and its <see cref="CacheValue.Many"/> list, never mutated) across threads is safe.
         ''' </summary>
-        Private _sharedCache As Cache(Of String, CacheValue)
-        Private ReadOnly _sharedLock As Object
+        Private ReadOnly _sharedCaches As Cache(Of String, CacheValue)()
+        Private ReadOnly _sharedLocks As Object()
+        Private ReadOnly _sharedShardMask As Integer
         Private ReadOnly _dropout As Double?
         Private ReadOnly _unkToken As String
         Private ReadOnly _continuingSubwordPrefix As String
@@ -302,7 +309,7 @@ Namespace Models
             _cacheCapacity = If(cacheCapacity > 0, cacheCapacity, 0)
             If cacheCapacity <= 0 Then
                 _cache = Nothing
-                _sharedCache = Nothing
+                _sharedCaches = Nothing
             Else
                 ' One bounded FIFO cache per thread, created lazily on first access. Capacity and
                 ' eviction are kept per-thread, matching the Rust thread-local cache. The value is
@@ -316,13 +323,27 @@ Namespace Models
                 _cache = New ThreadLocal(Of Cache(Of String, CacheValue))(
                     Function() New Cache(Of String, CacheValue)(cacheCapacity, comparer:=New StringMemoryAlternateComparer()))
                 If sharedCacheCapacity > 0 Then
-                    ' Shared L2: cross-worker/cross-scan layer. Every thread's L1 miss first consults
-                    ' it (guarded by _sharedLock) before merging, so a word is BPE-merged once
-                    ' globally instead of once per worker that sees it (the cold-scan cross-worker
-                    ' redundancy, ~10pp of hit rate at 8 workers) and L2 survives
-                    ' <see cref="CompactWordCache"/> to warm the next scan.
-                    _sharedCache = New Cache(Of String, CacheValue)(sharedCacheCapacity, comparer:=New StringMemoryAlternateComparer())
-                    _sharedLock = New Object()
+                    ' Shared L2, lock-striped: pick a power-of-two shard count below the CPU count
+                    ' (capped at 64) so concurrent workers hashing to different shards take different
+                    ' locks instead of contending on one. The aggregate capacity stays ~=
+                    ' sharedCacheCapacity (each shard holds total / K); a total too small to split
+                    ' meaningfully degrades to a single shard (shardCount = 1, mask = 0).
+                    Dim shardCount As Integer = 4
+                    While shardCount < Environment.ProcessorCount AndAlso shardCount < 64
+                        shardCount *= 2
+                    End While
+                    Dim perShard As Integer = sharedCacheCapacity \ shardCount
+                    If perShard <= 0 Then
+                        shardCount = 1
+                        perShard = sharedCacheCapacity
+                    End If
+                    _sharedCaches = New Cache(Of String, CacheValue)(shardCount - 1) {}
+                    _sharedLocks = New Object(shardCount - 1) {}
+                    _sharedShardMask = shardCount - 1
+                    For i As Integer = 0 To shardCount - 1
+                        _sharedCaches(i) = New Cache(Of String, CacheValue)(perShard, comparer:=New StringMemoryAlternateComparer())
+                        _sharedLocks(i) = New Object()
+                    Next
                 End If
             End If
         End Sub
@@ -384,10 +405,12 @@ Namespace Models
                 _cache = New ThreadLocal(Of Cache(Of String, CacheValue))(
                     Function() New Cache(Of String, CacheValue)(_cacheCapacity, comparer:=New StringMemoryAlternateComparer()))
             End If
-            If dropShared AndAlso _sharedCache IsNot Nothing Then
-                SyncLock _sharedLock
-                    _sharedCache.Clear()
-                End SyncLock
+            If dropShared AndAlso _sharedCaches IsNot Nothing Then
+                For i As Integer = 0 To _sharedCaches.Length - 1
+                    SyncLock _sharedLocks(i)
+                        _sharedCaches(i).Clear()
+                    End SyncLock
+                Next
             End If
         End Sub
 
@@ -643,12 +666,17 @@ Namespace Models
                 End If
                 ' L1 miss: consult the shared L2 before merging. A word already merged by any
                 ' other worker / earlier scan hits here (locked read), so the expensive BPE merge
-                ' runs once globally, not once per thread that sees the word. L2 hit inserts into
-                ' this thread's L1 so subsequent lookups stay lock-free.
-                If _sharedCache IsNot Nothing Then
+                ' runs once globally, not once per thread that sees the word. The L2 is lock-striped:
+                ' the shard comes from the word's hash (the String form and memory form hash
+                ' identically — see StringMemoryAlternateComparer — so the later insert lands on the
+                ' same shard) and only that shard's lock is taken, so workers hashing to different
+                ' shards never contend. An L2 hit inserts into this thread's L1 so subsequent
+                ' lookups stay lock-free.
+                If _sharedCaches IsNot Nothing Then
+                    Dim shard As Integer = String.GetHashCode(word.Span) And _sharedShardMask
                     Dim sharedValue As CacheValue
-                    SyncLock _sharedLock
-                        sharedValue = _sharedCache.GetValueMemory(word)
+                    SyncLock _sharedLocks(shard)
+                        sharedValue = _sharedCaches(shard).GetValueMemory(word)
                     End SyncLock
                     If sharedValue.Count > 0 Then
                         cache.Insert(word.ToString(), sharedValue)
@@ -662,17 +690,22 @@ Namespace Models
                 If symbols.Count = 1 Then
                     Dim singleValue As CacheValue = New CacheValue(1, symbols(0), Nothing)
                     cache.Insert(materialized, singleValue)
-                    If _sharedCache IsNot Nothing Then
-                        SyncLock _sharedLock
-                            _sharedCache.Insert(materialized, singleValue)
+                    If _sharedCaches IsNot Nothing Then
+                        ' materialized.GetHashCode() == String.GetHashCode(materialized.AsSpan()),
+                        ' so the write-through lands on the same shard as the L2 lookup above.
+                        Dim shard As Integer = materialized.GetHashCode() And _sharedShardMask
+                        SyncLock _sharedLocks(shard)
+                            _sharedCaches(shard).Insert(materialized, singleValue)
                         End SyncLock
                     End If
                 ElseIf symbols.Count > 1 Then
                     Dim manyValue As CacheValue = New CacheValue(symbols.Count, Nothing, symbols)
                     cache.Insert(materialized, manyValue)
-                    If _sharedCache IsNot Nothing Then
-                        SyncLock _sharedLock
-                            _sharedCache.Insert(materialized, manyValue)
+                    If _sharedCaches IsNot Nothing Then
+                        ' Same shard as the L2 lookup: String hash == memory hash (M9 invariant).
+                        Dim shard As Integer = materialized.GetHashCode() And _sharedShardMask
+                        SyncLock _sharedLocks(shard)
+                            _sharedCaches(shard).Insert(materialized, manyValue)
                         End SyncLock
                     End If
                 End If

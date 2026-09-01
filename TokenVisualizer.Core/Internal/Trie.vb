@@ -18,6 +18,23 @@ Namespace Internal
     End Class
 
     ''' <summary>
+    ''' Dedicated node for <see cref="CharTrie"/>. ASCII children (Char &lt; 128) are indexed by a
+    ''' lazily-allocated 128-slot array — a direct array index instead of a Dictionary hash+probe on
+    ''' the per-position hot walk — while non-ASCII children fall back to <see cref="Children"/>.
+    ''' </summary>
+    Friend NotInheritable Class CharTrieNode
+        Friend IsLeaf As Boolean
+        Friend AsciiChildren As CharTrieNode()
+        Friend Children As Dictionary(Of Char, CharTrieNode)
+
+        Public Sub New()
+            IsLeaf = False
+            AsciiChildren = Nothing
+            Children = New Dictionary(Of Char, CharTrieNode)()
+        End Sub
+    End Class
+
+    ''' <summary>
     ''' A generic trie keyed by labels. Faithful port of the Rust <c>Trie</c> /
     ''' <c>TrieBuilder</c> in <c>models/unigram/trie.rs</c>:
     ''' <see cref="Push"/> inserts a sequence, <see cref="CommonPrefixSearch"/> returns every
@@ -102,36 +119,89 @@ Namespace Internal
     ''' matcher. Operates on UTF-16 code units (each <c>Char</c> is one label); use
     ''' <see cref="Trie(Of TLabel)"/> with <see cref="System.Text.Rune"/> labels for scalar-based
     ''' matching.
+    '''
+    ''' #28 ASCII fast channel: real code is nearly all ASCII, so each node stores its ASCII
+    ''' children (Char &lt; 128) in a lazily-allocated 128-slot array indexed directly by the char
+    ''' code unit — a single array load instead of a <c>Dictionary</c> hash+probe on the per-position
+    ''' hot walk. Non-ASCII children fall back to a <see cref="CharTrieNode.Children"/> dictionary.
+    ''' The trie semantics are identical to the generic <see cref="Trie(Of Char)"/>; the two are kept
+    ''' in lockstep by the M13B differential test.
     ''' </summary>
     Public NotInheritable Class CharTrie
 
-        Private ReadOnly _trie As New Trie(Of Char)()
+        Private ReadOnly _root As New CharTrieNode()
 
         Public Sub Push(word As String)
             If word Is Nothing Then Return
-            _trie.Push(word)
+            Dim node As CharTrieNode = _root
+            For Each c As Char In word
+                If Char.IsAscii(c) Then
+                    ' ASCII fast channel: lazy 128-slot array, indexed directly by the code unit.
+                    If node.AsciiChildren Is Nothing Then
+                        node.AsciiChildren = New CharTrieNode(127) {}
+                    End If
+                    Dim idx As Integer = AscW(c)
+                    Dim child As CharTrieNode = node.AsciiChildren(idx)
+                    If child Is Nothing Then
+                        child = New CharTrieNode()
+                        node.AsciiChildren(idx) = child
+                    End If
+                    node = child
+                Else
+                    ' Non-ASCII: fall back to the dictionary.
+                    Dim child As CharTrieNode = Nothing
+                    If Not node.Children.TryGetValue(c, child) Then
+                        child = New CharTrieNode()
+                        node.Children(c) = child
+                    End If
+                    node = child
+                End If
+            Next
+            node.IsLeaf = True
         End Sub
 
         Public Function CommonPrefixSearch(word As String) As List(Of String)
-            Dim labels As List(Of Char) = If(word Is Nothing, New List(Of Char)(), word.ToList())
-            Return _trie.CommonPrefixSearch(labels).
-                Select(Function(ls) New String(ls.ToArray())).
-                ToList()
+            Dim result As New List(Of String)()
+            If word Is Nothing Then Return result
+            Dim node As CharTrieNode = _root
+            For i As Integer = 0 To word.Length - 1
+                Dim c As Char = word(i)
+                Dim child As CharTrieNode = Nothing
+                If node.AsciiChildren IsNot Nothing AndAlso Char.IsAscii(c) Then
+                    child = node.AsciiChildren(AscW(c))
+                Else
+                    node.Children.TryGetValue(c, child)
+                End If
+                If child Is Nothing Then Exit For
+                node = child
+                If node.IsLeaf Then
+                    result.Add(word.Substring(0, i + 1))
+                End If
+            Next
+            Return result
         End Function
 
         ''' <summary>Returns the .NET end index (exclusive) of the longest match at <paramref name="startNetIndex"/>, 0 if none.</summary>
         Public Function FindLongestPrefix(word As String, startNetIndex As Integer) As Integer
             If word Is Nothing Then Return 0
+            If startNetIndex < 0 OrElse startNetIndex > word.Length Then Return 0
             ' Walk the trie over the String directly (String has Length + an indexer but does
-            ' NOT implement IReadOnlyList(Of Char)). The previous implementation converted the
-            ' WHOLE string to a List(Of Char) on every call, which made the added-token matcher
-            ' O(n^2) -- FindMatches calls this once per scalar position.
-            Dim node As TrieNode(Of Char) = _trie.Root
+            ' NOT implement IReadOnlyList(Of Char)), preferring the ASCII fast channel: each node's
+            ' ASCII children are indexed directly by code unit (a plain array load), while
+            ' non-ASCII children use the dictionary. Semantically identical to the generic
+            ' Trie(Of Char).FindLongestPrefix.
+            Dim node As CharTrieNode = _root
             Dim lastMatchEnd As Integer = 0
             Dim i As Integer = startNetIndex
             While i < word.Length
-                Dim child As TrieNode(Of Char) = Nothing
-                If Not node.Children.TryGetValue(word(i), child) Then Exit While
+                Dim c As Char = word(i)
+                Dim child As CharTrieNode = Nothing
+                If node.AsciiChildren IsNot Nothing AndAlso Char.IsAscii(c) Then
+                    child = node.AsciiChildren(AscW(c))
+                Else
+                    node.Children.TryGetValue(c, child)
+                End If
+                If child Is Nothing Then Exit While
                 node = child
                 i += 1
                 If node.IsLeaf Then lastMatchEnd = i
