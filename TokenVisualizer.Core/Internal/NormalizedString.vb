@@ -358,6 +358,18 @@ Namespace Internal
         End Function
 
         ''' <summary>
+        ''' Cursor-aware twin of <see cref="ByteToNetIndexCached"/> for MONOTONICALLY NON-DECREASING
+        ''' byte offsets: the fused range scan visits ranges in ascending byte order, so a shared
+        ''' cursor (the index into <see cref="ScalarBoundaryIndex.BreakBytes"/> of the last breakpoint
+        ''' at or below the previous query; start at -1) turns consecutive lookups into an amortized
+        ''' O(1) linear advance instead of an O(log n) binary search. The caller MUST guarantee
+        ''' <c>byteOffset >= every earlier call's byteOffset</c> within the same cursor's lifetime.
+        ''' </summary>
+        Friend Function ByteToNetIndexCachedMonotonic(byteOffset As Integer, ByRef cursor As Integer) As Integer
+            Return ByteToNetCachedMonotonic(NormalizedIndex(), _normalized, byteOffset, cursor)
+        End Function
+
+        ''' <summary>
         ''' Converts a UTF-8 byte offset to a .NET string index using a cached boundary index.
         ''' Semantics match <see cref="Utf8Helpers.ByteToNetIndex"/>: floors to the enclosing scalar
         ''' start. A pure-ASCII index (empty breakpoints, from <see cref="BuildScalarIndex"/>) maps
@@ -392,6 +404,35 @@ Namespace Internal
             Dim excessAfter As Integer
             If i + 1 < index.BreakBytes.Length Then
                 excessAfter = index.BreakExcess(i + 1)
+            Else
+                excessAfter = index.Utf8Len - s.Length
+            End If
+            Return byteOffset - excessAfter
+        End Function
+
+        ''' <summary>
+        ''' Monotonic twin of <see cref="ByteToNetCached"/>; see
+        ''' <see cref="ByteToNetIndexCachedMonotonic"/> for the cursor contract.
+        ''' </summary>
+        Private Shared Function ByteToNetCachedMonotonic(index As ScalarBoundaryIndex, s As String,
+                                                         byteOffset As Integer, ByRef cursor As Integer) As Integer
+            If byteOffset <= 0 Then Return 0
+            If byteOffset >= index.Utf8Len Then Return s.Length
+            If index.BreakBytes.Length = 0 Then Return byteOffset ' pure ASCII: identity
+            ' Advance the cursor: the last breakpoint start <= byteOffset. Breakpoints are sorted
+            ' and byteOffset is non-decreasing, so the cursor only ever moves forward.
+            While cursor + 1 < index.BreakBytes.Length AndAlso index.BreakBytes(cursor + 1) <= byteOffset
+                cursor += 1
+            End While
+            If cursor < 0 Then Return byteOffset ' before the first non-ASCII scalar: excess is 0
+            If byteOffset < index.BreakBytes(cursor) + index.BreakLens(cursor) Then
+                Return index.BreakBytes(cursor) - index.BreakExcess(cursor)
+            End If
+            ' In the ASCII run after the scalar: excess is constant at the value AFTER the scalar
+            ' (== the next breakpoint's excessBefore, or the final total excess).
+            Dim excessAfter As Integer
+            If cursor + 1 < index.BreakBytes.Length Then
+                excessAfter = index.BreakExcess(cursor + 1)
             Else
                 excessAfter = index.Utf8Len - s.Length
             End If

@@ -289,16 +289,19 @@ Namespace Internal
         Private Shared Sub FillRangesInto(ns As NormalizedString, text As String, p As Pattern,
                                           ranges As List(Of (Integer, Integer)), scratch As List(Of MatchInfo),
                                           target As List(Of (Integer, Integer)))
+            ' Ranges arrive in ascending byte order, so the boundary lookups are monotonic: a shared
+            ' cursor turns the O(log n) binary searches into an amortized O(1) linear advance.
+            Dim cursor As Integer = -1
             For Each r In ranges
                 Dim b1 As Integer = r.Item1
                 Dim b2 As Integer = r.Item2
                 If b2 <= b1 Then Continue For
-                ' Run the pattern directly on the text slice via the cached boundary index (binary
-                ' search): the manual scanners accept a (string, start, length) slice and scan it in
-                ' place, so no per-(piece × pattern) substring is materialized. Matches come back
-                ' with byte offsets relative to the slice and are offset back below.
-                Dim n1 As Integer = ns.ByteToNetIndexCached(b1)
-                Dim n2 As Integer = ns.ByteToNetIndexCached(b2)
+                ' Run the pattern directly on the text slice via the cached boundary index: the
+                ' manual scanners accept a (string, start, length) slice and scan it in place, so no
+                ' per-(piece × pattern) substring is materialized. Matches come back with byte
+                ' offsets relative to the slice and are offset back below.
+                Dim n1 As Integer = ns.ByteToNetIndexCachedMonotonic(b1, cursor)
+                Dim n2 As Integer = ns.ByteToNetIndexCachedMonotonic(b2, cursor)
                 If n2 <= n1 Then Continue For
                 p.FindMatchesInto(text, n1, n2 - n1, scratch)
                 For i As Integer = 0 To scratch.Count - 1
@@ -373,12 +376,15 @@ Namespace Internal
         Private Shared Sub StreamRangesInto(ns As NormalizedString, text As String, p As Pattern,
                                             ranges As List(Of (Integer, Integer)), scratch As List(Of MatchInfo),
                                             visitor As IFusedRangeVisitor)
+            ' Ranges arrive in ascending byte order, so the boundary lookups are monotonic (cursor
+            ' contract in ByteToNetIndexCachedMonotonic).
+            Dim cursor As Integer = -1
             For Each r In ranges
                 Dim b1 As Integer = r.Item1
                 Dim b2 As Integer = r.Item2
                 If b2 <= b1 Then Continue For
-                Dim n1 As Integer = ns.ByteToNetIndexCached(b1)
-                Dim n2 As Integer = ns.ByteToNetIndexCached(b2)
+                Dim n1 As Integer = ns.ByteToNetIndexCachedMonotonic(b1, cursor)
+                Dim n2 As Integer = ns.ByteToNetIndexCachedMonotonic(b2, cursor)
                 If n2 <= n1 Then Continue For
                 p.FindMatchesInto(text, n1, n2 - n1, scratch)
                 For i As Integer = 0 To scratch.Count - 1
