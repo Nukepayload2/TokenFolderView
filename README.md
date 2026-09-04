@@ -1,10 +1,18 @@
-﻿# TokenFolderView（代码名 TokenVisualizer）
+﻿# 词元文件夹视图
 
-基于 **VB.NET + Avalonia** 的桌面应用，用于可视化大语言模型分词器（tokenizer）的切分结果：打开一个文件夹即可统计每个文件 / 子目录的 token 数，并逐 token 着色查看任意文本文件的切分细节。
+基于 **VB.NET + Avalonia** 的原生桌面应用，用于可视化大语言模型分词器（tokenizer）的切分结果：打开一个文件夹即可统计每个文件 / 子目录的词元数，并逐个着色查看任意文本文件的切分细节。
 
-核心库 `TokenVisualizer.Core`（命名空间 `Tokenizers`）实现了与 HuggingFace [tokenizers](https://github.com/huggingface/tokenizers) 相同的分词管线语义（normalization / pre-tokenization / model / truncation / post-processing / padding），分词结果与参考实现一致（有 golden vector 与 parity 测试校验），并支持 `tokenizer.json` 的加载与序列化，可直接作为库使用。
+核心库 `TokenVisualizer.Core`（命名空间 `Tokenizers`）实现了与 HuggingFace [tokenizers](https://github.com/huggingface/tokenizers) 相同的分词管线语义（normalization / pre-tokenization / model / truncation / post-processing / padding），分词结果与参考实现一致（有单元测试校验），并支持 `tokenizer.json` 的加载与序列化，可直接作为库使用。
 
-> 性能：实测仅统计 token 数的用例下，本库单线程速度约为 Python 版 hf tokenizers（Rust 参考实现, 提交 828e4830f7c9e0ff8b75a2433d9814b802b43c3d）的[五倍](tests/performance/)。
+## 快如疾风
+
+实测仅统计词元数的用例下，本库单线程速度约为 Python 版 hf tokenizers（Rust 参考实现, [提交 828e4830f7c9e0ff8b75a2433d9814b802b43c3d](https://github.com/huggingface/tokenizers/commit/828e4830f7c9e0ff8b75a2433d9814b802b43c3d)）的[五倍](tests/performance/)。
+
+实际使用中，本软件使用逻辑处理器数量的一半进行并发扫描。
+
+使用限制了 150w 功耗墙的 i5-13600KF 运行 AOT 产物，
+扫描 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（[提交 d347e703908d0406b7a7ef80e3a0e594d86b2215](https://github.com/deepseek-ai/deepseek-harness/commit/d347e703908d0406b7a7ef80e3a0e594d86b2215)），
+速度为 **15.6 M Tokens/s**，**59 MB/s**。峰值工作集内存**不超过 400 MB**。
 
 ## 目标平台
 
@@ -47,17 +55,18 @@ dotnet publish TokenVisualizer -c Release -r linux-x64
 dotnet publish TokenVisualizer -c Release -r osx-arm64
 ```
 
-首次启动时，应用会自动注册仓库内置的 `deepseek-v4-flash/tokenizer.json` 作为默认分词器（按绝对路径引用，不复制文件）。
+首次启动时，应用会自动注册仓库内置的 `deepseek-v4-flash/tokenizer.json` 作为默认分词器。
 
 ## 用法
 
-### 1. 词元统计（Explorer 页）
+### 1. 词元统计
 
 - 点击 **打开文件夹** 选择要扫描的目录；扫描完成后左侧树显示每个文件 / 文件夹的 token 计数，底部状态栏显示总计、扫描 / 跳过文件数。
 - 点选任意文件，右侧以等宽字体逐 token 着色展示切分结果（不同颜色区分不同 token）。
 - 顶部标题栏搜索框可按名称过滤文件 / 文件夹；**重新扫描** 可在修改过滤设置后重扫。
+- 支持粘贴文本进行词元统计
 
-### 2. 设置（Settings 页）
+### 2. 设置
 
 - **分词器**：管理 tokenizer 模型——添加（选择 tokenizer.json 与 tokenizer_config.json）、设为当前使用、删除（内置 deepseek 不可删）。
 - **扫描**：最大文件大小（MB，默认 10，超过跳过）、是否跳过二进制文件（默认开启）、文件夹黑名单（每行一个，默认含 `bin`、`obj`、`node_modules`、`.git` 等）。
@@ -105,4 +114,5 @@ Dim text As String = tok.Decode(enc.Ids)                       ' 解码回文本
 ## 许可证
 
 - 代码：MIT，见 [License.txt](License.txt)
-- `deepseek-v4-flash/` 分词器数据：遵循其自身许可证，见 [deepseek-v4-flash/LICENSE](deepseek-v4-flash/LICENSE)
+- `deepseek-v4-flash/` 分词器数据：[MIT 许可证](deepseek-v4-flash/LICENSE)
+- 参考了 hf tokenizers 的实现思路, 它采用 [Apache License 2.0](https://github.com/huggingface/tokenizers/blob/main/LICENSE), 下载 Releases 或者分发产物记得带上它
