@@ -18,13 +18,15 @@
 | 项目 | 说明 |
 |------|------|
 | 目标框架 | `.NET 10`（`net10.0`） |
-| 运行平台 | Windows / Linux / macOS（Avalonia Desktop） |
-| UI 技术 | Avalonia 12 + FluentAvalonia，界面语言为中文 |
+| 运行平台 | 桌面版 Windows 10+ / Linux (glibc 2.27 或 musl 1.2.3) / macOS 14+ |
+| UI 技术 | Avalonia 12 + FluentAvalonia |
+| UI 语言 | zh-CN |
 
 ## 编译环境
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10)（命令行 `dotnet` 可用即可）
 - 解决方案文件：`TokenVisualizer.slnx`
+- 可选：AOT 发布需要装对应系统上的本机工具链依赖
 
 仓库结构：
 
