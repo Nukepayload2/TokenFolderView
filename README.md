@@ -2,16 +2,15 @@
 
 基于 **VB.NET + Avalonia** 的原生桌面应用，用于可视化大语言模型分词器（tokenizer）的切分结果：打开一个文件夹即可统计每个文件 / 子目录的词元数，并逐个着色查看任意文本文件的切分细节。
 
-核心库 `TokenVisualizer.Core`（命名空间 `Tokenizers`）实现了与 HuggingFace [tokenizers](https://github.com/huggingface/tokenizers) 相同的分词管线语义（normalization / pre-tokenization / model / truncation / post-processing / padding），分词结果与参考实现一致（有单元测试校验），并支持 `tokenizer.json` 的加载与序列化，可直接作为库使用。
+核心库 `TokenVisualizer.Core`（命名空间 `Tokenizers`）实现了与 [HuggingFace tokenizers](https://github.com/huggingface/tokenizers) 相同的分词管线语义（normalization / pre-tokenization / model / truncation / post-processing / padding），分词结果与参考实现一致（有单元测试校验），并支持 `tokenizer.json` 的加载与序列化，可直接作为库使用。
 
 ## 快如疾风
 
-实测仅统计词元数的用例下，本库单线程速度约为 Python 版 hf tokenizers（Rust 参考实现, [提交 828e4830f7c9e0ff8b75a2433d9814b802b43c3d](https://github.com/huggingface/tokenizers/commit/828e4830f7c9e0ff8b75a2433d9814b802b43c3d)）的[五倍](tests/performance/)。
+实测仅统计词元数的用例下，本库单线程速度约为 Python 包装版 [hf tokenizers](https://github.com/huggingface/tokenizers/commit/828e4830f7c9e0ff8b75a2433d9814b802b43c3d) 的[五倍](tests/performance/)。
 
 实际使用中，本软件使用逻辑处理器数量的一半进行并发扫描。
-
 使用限制了 150w 功耗墙的 i5-13600KF 运行 AOT 产物，
-扫描 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（[提交 d347e703908d0406b7a7ef80e3a0e594d86b2215](https://github.com/deepseek-ai/deepseek-harness/commit/d347e703908d0406b7a7ef80e3a0e594d86b2215)），
+统计 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness/commit/d347e703908d0406b7a7ef80e3a0e594d86b2215) 代码文件的词元数量，
 速度为 **15.6 M Tokens/s**，**59 MB/s**。峰值工作集内存**不超过 400 MB**。
 
 ## 目标平台
@@ -80,7 +79,7 @@ dotnet publish TokenVisualizer -c Release -r osx-arm64
 
 ### 3. 核心库（TokenVisualizer.Core）
 
-```vb
+```vbnet
 Imports Tokenizers
 
 ' 从 HuggingFace tokenizer.json 加载
