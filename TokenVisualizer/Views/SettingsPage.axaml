@@ -8,7 +8,7 @@
              x:Class="TokenVisualizer.Views.SettingsPage">
 
     <ScrollViewer>
-        <StackPanel Margin="24,16" Spacing="16" MaxWidth="700">
+        <StackPanel Margin="24,16" Spacing="16">
 
             <TextBlock Text="设置" FontSize="28" FontWeight="Bold"/>
 
@@ -52,6 +52,20 @@
                             <ComboBoxItem Content="深色" Tag="Dark"/>
                         </ComboBox>
                     </StackPanel>
+                </StackPanel>
+            </ui:FASettingsExpander>
+
+            <!-- 关于 -->
+            <ui:FASettingsExpander Header="关于" Description="项目主页与版权" IconSource="Link">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="TokenFolderView · 版本 1.1.0" FontSize="16" FontWeight="SemiBold"/>
+                    <Button x:Name="BtnHomepage"
+                            Content="https://github.com/Nukepayload2/TokenFolderView/"
+                            HorizontalAlignment="Left"
+                            Padding="12,6"
+                            Cursor="Hand"/>
+                    <TextBlock Text="本软件受中国和国际版权法保护。源代码与产品以 MIT 许可发布；内置分词器数据遵循其自身许可。"
+                               Opacity="0.6" TextWrapping="Wrap"/>
                 </StackPanel>
             </ui:FASettingsExpander>
 

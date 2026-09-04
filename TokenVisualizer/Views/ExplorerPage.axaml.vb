@@ -22,6 +22,7 @@ Namespace Views
         Private _loadGeneration As Integer
 
         Private _currentQuery As String = ""
+        Private WithEvents _searchTimer As DispatcherTimer
 
         ' Cap on nodes auto-expanded by a search. A broad query (e.g. a single character) can match a
         ' large share of the tree; TreeView is non-virtualizing, so expanding every ancestor realizes
@@ -31,6 +32,9 @@ Namespace Views
 
         Public Sub New()
             InitializeComponent()
+            _searchTimer = New DispatcherTimer With {
+                .Interval = TimeSpan.FromMilliseconds(200)
+            }
         End Sub
 
         ' ------------------------------------------------------------------
@@ -76,6 +80,17 @@ Namespace Views
         ''' <summary>Refreshes the scan state UI (button enablement, cancel visibility).</summary>
         Public Sub RefreshStatus()
             UpdateScanUi()
+            UpdateTreeEmptyPlaceholder()
+        End Sub
+
+        ''' <summary>
+        ''' Shows the "打开文件夹" empty-state hint in the tree pane until a folder has been loaded
+        ''' (RootNode exists) and no scan is currently running. Hides it again while scanning or once
+        ''' a folder is on screen.
+        ''' </summary>
+        Private Sub UpdateTreeEmptyPlaceholder()
+            Dim state = AppState.Current
+            EmptyState.IsVisible = (Not state.IsScanning) AndAlso state.RootNode Is Nothing
         End Sub
 
         Private Sub UpdateScanUi()
@@ -88,7 +103,7 @@ Namespace Views
         ' Open / rescan / cancel
         ' ------------------------------------------------------------------
 
-        Private Async Sub BtnOpenFolder_Click() Handles BtnOpenFolder.Click
+        Private Async Sub BtnOpenFolder_Click() Handles BtnOpenFolder.Click, BtnOpenFolderEmpty.Click
             AppState.EnsureActiveTokenizer()
             If AppState.Current.ActiveTokenizer Is Nothing Then
                 TokenLines.ShowText("未找到分词器，请先在「设置」中添加。")
@@ -322,6 +337,20 @@ Namespace Views
                 Return offset
             End Using
         End Function
+
+        ' ------------------------------------------------------------------
+        ' Search debounce (search box lives on this page now)
+        ' ------------------------------------------------------------------
+
+        Private Sub SearchBox_TextChanged() Handles SearchBox.TextChanged
+            _searchTimer.Stop()
+            _searchTimer.Start()
+        End Sub
+
+        Private Sub SearchTimer_Tick() Handles _searchTimer.Tick
+            _searchTimer.Stop()
+            ApplySearchFilter(If(SearchBox.Text, "").Trim())
+        End Sub
 
         ' ------------------------------------------------------------------
         ' Search filtering

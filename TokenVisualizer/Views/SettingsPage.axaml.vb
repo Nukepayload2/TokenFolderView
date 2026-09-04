@@ -115,5 +115,19 @@ Namespace Views
             Return item.Tag?.ToString()
         End Function
 
+        ' ------------------------------------------------------------------
+        ' 关于
+        ' ------------------------------------------------------------------
+
+        Private Async Sub BtnHomepage_Click(sender As Object, e As RoutedEventArgs) Handles BtnHomepage.Click
+            Try
+                Dim tl As TopLevel = TopLevel.GetTopLevel(Me)
+                If tl IsNot Nothing Then
+                    Await tl.Launcher.LaunchUriAsync(New Uri("https://github.com/Nukepayload2/TokenFolderView/"))
+                End If
+            Catch
+            End Try
+        End Sub
+
     End Class
 End Namespace

@@ -15,19 +15,15 @@ Namespace Views
         Inherits Window
 
         Private _currentPage As Control
+        Private _pageKind As String = "explore"
         Private _explorerPage As ExplorerPage
         Private _textTokenizePage As TextTokenizePage
         Private _settingsPage As SettingsPage
-        Private _searchQuery As String = ""
-        Private WithEvents _searchTimer As DispatcherTimer
         Private WithEvents _statusTimer As DispatcherTimer
 
         Public Sub New()
             InitializeComponent()
 
-            _searchTimer = New DispatcherTimer With {
-                .Interval = TimeSpan.FromMilliseconds(200)
-            }
             _statusTimer = New DispatcherTimer With {
                 .Interval = TimeSpan.FromMilliseconds(200)
             }
@@ -87,6 +83,7 @@ Namespace Views
         End Sub
 
         Private Sub ShowPage(kind As String)
+            _pageKind = If(kind = "text-tokenize" OrElse kind = "settings", kind, "explore")
             Select Case kind
                 Case "text-tokenize"
                     ShowTextTokenizePage()
@@ -95,6 +92,7 @@ Namespace Views
                 Case Else
                     ShowExplorerPage()
             End Select
+            UpdateStatus()
         End Sub
 
         Private Sub ShowExplorerPage()
@@ -104,7 +102,6 @@ Namespace Views
             _currentPage = _explorerPage
             NavView.Content = _explorerPage
             _explorerPage.RefreshStatus()
-            _explorerPage.ApplySearchFilter(_searchQuery)
         End Sub
 
         Private Sub ShowTextTokenizePage()
@@ -123,19 +120,6 @@ Namespace Views
             NavView.Content = _settingsPage
         End Sub
 
-        ' ---- Global Search (debounced; filters the Explorer tree) ----
-
-        Private Sub SearchBox_TextChanged() Handles SearchBox.TextChanged
-            _searchTimer.Stop()
-            _searchTimer.Start()
-        End Sub
-
-        Private Sub SearchTimer_Tick() Handles _searchTimer.Tick
-            _searchTimer.Stop()
-            _searchQuery = If(SearchBox.Text, "").Trim()
-            _explorerPage?.ApplySearchFilter(_searchQuery)
-        End Sub
-
         ' ---- Status polling (reads the shared AppState) ----
 
         Private Sub StatusTimer_Tick() Handles _statusTimer.Tick
@@ -143,6 +127,42 @@ Namespace Views
         End Sub
 
         Private Sub UpdateStatus()
+            Select Case _pageKind
+                Case "settings"
+                    StatusBarBorder.IsVisible = False
+                Case "text-tokenize"
+                    StatusBarBorder.IsVisible = True
+                    ShowTextStatus()
+                Case Else
+                    StatusBarBorder.IsVisible = True
+                    UpdateScanStatus()
+            End Select
+        End Sub
+
+        ''' <summary>
+        ''' Status line for the free-text page: shows the latest tokenization result summary, or a
+        ''' hint while there is nothing to report yet. The scan labels are hidden.
+        ''' </summary>
+        Private Sub ShowTextStatus()
+            Dim stats As String = ""
+            If _textTokenizePage IsNot Nothing Then
+                stats = _textTokenizePage.StatusSummary
+            End If
+
+            TxtTotalTokens.Text = stats
+            TxtFilesScanned.IsVisible = False
+            TxtFilesSkipped.IsVisible = False
+            TxtScanStatus.IsVisible = True
+            TxtScanStatus.Text = If(stats.Length > 0, "", "在左侧输入文本，停顿后将在此显示统计")
+            ScanProgressBar.IsVisible = False
+            BtnCancelScan.IsVisible = False
+        End Sub
+
+        ''' <summary>Folder-scan totals shown while the Explorer page is active.</summary>
+        Private Sub UpdateScanStatus()
+            TxtFilesScanned.IsVisible = True
+            TxtFilesSkipped.IsVisible = True
+            TxtScanStatus.IsVisible = True
             Dim state = AppState.Current
             Dim root = state.RootNode
             Dim progress = If(state.ActiveScan IsNot Nothing, state.ActiveScan.ScanProgress, Nothing)

@@ -7,40 +7,42 @@
              mc:Ignorable="d" d:DesignWidth="1200" d:DesignHeight="800"
              x:Class="TokenVisualizer.Views.ExplorerPage">
 
-    <Grid RowDefinitions="Auto,*">
+    <Grid ColumnDefinitions="340,4,*" Margin="20,12,20,16">
 
-        <!-- Row 0: page header -->
-        <Grid ColumnDefinitions="*,Auto" Margin="20,16,20,0">
-            <StackPanel Spacing="2">
-                <TextBlock Text="词元统计" FontSize="28" FontWeight="Bold"/>
-            </StackPanel>
-            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+        <!-- Left: search sits on top of the tree, inside the resizable column -->
+        <Grid RowDefinitions="Auto,*">
+            <TextBox x:Name="SearchBox" PlaceholderText="搜索文件 / 文件夹…" Margin="0,0,8,8"/>
+            <Grid Grid.Row="1">
+                <TreeView x:Name="FileTree">
+                    <TreeView.ItemTemplate>
+                        <TreeDataTemplate ItemsSource="{Binding Children}" x:DataType="scanning:ScanTreeNode">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <TextBlock Text="{Binding Name}"/>
+                                <TextBlock Text="{Binding CountText}" FontSize="11" Opacity="0.7" VerticalAlignment="Center"/>
+                            </StackPanel>
+                        </TreeDataTemplate>
+                    </TreeView.ItemTemplate>
+                </TreeView>
+                <!-- Empty state: shown in the tree pane until a folder has been opened/loaded -->
+                <StackPanel x:Name="EmptyState" IsVisible="False"
+                            HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+                    <TextBlock Text="还没有打开文件夹" Opacity="0.5" HorizontalAlignment="Center"/>
+                    <Button x:Name="BtnOpenFolderEmpty" Content="打开文件夹" Classes="accent"
+                            Padding="16,8" HorizontalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Grid>
+
+        <!-- Splitter -->
+        <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Center" VerticalAlignment="Stretch"/>
+
+        <!-- Right: folder actions sit above the token-colored file view -->
+        <Grid Grid.Column="2" RowDefinitions="Auto,*">
+            <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,0,0,8" HorizontalAlignment="Right">
                 <Button x:Name="BtnOpenFolder" Content="打开文件夹" Classes="accent" Padding="16,8"/>
                 <Button x:Name="BtnRescan" Content="重新扫描" Padding="12,8" IsEnabled="False"/>
             </StackPanel>
-        </Grid>
-
-        <!-- Row 1: body -->
-        <Grid Grid.Row="1" ColumnDefinitions="340,4,*" Margin="20,10,20,16">
-
-            <!-- Left: folder tree -->
-            <TreeView x:Name="FileTree">
-                <TreeView.ItemTemplate>
-                    <TreeDataTemplate ItemsSource="{Binding Children}" x:DataType="scanning:ScanTreeNode">
-                        <StackPanel Orientation="Horizontal" Spacing="6">
-                            <TextBlock Text="{Binding Name}"/>
-                            <TextBlock Text="{Binding CountText}" FontSize="11" Opacity="0.7" VerticalAlignment="Center"/>
-                        </StackPanel>
-                    </TreeDataTemplate>
-                </TreeView.ItemTemplate>
-            </TreeView>
-
-            <!-- Splitter -->
-            <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Center" VerticalAlignment="Stretch"/>
-
-            <!-- Right: token-colored file view -->
-            <controls:TokenizedViewer x:Name="TokenLines" Grid.Column="2" EmptyHint="选择文件查看 token 着色"/>
-
+            <controls:TokenizedViewer x:Name="TokenLines" Grid.Row="1" EmptyHint="选择文件查看 token 着色"/>
         </Grid>
 
     </Grid>
