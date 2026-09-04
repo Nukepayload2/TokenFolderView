@@ -721,53 +721,53 @@ Imports Tokenizers.Serialization
                                         Optional cacheCapacity As Integer? = Nothing,
                                         Optional cacheMaxWord As Integer? = Nothing,
                                         Optional sharedCacheCapacity As Integer? = Nothing) As Tokenizer
-            Dim node As JsonNode = JsonNode.Parse(json)
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then
-                Throw New ArgumentException("Invalid tokenizer JSON")
-            End If
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
+            Using doc As JsonDocument = JsonDocument.Parse(json)
+                Dim root As JsonElement = doc.RootElement
+                If root.ValueKind <> JsonValueKind.Object Then
+                    Throw New ArgumentException("Invalid tokenizer JSON")
+                End If
 
-            Dim version As String = SerializationHelpers.GetString(obj, "version")
-            If version IsNot Nothing AndAlso version <> "1.0" Then
-                Throw New ArgumentException($"Unknown tokenizer version '{version}'")
-            End If
+                Dim version As String = SerializationHelpers.GetString(root, "version")
+                If version IsNot Nothing AndAlso version <> "1.0" Then
+                    Throw New ArgumentException($"Unknown tokenizer version '{version}'")
+                End If
 
-            Dim modelNode As JsonNode = SerializationHelpers.GetNode(obj, "model")
-            Dim model As Object = ComponentFactory.FromModel(modelNode, cacheCapacity, cacheMaxWord, sharedCacheCapacity)
-            If model Is Nothing Then
-                Throw New ArgumentException("Model missing.")
-            End If
-            Dim tokenizer As New Tokenizer(DirectCast(model, IModel))
+                Dim modelNode As JsonElement? = SerializationHelpers.GetProperty(root, "model")
+                Dim model As Object = ComponentFactory.FromModel(modelNode, cacheCapacity, cacheMaxWord, sharedCacheCapacity)
+                If model Is Nothing Then
+                    Throw New ArgumentException("Model missing.")
+                End If
+                Dim tokenizer As New Tokenizer(DirectCast(model, IModel))
 
-            tokenizer.Normalizer = ComponentFactory.FromNormalizer(SerializationHelpers.GetNode(obj, "normalizer"))
-            tokenizer.PreTokenizer = ComponentFactory.FromPreTokenizer(SerializationHelpers.GetNode(obj, "pre_tokenizer"))
-            tokenizer.PostProcessor = ComponentFactory.FromPostProcessor(SerializationHelpers.GetNode(obj, "post_processor"))
-            tokenizer.Decoder = ComponentFactory.FromDecoder(SerializationHelpers.GetNode(obj, "decoder"))
-            tokenizer.Truncation = ParseTruncation(SerializationHelpers.GetNode(obj, "truncation"))
-            tokenizer.Padding = ParsePadding(SerializationHelpers.GetNode(obj, "padding"))
+                tokenizer.Normalizer = ComponentFactory.FromNormalizer(SerializationHelpers.GetProperty(root, "normalizer"))
+                tokenizer.PreTokenizer = ComponentFactory.FromPreTokenizer(SerializationHelpers.GetProperty(root, "pre_tokenizer"))
+                tokenizer.PostProcessor = ComponentFactory.FromPostProcessor(SerializationHelpers.GetProperty(root, "post_processor"))
+                tokenizer.Decoder = ComponentFactory.FromDecoder(SerializationHelpers.GetProperty(root, "decoder"))
+                tokenizer.Truncation = ParseTruncation(SerializationHelpers.GetProperty(root, "truncation"))
+                tokenizer.Padding = ParsePadding(SerializationHelpers.GetProperty(root, "padding"))
 
-            tokenizer.AddedVocabulary.ModelVocab = DirectCast(model, IModel).GetVocab()
-            tokenizer.AddedVocabulary.Normalizer = tokenizer.Normalizer
+                tokenizer.AddedVocabulary.ModelVocab = DirectCast(model, IModel).GetVocab()
+                tokenizer.AddedVocabulary.Normalizer = tokenizer.Normalizer
 
-            Dim addedNode As JsonNode = SerializationHelpers.GetNode(obj, "added_tokens")
-            Dim addedTokens As New List(Of AddedToken)()
-            If addedNode IsNot Nothing AndAlso TypeOf addedNode Is JsonArray Then
-                For Each item As JsonNode In DirectCast(addedNode, JsonArray)
-                    Dim entry As JsonObject = TryCast(item, JsonObject)
-                    If entry Is Nothing Then Continue For
-                    Dim content As String = SerializationHelpers.GetString(entry, "content")
-                    Dim special As Boolean = SerializationHelpers.GetBool(entry, "special").GetValueOrDefault(False)
-                    Dim at As New AddedToken(content, special)
-                    at.SingleWord = SerializationHelpers.GetBool(entry, "single_word").GetValueOrDefault(False)
-                    at.LStrip = SerializationHelpers.GetBool(entry, "lstrip").GetValueOrDefault(False)
-                    at.RStrip = SerializationHelpers.GetBool(entry, "rstrip").GetValueOrDefault(False)
-                    at.Normalized = SerializationHelpers.GetBool(entry, "normalized").GetValueOrDefault(Not special)
-                    addedTokens.Add(at)
-                Next
-            End If
-            tokenizer.AddTokens(addedTokens)
+                Dim addedProp As JsonElement? = SerializationHelpers.GetProperty(root, "added_tokens")
+                Dim addedTokens As New List(Of AddedToken)()
+                If addedProp.HasValue AndAlso addedProp.Value.ValueKind = JsonValueKind.Array Then
+                    For Each item As JsonElement In addedProp.Value.EnumerateArray()
+                        If item.ValueKind <> JsonValueKind.Object Then Continue For
+                        Dim content As String = SerializationHelpers.GetString(item, "content")
+                        Dim special As Boolean = SerializationHelpers.GetBool(item, "special").GetValueOrDefault(False)
+                        Dim at As New AddedToken(content, special)
+                        at.SingleWord = SerializationHelpers.GetBool(item, "single_word").GetValueOrDefault(False)
+                        at.LStrip = SerializationHelpers.GetBool(item, "lstrip").GetValueOrDefault(False)
+                        at.RStrip = SerializationHelpers.GetBool(item, "rstrip").GetValueOrDefault(False)
+                        at.Normalized = SerializationHelpers.GetBool(item, "normalized").GetValueOrDefault(Not special)
+                        addedTokens.Add(at)
+                    Next
+                End If
+                tokenizer.AddTokens(addedTokens)
 
-            Return tokenizer
+                Return tokenizer
+            End Using
         End Function
 
         ''' <summary>Loads a tokenizer from a tokenizer.json file.</summary>
@@ -850,9 +850,9 @@ Imports Tokenizers.Serialization
             Return o
         End Function
 
-        Private Shared Function ParseTruncation(node As JsonNode) As TruncationParams
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
+        Private Shared Function ParseTruncation(prop As JsonElement?) As TruncationParams
+            If Not prop.HasValue OrElse prop.Value.ValueKind <> JsonValueKind.Object Then Return Nothing
+            Dim obj As JsonElement = prop.Value
             Dim p As New TruncationParams()
             Dim direction As String = SerializationHelpers.GetString(obj, "direction")
             If direction IsNot Nothing Then p.Direction = SerializationHelpers.ParseTruncationDirection(direction)
@@ -863,12 +863,12 @@ Imports Tokenizers.Serialization
             Return p
         End Function
 
-        Private Shared Function ParsePadding(node As JsonNode) As PaddingParams
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
+        Private Shared Function ParsePadding(prop As JsonElement?) As PaddingParams
+            If Not prop.HasValue OrElse prop.Value.ValueKind <> JsonValueKind.Object Then Return Nothing
+            Dim obj As JsonElement = prop.Value
             Dim p As New PaddingParams()
-            Dim strategyNode As JsonNode = SerializationHelpers.GetNode(obj, "strategy")
-            If strategyNode IsNot Nothing Then p.Strategy = SerializationHelpers.ParsePaddingStrategy(strategyNode)
+            Dim strategyNode As JsonElement? = SerializationHelpers.GetProperty(obj, "strategy")
+            If strategyNode.HasValue Then p.Strategy = SerializationHelpers.ParsePaddingStrategy(strategyNode)
             Dim direction As String = SerializationHelpers.GetString(obj, "direction")
             If direction IsNot Nothing Then p.Direction = SerializationHelpers.ParsePaddingDirection(direction)
             p.PadToMultipleOf = SerializationHelpers.GetInt(obj, "pad_to_multiple_of")

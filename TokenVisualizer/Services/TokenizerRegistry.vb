@@ -65,8 +65,10 @@ Namespace Services
 
                 Dim def As TokenizerSettings = _settings.Tokenizers(index)
                 If String.IsNullOrEmpty(def.TokenizerJsonPath) OrElse Not File.Exists(def.TokenizerJsonPath) Then
-                    Dim display As String = If(String.IsNullOrEmpty(def.TokenizerJsonPath), "(未设置)", def.TokenizerJsonPath)
-                    Throw New FileNotFoundException($"找不到分词器文件：{display}")
+                    If Not TryRepairBundledEntry(def) Then
+                        Dim display As String = If(String.IsNullOrEmpty(def.TokenizerJsonPath), "(未设置)", def.TokenizerJsonPath)
+                        Throw New FileNotFoundException($"找不到分词器文件：{display}")
+                    End If
                 End If
 
                 Dim tokenizer As Tokenizer = Tokenizer.FromFile(def.TokenizerJsonPath)
@@ -74,6 +76,23 @@ Namespace Services
                 _cachedIndex = index
                 Return tokenizer
             End SyncLock
+        End Function
+
+        ''' <summary>
+        ''' Re-points a bundled tokenizer whose stored file is missing back to the tokenizer next to
+        ''' the executable. Covers moving / re-publishing the whole app folder between runs (the
+        ''' persisted path is absolute and goes stale). Only bundled entries are touched — a
+        ''' user-added path cannot be guessed. Returns True when the entry now points at an
+        ''' existing tokenizer.json.
+        ''' </summary>
+        Private Function TryRepairBundledEntry(def As TokenizerSettings) As Boolean
+            If def Is Nothing OrElse Not def.IsBundled Then Return False
+            Dim bundledPath As String = ResolveBundledTokenizerPath()
+            If String.IsNullOrEmpty(bundledPath) Then Return False
+            def.TokenizerJsonPath = bundledPath
+            def.TokenizerConfigJsonPath = Path.Combine(Path.GetDirectoryName(bundledPath), "tokenizer_config.json")
+            SettingsService.Save(_settings)
+            Return True
         End Function
 
         ''' <summary>Returns the display name of the active tokenizer.</summary>

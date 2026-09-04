@@ -6,11 +6,24 @@
     <ApplicationManifest>My Project\app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
     <RootNamespace>TokenVisualizer</RootNamespace>
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <PublishAot>true</PublishAot>
+  </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\TokenVisualizer.Core\TokenVisualizer.Core.vbproj" />
+  </ItemGroup>
+
+  <!-- Bundle the built-in tokenizer (data + config + license) next to the executable so a fresh
+       install auto-registers a default tokenizer. 'Link' keeps it under deepseek-v4-flash/ in output. -->
+  <ItemGroup>
+    <Content Include="..\deepseek-v4-flash\**"
+             Link="deepseek-v4-flash\%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

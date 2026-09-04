@@ -1,3 +1,4 @@
+Imports System.Text.Json
 Imports Tokenizers.Internal
 Imports Tokenizers.PreTokenizers
 
@@ -10,67 +11,55 @@ Namespace Serialization
     ''' </summary>
     Public Module SerializationHelpers
 
-        ''' <summary>Returns the JsonNode at <paramref name="key"/>, or <c>Nothing</c> when absent or null.</summary>
-        Public Function GetNode(obj As System.Text.Json.Nodes.JsonObject, key As String) As System.Text.Json.Nodes.JsonNode
-            If obj Is Nothing Then Return Nothing
-            Dim n As System.Text.Json.Nodes.JsonNode = Nothing
-            If obj.TryGetPropertyValue(key, n) Then Return n
-            Return Nothing
-        End Function
-
-        ''' <summary>Reads a string field, or <c>Nothing</c> when absent or null.</summary>
-        Public Function GetString(obj As System.Text.Json.Nodes.JsonObject, key As String) As String
-            Dim n As System.Text.Json.Nodes.JsonNode = GetNode(obj, key)
-            If n Is Nothing Then Return Nothing
-            If TypeOf n Is System.Text.Json.Nodes.JsonValue Then
-                Try
-                    Return n.GetValue(Of String)()
-                Catch
-                    Return Nothing
-                End Try
+        ''' <summary>Returns the child element at <paramref name="key"/>, or <c>Nothing</c> when absent or null.</summary>
+        Public Function GetProperty(el As JsonElement, key As String) As JsonElement?
+            If el.ValueKind <> JsonValueKind.Object Then Return Nothing
+            Dim child As JsonElement
+            If el.TryGetProperty(key, child) AndAlso child.ValueKind <> JsonValueKind.Null Then
+                Return child
             End If
             Return Nothing
         End Function
 
-        ''' <summary>Reads an integer field, or <c>Nothing</c> when absent or null.</summary>
-        Public Function GetInt(obj As System.Text.Json.Nodes.JsonObject, key As String) As Integer?
-            Dim n As System.Text.Json.Nodes.JsonNode = GetNode(obj, key)
-            If n Is Nothing Then Return Nothing
-            Try
-                If TypeOf n Is System.Text.Json.Nodes.JsonValue Then
-                    Return n.GetValue(Of Integer)()
-                End If
-            Catch
-                Return Nothing
-            End Try
+        ''' <summary>Reads a string field, or <c>Nothing</c> when absent, null, or not a string.</summary>
+        Public Function GetString(el As JsonElement, key As String) As String
+            Dim child As JsonElement
+            If el.ValueKind = JsonValueKind.Object AndAlso el.TryGetProperty(key, child) AndAlso
+               child.ValueKind = JsonValueKind.String Then
+                Return child.GetString()
+            End If
+            Return Nothing
+        End Function
+
+        ''' <summary>Reads an integer field, or <c>Nothing</c> when absent, null, or not an integral number.</summary>
+        Public Function GetInt(el As JsonElement, key As String) As Integer?
+            Dim child As JsonElement
+            Dim value As Integer
+            If el.ValueKind = JsonValueKind.Object AndAlso el.TryGetProperty(key, child) AndAlso
+               child.ValueKind = JsonValueKind.Number AndAlso child.TryGetInt32(value) Then
+                Return value
+            End If
             Return Nothing
         End Function
 
         ''' <summary>Reads a boolean field, or <c>Nothing</c> when absent or null.</summary>
-        Public Function GetBool(obj As System.Text.Json.Nodes.JsonObject, key As String) As Boolean?
-            Dim n As System.Text.Json.Nodes.JsonNode = GetNode(obj, key)
-            If n Is Nothing Then Return Nothing
-            Try
-                If TypeOf n Is System.Text.Json.Nodes.JsonValue Then
-                    Return n.GetValue(Of Boolean)()
-                End If
-            Catch
-                Return Nothing
-            End Try
+        Public Function GetBool(el As JsonElement, key As String) As Boolean?
+            Dim child As JsonElement
+            If el.ValueKind = JsonValueKind.Object AndAlso el.TryGetProperty(key, child) AndAlso
+               (child.ValueKind = JsonValueKind.True OrElse child.ValueKind = JsonValueKind.False) Then
+                Return child.GetBoolean()
+            End If
             Return Nothing
         End Function
 
         ''' <summary>Reads a double field, or <c>Nothing</c> when absent or null.</summary>
-        Public Function GetDouble(obj As System.Text.Json.Nodes.JsonObject, key As String) As Double?
-            Dim n As System.Text.Json.Nodes.JsonNode = GetNode(obj, key)
-            If n Is Nothing Then Return Nothing
-            Try
-                If TypeOf n Is System.Text.Json.Nodes.JsonValue Then
-                    Return n.GetValue(Of Double)()
-                End If
-            Catch
-                Return Nothing
-            End Try
+        Public Function GetDouble(el As JsonElement, key As String) As Double?
+            Dim child As JsonElement
+            Dim value As Double
+            If el.ValueKind = JsonValueKind.Object AndAlso el.TryGetProperty(key, child) AndAlso
+               child.ValueKind = JsonValueKind.Number AndAlso child.TryGetDouble(value) Then
+                Return value
+            End If
             Return Nothing
         End Function
 
@@ -210,22 +199,24 @@ Namespace Serialization
         ''' Parses a <see cref="PaddingStrategy"/> from its serde form (either the string
         ''' <c>"BatchLongest"</c> or <c>{"Fixed": N}</c>).
         ''' </summary>
-        Public Function ParsePaddingStrategy(node As System.Text.Json.Nodes.JsonNode) As PaddingStrategy
-            If node Is Nothing Then
+        Public Function ParsePaddingStrategy(prop As JsonElement?) As PaddingStrategy
+            If Not prop.HasValue OrElse prop.Value.ValueKind = JsonValueKind.Null Then
                 Return PaddingStrategy.BatchLongest
             End If
-            If TypeOf node Is System.Text.Json.Nodes.JsonValue Then
-                Dim s As String = node.GetValue(Of String)()
+            Dim el As JsonElement = prop.Value
+            If el.ValueKind = JsonValueKind.String Then
+                Dim s As String = el.GetString()
                 If String.Equals(s, "BatchLongest", StringComparison.OrdinalIgnoreCase) Then
                     Return PaddingStrategy.BatchLongest
                 End If
                 Throw New ArgumentException($"Unknown PaddingStrategy '{s}'")
             End If
-            Dim obj As System.Text.Json.Nodes.JsonObject = TryCast(node, System.Text.Json.Nodes.JsonObject)
-            If obj IsNot Nothing Then
-                Dim fixedVal As System.Text.Json.Nodes.JsonNode = Nothing
-                If obj.TryGetPropertyValue("Fixed", fixedVal) AndAlso fixedVal IsNot Nothing Then
-                    Return PaddingStrategy.Fixed(fixedVal.GetValue(Of Integer)())
+            If el.ValueKind = JsonValueKind.Object Then
+                Dim fixedVal As JsonElement
+                Dim fixedLength As Integer
+                If el.TryGetProperty("Fixed", fixedVal) AndAlso fixedVal.ValueKind = JsonValueKind.Number AndAlso
+                   fixedVal.TryGetInt32(fixedLength) Then
+                    Return PaddingStrategy.Fixed(fixedLength)
                 End If
             End If
             Throw New ArgumentException("Invalid PaddingStrategy JSON")

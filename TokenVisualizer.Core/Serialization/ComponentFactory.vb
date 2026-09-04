@@ -1,5 +1,5 @@
 Imports System.Linq
-Imports System.Text.Json.Nodes
+Imports System.Text.Json
 Imports Tokenizers.Decoders
 Imports Tokenizers.Internal
 Imports Tokenizers.Models
@@ -11,7 +11,7 @@ Namespace Serialization
 
     ''' <summary>
     ''' The serde-equivalent dispatcher: reconstructs every component (model, normalizer,
-    ''' pre-tokenizer, post-processor, decoder) from a <c>JsonNode</c>. Mirrors the Rust
+    ''' pre-tokenizer, post-processor, decoder) from a <c>JsonElement</c>. Mirrors the Rust
     ''' <c>ModelWrapper</c>/<c>NormalizerWrapper</c>/<c>PreTokenizerWrapper</c>/
     ''' <c>PostProcessorWrapper</c>/<c>DecoderWrapper</c> deserialization, including the tagged
     ''' dispatch on <c>"type"</c> and the legacy untagged probing by required fields.
@@ -32,12 +32,13 @@ Namespace Serialization
         ''' sweep capacity and the max-word-length cache-eligibility limit). <c>Nothing</c> keeps the
         ''' model defaults.
         ''' </summary>
-        Public Shared Function FromModel(node As JsonNode,
+        Public Shared Function FromModel(prop As JsonElement?,
                                          Optional cacheCapacity As Integer? = Nothing,
                                          Optional cacheMaxWord As Integer? = Nothing,
                                          Optional sharedCacheCapacity As Integer? = Nothing) As Object
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
+            If Not prop.HasValue Then Return Nothing
+            Dim obj As JsonElement = prop.Value
+            If obj.ValueKind <> JsonValueKind.Object Then Return Nothing
 
             Dim tag As String = SerializationHelpers.GetString(obj, "type")
             If tag IsNot Nothing Then
@@ -72,12 +73,12 @@ Namespace Serialization
             Return Nothing
         End Function
 
-        Private Shared Function BuildBpe(obj As JsonObject,
+        Private Shared Function BuildBpe(obj As JsonElement,
                                          Optional cacheCapacity As Integer? = Nothing,
                                          Optional cacheMaxWord As Integer? = Nothing,
                                          Optional sharedCacheCapacity As Integer? = Nothing) As BpeModel
-            Dim vocab As Dictionary(Of String, Integer) = ParseVocab(SerializationHelpers.GetNode(obj, "vocab"))
-            Dim merges As List(Of String) = ParseMerges(SerializationHelpers.GetNode(obj, "merges"))
+            Dim vocab As Dictionary(Of String, Integer) = ParseVocab(SerializationHelpers.GetProperty(obj, "vocab"))
+            Dim merges As List(Of String) = ParseMerges(SerializationHelpers.GetProperty(obj, "merges"))
             Dim dropout As Double? = SerializationHelpers.GetDouble(obj, "dropout")
             Dim unk As String = SerializationHelpers.GetString(obj, "unk_token")
             Dim prefix As String = SerializationHelpers.GetString(obj, "continuing_subword_prefix")
@@ -91,8 +92,8 @@ Namespace Serialization
                                 sharedCacheCapacity:=If(sharedCacheCapacity.HasValue, sharedCacheCapacity.Value, Models.BpeModel.SharedCacheCapacity))
         End Function
 
-        Private Shared Function BuildWordPiece(obj As JsonObject) As WordPieceModel
-            Dim vocab As Dictionary(Of String, Integer) = ParseVocab(SerializationHelpers.GetNode(obj, "vocab"))
+        Private Shared Function BuildWordPiece(obj As JsonElement) As WordPieceModel
+            Dim vocab As Dictionary(Of String, Integer) = ParseVocab(SerializationHelpers.GetProperty(obj, "vocab"))
             Dim unk As String = SerializationHelpers.GetString(obj, "unk_token")
             If unk Is Nothing Then unk = "[UNK]"
             Dim prefix As String = SerializationHelpers.GetString(obj, "continuing_subword_prefix")
@@ -101,25 +102,22 @@ Namespace Serialization
             Return New WordPieceModel(vocab, unk, prefix, maxChars)
         End Function
 
-        Private Shared Function BuildWordLevel(obj As JsonObject) As WordLevelModel
-            Dim vocab As Dictionary(Of String, Integer) = ParseVocab(SerializationHelpers.GetNode(obj, "vocab"))
+        Private Shared Function BuildWordLevel(obj As JsonElement) As WordLevelModel
+            Dim vocab As Dictionary(Of String, Integer) = ParseVocab(SerializationHelpers.GetProperty(obj, "vocab"))
             Dim unk As String = SerializationHelpers.GetString(obj, "unk_token")
             If unk Is Nothing Then unk = "<unk>"
             Return New WordLevelModel(vocab, unk)
         End Function
 
-        Private Shared Function BuildUnigram(obj As JsonObject) As UnigramModel
+        Private Shared Function BuildUnigram(obj As JsonElement) As UnigramModel
             Dim vocab As New List(Of (String, Double))()
-            Dim vocabNode As JsonNode = SerializationHelpers.GetNode(obj, "vocab")
-            If vocabNode IsNot Nothing AndAlso TypeOf vocabNode Is JsonArray Then
-                For Each entry As JsonNode In DirectCast(vocabNode, JsonArray)
-                    If entry IsNot Nothing AndAlso TypeOf entry Is JsonArray Then
-                        Dim pair As JsonArray = DirectCast(entry, JsonArray)
-                        If pair.Count >= 2 Then
-                            Dim piece As String = pair(0).GetValue(Of String)()
-                            Dim score As Double = pair(1).GetValue(Of Double)()
-                            vocab.Add((piece, score))
-                        End If
+            Dim vocabNode As JsonElement? = SerializationHelpers.GetProperty(obj, "vocab")
+            If vocabNode.HasValue AndAlso vocabNode.Value.ValueKind = JsonValueKind.Array Then
+                For Each entry As JsonElement In vocabNode.Value.EnumerateArray()
+                    If entry.ValueKind = JsonValueKind.Array AndAlso entry.GetArrayLength() >= 2 Then
+                        Dim piece As String = entry(0).GetString()
+                        Dim score As Double = entry(1).GetDouble()
+                        vocab.Add((piece, score))
                     End If
                 Next
             End If
@@ -133,9 +131,10 @@ Namespace Serialization
         ' ------------------------------------------------------------------
 
         ''' <summary>Reconstructs a normalizer from its JSON node, or <c>Nothing</c> when nothing matches.</summary>
-        Public Shared Function FromNormalizer(node As JsonNode) As INormalizer
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
+        Public Shared Function FromNormalizer(prop As JsonElement?) As INormalizer
+            If Not prop.HasValue Then Return Nothing
+            Dim obj As JsonElement = prop.Value
+            If obj.ValueKind <> JsonValueKind.Object Then Return Nothing
 
             Dim tag As String = SerializationHelpers.GetString(obj, "type")
             If tag IsNot Nothing Then
@@ -198,7 +197,7 @@ Namespace Serialization
             Return Nothing
         End Function
 
-        Private Shared Function BuildBertNormalizer(obj As JsonObject) As BertNormalizer
+        Private Shared Function BuildBertNormalizer(obj As JsonElement) As BertNormalizer
             Dim cleanText As Boolean = SerializationHelpers.GetBool(obj, "clean_text").GetValueOrDefault(True)
             Dim handleChinese As Boolean = SerializationHelpers.GetBool(obj, "handle_chinese_chars").GetValueOrDefault(True)
             Dim stripAccents As Boolean? = SerializationHelpers.GetBool(obj, "strip_accents")
@@ -206,17 +205,13 @@ Namespace Serialization
             Return New BertNormalizer(cleanText, handleChinese, stripAccents, lowercase)
         End Function
 
-        Private Shared Function BuildPrecompiledNormalizer(obj As JsonObject) As PrecompiledNormalizer
-            Dim node As JsonNode = SerializationHelpers.GetNode(obj, "precompiled_charsmap")
+        Private Shared Function BuildPrecompiledNormalizer(obj As JsonElement) As PrecompiledNormalizer
+            Dim node As JsonElement? = SerializationHelpers.GetProperty(obj, "precompiled_charsmap")
             Dim bytes As Byte() = Array.Empty(Of Byte)()
-            If node IsNot Nothing Then
+            If node.HasValue Then
                 Dim s As String = Nothing
-                If TypeOf node Is JsonValue Then
-                    Try
-                        s = node.GetValue(Of String)()
-                    Catch
-                        s = Nothing
-                    End Try
+                If node.Value.ValueKind = JsonValueKind.String Then
+                    s = node.Value.GetString()
                 End If
                 If s IsNot Nothing Then
                     Try
@@ -230,12 +225,12 @@ Namespace Serialization
             Return New PrecompiledNormalizer(bytes)
         End Function
 
-        Private Shared Function BuildReplaceNormalizer(obj As JsonObject) As ReplaceNormalizer
-            Dim patternNode As JsonNode = SerializationHelpers.GetNode(obj, "pattern")
+        Private Shared Function BuildReplaceNormalizer(obj As JsonElement) As ReplaceNormalizer
+            Dim patternNode As JsonElement? = SerializationHelpers.GetProperty(obj, "pattern")
             Dim kind As String = "String"
             Dim pattern As String = ""
-            If patternNode IsNot Nothing AndAlso TypeOf patternNode Is JsonObject Then
-                Dim pObj As JsonObject = DirectCast(patternNode, JsonObject)
+            If patternNode.HasValue AndAlso patternNode.Value.ValueKind = JsonValueKind.Object Then
+                Dim pObj As JsonElement = patternNode.Value
                 If IsPresent(pObj, "Regex") Then
                     kind = "Regex"
                     pattern = SerializationHelpers.GetString(pObj, "Regex")
@@ -248,13 +243,13 @@ Namespace Serialization
             Return New ReplaceNormalizer(kind, pattern, content)
         End Function
 
-        Private Shared Function BuildNormalizerSequence(obj As JsonObject) As NormalizerSequence
-            Dim arrNode As JsonNode = SerializationHelpers.GetNode(obj, "normalizers")
-            If arrNode Is Nothing OrElse TypeOf arrNode IsNot JsonArray Then
+        Private Shared Function BuildNormalizerSequence(obj As JsonElement) As NormalizerSequence
+            Dim arrNode As JsonElement? = SerializationHelpers.GetProperty(obj, "normalizers")
+            If Not arrNode.HasValue OrElse arrNode.Value.ValueKind <> JsonValueKind.Array Then
                 Throw New ArgumentException("missing field `normalizers`")
             End If
             Dim items As New List(Of INormalizer)()
-            For Each item As JsonNode In DirectCast(arrNode, JsonArray)
+            For Each item As JsonElement In arrNode.Value.EnumerateArray()
                 Dim norm As INormalizer = FromNormalizer(item)
                 If norm Is Nothing Then
                     Throw New ArgumentException("data did not match any variant of untagged enum NormalizerUntagged")
@@ -269,9 +264,10 @@ Namespace Serialization
         ' ------------------------------------------------------------------
 
         ''' <summary>Reconstructs a pre-tokenizer from its JSON node, or <c>Nothing</c> when nothing matches.</summary>
-        Public Shared Function FromPreTokenizer(node As JsonNode) As IPreTokenizer
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
+        Public Shared Function FromPreTokenizer(prop As JsonElement?) As IPreTokenizer
+            If Not prop.HasValue Then Return Nothing
+            Dim obj As JsonElement = prop.Value
+            If obj.ValueKind <> JsonValueKind.Object Then Return Nothing
 
             Dim tag As String = SerializationHelpers.GetString(obj, "type")
             If tag IsNot Nothing Then
@@ -334,20 +330,20 @@ Namespace Serialization
             Return Nothing
         End Function
 
-        Private Shared Function BuildByteLevelPreTokenizer(obj As JsonObject) As ByteLevelPreTokenizer
+        Private Shared Function BuildByteLevelPreTokenizer(obj As JsonElement) As ByteLevelPreTokenizer
             Dim addPrefix As Boolean = SerializationHelpers.GetBool(obj, "add_prefix_space").GetValueOrDefault(True)
             Dim trimOffsets As Boolean = SerializationHelpers.GetBool(obj, "trim_offsets").GetValueOrDefault(True)
             Dim useRegex As Boolean = SerializationHelpers.GetBool(obj, "use_regex").GetValueOrDefault(True)
             Return New ByteLevelPreTokenizer(addPrefix, trimOffsets, useRegex)
         End Function
 
-        Private Shared Function ParseDelimiterChar(obj As JsonObject) As Char
+        Private Shared Function ParseDelimiterChar(obj As JsonElement) As Char
             Dim s As String = SerializationHelpers.GetString(obj, "delimiter")
             If String.IsNullOrEmpty(s) Then Throw New ArgumentException("missing field `delimiter`")
             Return s(0)
         End Function
 
-        Private Shared Function BuildMetaspacePreTokenizer(obj As JsonObject) As MetaspacePreTokenizer
+        Private Shared Function BuildMetaspacePreTokenizer(obj As JsonElement) As MetaspacePreTokenizer
             Dim replacement As String = SerializationHelpers.GetString(obj, "replacement")
             If String.IsNullOrEmpty(replacement) Then Throw New ArgumentException("missing field `replacement`")
             Dim scheme As PrependScheme = PrependScheme.Always
@@ -364,13 +360,13 @@ Namespace Serialization
             Return New MetaspacePreTokenizer(replacement(0), scheme, split)
         End Function
 
-        Private Shared Function ParseBehavior(obj As JsonObject) As SplitDelimiterBehavior
+        Private Shared Function ParseBehavior(obj As JsonElement) As SplitDelimiterBehavior
             Dim s As String = SerializationHelpers.GetString(obj, "behavior")
             If s Is Nothing Then Throw New ArgumentException("missing field `behavior`")
             Return SerializationHelpers.ParseSplitDelimiterBehavior(s)
         End Function
 
-        Private Shared Function TryParseBehavior(obj As JsonObject) As SplitDelimiterBehavior?
+        Private Shared Function TryParseBehavior(obj As JsonElement) As SplitDelimiterBehavior?
             Dim s As String = SerializationHelpers.GetString(obj, "behavior")
             If s Is Nothing Then Return Nothing
             Try
@@ -380,13 +376,13 @@ Namespace Serialization
             End Try
         End Function
 
-        Private Shared Function BuildPreTokenizerSequence(obj As JsonObject) As PreTokenizerSequence
-            Dim arrNode As JsonNode = SerializationHelpers.GetNode(obj, "pretokenizers")
-            If arrNode Is Nothing OrElse TypeOf arrNode IsNot JsonArray Then
+        Private Shared Function BuildPreTokenizerSequence(obj As JsonElement) As PreTokenizerSequence
+            Dim arrNode As JsonElement? = SerializationHelpers.GetProperty(obj, "pretokenizers")
+            If Not arrNode.HasValue OrElse arrNode.Value.ValueKind <> JsonValueKind.Array Then
                 Throw New ArgumentException("missing field `pretokenizers`")
             End If
             Dim items As New List(Of IPreTokenizer)()
-            For Each item As JsonNode In DirectCast(arrNode, JsonArray)
+            For Each item As JsonElement In arrNode.Value.EnumerateArray()
                 Dim pt As IPreTokenizer = FromPreTokenizer(item)
                 If pt Is Nothing Then
                     Throw New ArgumentException("data did not match any variant of untagged enum PreTokenizerUntagged")
@@ -396,12 +392,12 @@ Namespace Serialization
             Return New PreTokenizerSequence(items)
         End Function
 
-        Private Shared Function BuildSplitPreTokenizer(obj As JsonObject) As SplitPreTokenizer
-            Dim patternNode As JsonNode = SerializationHelpers.GetNode(obj, "pattern")
+        Private Shared Function BuildSplitPreTokenizer(obj As JsonElement) As SplitPreTokenizer
+            Dim patternNode As JsonElement? = SerializationHelpers.GetProperty(obj, "pattern")
             Dim kind As String = "String"
             Dim pattern As String = ""
-            If patternNode IsNot Nothing AndAlso TypeOf patternNode Is JsonObject Then
-                Dim pObj As JsonObject = DirectCast(patternNode, JsonObject)
+            If patternNode.HasValue AndAlso patternNode.Value.ValueKind = JsonValueKind.Object Then
+                Dim pObj As JsonElement = patternNode.Value
                 If IsPresent(pObj, "Regex") Then
                     kind = "Regex"
                     pattern = SerializationHelpers.GetString(pObj, "Regex")
@@ -421,9 +417,10 @@ Namespace Serialization
         ' ------------------------------------------------------------------
 
         ''' <summary>Reconstructs a post-processor from its JSON node, or <c>Nothing</c> when nothing matches.</summary>
-        Public Shared Function FromPostProcessor(node As JsonNode) As IPostProcessor
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
+        Public Shared Function FromPostProcessor(prop As JsonElement?) As IPostProcessor
+            If Not prop.HasValue Then Return Nothing
+            Dim obj As JsonElement = prop.Value
+            If obj.ValueKind <> JsonValueKind.Object Then Return Nothing
 
             Dim tag As String = SerializationHelpers.GetString(obj, "type")
             If tag IsNot Nothing Then
@@ -463,21 +460,21 @@ Namespace Serialization
             Return Nothing
         End Function
 
-        Private Shared Function ParseTokenPair(obj As JsonObject, key As String) As (String, Integer)
-            Dim node As JsonNode = SerializationHelpers.GetNode(obj, key)
-            If node Is Nothing OrElse TypeOf node IsNot JsonArray Then Throw New ArgumentException($"missing field `{key}`")
-            Dim arr As JsonArray = DirectCast(node, JsonArray)
-            If arr.Count < 2 Then Throw New ArgumentException($"invalid `{key}`")
-            Return (arr(0).GetValue(Of String)(), arr(1).GetValue(Of Integer)())
+        Private Shared Function ParseTokenPair(obj As JsonElement, key As String) As (String, Integer)
+            Dim node As JsonElement? = SerializationHelpers.GetProperty(obj, key)
+            If Not node.HasValue OrElse node.Value.ValueKind <> JsonValueKind.Array Then Throw New ArgumentException($"missing field `{key}`")
+            Dim arr As JsonElement = node.Value
+            If arr.GetArrayLength() < 2 Then Throw New ArgumentException($"invalid `{key}`")
+            Return (arr(0).GetString(), arr(1).GetInt32())
         End Function
 
-        Private Shared Function BuildBertProcessing(obj As JsonObject) As BertProcessing
+        Private Shared Function BuildBertProcessing(obj As JsonElement) As BertProcessing
             Dim sep As (String, Integer) = ParseTokenPair(obj, "sep")
             Dim cls As (String, Integer) = ParseTokenPair(obj, "cls")
             Return New BertProcessing(sep, cls)
         End Function
 
-        Private Shared Function BuildRobertaProcessing(obj As JsonObject) As RobertaProcessing
+        Private Shared Function BuildRobertaProcessing(obj As JsonElement) As RobertaProcessing
             Dim sep As (String, Integer) = ParseTokenPair(obj, "sep")
             Dim cls As (String, Integer) = ParseTokenPair(obj, "cls")
             Dim trimOffsets As Boolean = SerializationHelpers.GetBool(obj, "trim_offsets").GetValueOrDefault(True)
@@ -485,20 +482,20 @@ Namespace Serialization
             Return New RobertaProcessing(sep, cls, trimOffsets, addPrefix)
         End Function
 
-        Private Shared Function BuildByteLevelProcessing(obj As JsonObject) As ByteLevelProcessing
+        Private Shared Function BuildByteLevelProcessing(obj As JsonElement) As ByteLevelProcessing
             Dim addPrefix As Boolean = SerializationHelpers.GetBool(obj, "add_prefix_space").GetValueOrDefault(True)
             Dim trimOffsets As Boolean = SerializationHelpers.GetBool(obj, "trim_offsets").GetValueOrDefault(True)
             Dim useRegex As Boolean = SerializationHelpers.GetBool(obj, "use_regex").GetValueOrDefault(True)
             Return New ByteLevelProcessing(addPrefix, trimOffsets, useRegex)
         End Function
 
-        Private Shared Function BuildProcessorSequence(obj As JsonObject) As ProcessorSequence
-            Dim arrNode As JsonNode = SerializationHelpers.GetNode(obj, "processors")
-            If arrNode Is Nothing OrElse TypeOf arrNode IsNot JsonArray Then
+        Private Shared Function BuildProcessorSequence(obj As JsonElement) As ProcessorSequence
+            Dim arrNode As JsonElement? = SerializationHelpers.GetProperty(obj, "processors")
+            If Not arrNode.HasValue OrElse arrNode.Value.ValueKind <> JsonValueKind.Array Then
                 Throw New ArgumentException("missing field `processors`")
             End If
             Dim items As New List(Of IPostProcessor)()
-            For Each item As JsonNode In DirectCast(arrNode, JsonArray)
+            For Each item As JsonElement In arrNode.Value.EnumerateArray()
                 Dim pp As IPostProcessor = FromPostProcessor(item)
                 If pp Is Nothing Then
                     Throw New ArgumentException("data did not match any variant of untagged enum PostProcessorWrapper")
@@ -508,56 +505,61 @@ Namespace Serialization
             Return New ProcessorSequence(items)
         End Function
 
-        Private Shared Function BuildTemplateProcessing(obj As JsonObject) As TemplateProcessing
-            Dim singleStr As String = TemplateToString(SerializationHelpers.GetNode(obj, "single"))
-            Dim pairStr As String = TemplateToString(SerializationHelpers.GetNode(obj, "pair"))
+        Private Shared Function BuildTemplateProcessing(obj As JsonElement) As TemplateProcessing
+            Dim singleStr As String = TemplateToString(SerializationHelpers.GetProperty(obj, "single"))
+            Dim pairStr As String = TemplateToString(SerializationHelpers.GetProperty(obj, "pair"))
 
             Dim special As New Dictionary(Of String, (List(Of Integer), List(Of String)))()
-            Dim specialNode As JsonNode = SerializationHelpers.GetNode(obj, "special_tokens")
-            If specialNode IsNot Nothing AndAlso TypeOf specialNode Is JsonObject Then
-                Dim sObj As JsonObject = DirectCast(specialNode, JsonObject)
-                For Each kv As KeyValuePair(Of String, JsonNode) In sObj
-                    Dim entry As JsonObject = TryCast(kv.Value, JsonObject)
-                    If entry Is Nothing Then Continue For
+            Dim specialNode As JsonElement? = SerializationHelpers.GetProperty(obj, "special_tokens")
+            If specialNode.HasValue AndAlso specialNode.Value.ValueKind = JsonValueKind.Object Then
+                Dim sObj As JsonElement = specialNode.Value
+                For Each kv As JsonProperty In sObj.EnumerateObject()
+                    Dim entry As JsonElement = kv.Value
+                    If entry.ValueKind <> JsonValueKind.Object Then Continue For
                     Dim ids As New List(Of Integer)()
-                    Dim idsNode As JsonNode = SerializationHelpers.GetNode(entry, "ids")
-                    If idsNode IsNot Nothing AndAlso TypeOf idsNode Is JsonArray Then
-                        For Each idNode As JsonNode In DirectCast(idsNode, JsonArray)
-                            ids.Add(idNode.GetValue(Of Integer)())
+                    Dim idsNode As JsonElement? = SerializationHelpers.GetProperty(entry, "ids")
+                    If idsNode.HasValue AndAlso idsNode.Value.ValueKind = JsonValueKind.Array Then
+                        For Each idNode As JsonElement In idsNode.Value.EnumerateArray()
+                            ids.Add(idNode.GetInt32())
                         Next
                     End If
                     Dim tokens As New List(Of String)()
-                    Dim tokensNode As JsonNode = SerializationHelpers.GetNode(entry, "tokens")
-                    If tokensNode IsNot Nothing AndAlso TypeOf tokensNode Is JsonArray Then
-                        For Each tNode As JsonNode In DirectCast(tokensNode, JsonArray)
-                            tokens.Add(tNode.GetValue(Of String)())
+                    Dim tokensNode As JsonElement? = SerializationHelpers.GetProperty(entry, "tokens")
+                    If tokensNode.HasValue AndAlso tokensNode.Value.ValueKind = JsonValueKind.Array Then
+                        For Each tNode As JsonElement In tokensNode.Value.EnumerateArray()
+                            tokens.Add(tNode.GetString())
                         Next
                     End If
-                    special(kv.Key) = (ids, tokens)
+                    special(kv.Name) = (ids, tokens)
                 Next
             End If
             Return New TemplateProcessing(singleStr, pairStr, special)
         End Function
 
         ''' <summary>Reconstructs a template string ("$A [SEP] $B:1 ...") from its JSON piece array.</summary>
-        Private Shared Function TemplateToString(node As JsonNode) As String
-            If node Is Nothing OrElse TypeOf node IsNot JsonArray Then
+        Private Shared Function TemplateToString(prop As JsonElement?) As String
+            If Not prop.HasValue OrElse prop.Value.ValueKind <> JsonValueKind.Array Then
                 Throw New ArgumentException("missing field `template`")
             End If
             Dim parts As New List(Of String)()
-            For Each piece As JsonNode In DirectCast(node, JsonArray)
-                Dim pObj As JsonObject = TryCast(piece, JsonObject)
-                If pObj Is Nothing Then Continue For
-                If IsPresent(pObj, "Sequence") Then
-                    Dim seq As JsonObject = TryCast(SerializationHelpers.GetNode(pObj, "Sequence"), JsonObject)
-                    Dim id As String = SerializationHelpers.GetString(seq, "id")
-                    Dim typeId As Integer = SerializationHelpers.GetInt(seq, "type_id").GetValueOrDefault(0)
-                    parts.Add(If(typeId = 0, "$" & id, "$" & id & ":" & typeId))
-                ElseIf IsPresent(pObj, "SpecialToken") Then
-                    Dim sp As JsonObject = TryCast(SerializationHelpers.GetNode(pObj, "SpecialToken"), JsonObject)
-                    Dim id As String = SerializationHelpers.GetString(sp, "id")
-                    Dim typeId As Integer = SerializationHelpers.GetInt(sp, "type_id").GetValueOrDefault(0)
-                    parts.Add(If(typeId = 0, id, id & ":" & typeId))
+            For Each piece As JsonElement In prop.Value.EnumerateArray()
+                If piece.ValueKind <> JsonValueKind.Object Then Continue For
+                If IsPresent(piece, "Sequence") Then
+                    Dim seqNode As JsonElement? = SerializationHelpers.GetProperty(piece, "Sequence")
+                    If seqNode.HasValue AndAlso seqNode.Value.ValueKind = JsonValueKind.Object Then
+                        Dim seq As JsonElement = seqNode.Value
+                        Dim id As String = SerializationHelpers.GetString(seq, "id")
+                        Dim typeId As Integer = SerializationHelpers.GetInt(seq, "type_id").GetValueOrDefault(0)
+                        parts.Add(If(typeId = 0, "$" & id, "$" & id & ":" & typeId))
+                    End If
+                ElseIf IsPresent(piece, "SpecialToken") Then
+                    Dim spNode As JsonElement? = SerializationHelpers.GetProperty(piece, "SpecialToken")
+                    If spNode.HasValue AndAlso spNode.Value.ValueKind = JsonValueKind.Object Then
+                        Dim sp As JsonElement = spNode.Value
+                        Dim id As String = SerializationHelpers.GetString(sp, "id")
+                        Dim typeId As Integer = SerializationHelpers.GetInt(sp, "type_id").GetValueOrDefault(0)
+                        parts.Add(If(typeId = 0, id, id & ":" & typeId))
+                    End If
                 End If
             Next
             Return String.Join(" ", parts)
@@ -568,9 +570,10 @@ Namespace Serialization
         ' ------------------------------------------------------------------
 
         ''' <summary>Reconstructs a decoder from its JSON node, or <c>Nothing</c> when nothing matches.</summary>
-        Public Shared Function FromDecoder(node As JsonNode) As IDecoder
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return Nothing
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
+        Public Shared Function FromDecoder(prop As JsonElement?) As IDecoder
+            If Not prop.HasValue Then Return Nothing
+            Dim obj As JsonElement = prop.Value
+            If obj.ValueKind <> JsonValueKind.Object Then Return Nothing
 
             Dim tag As String = SerializationHelpers.GetString(obj, "type")
             If tag IsNot Nothing Then
@@ -638,14 +641,14 @@ Namespace Serialization
             Return Nothing
         End Function
 
-        Private Shared Function BuildByteLevelDecoder(obj As JsonObject) As ByteLevelDecoder
+        Private Shared Function BuildByteLevelDecoder(obj As JsonElement) As ByteLevelDecoder
             Dim addPrefix As Boolean = SerializationHelpers.GetBool(obj, "add_prefix_space").GetValueOrDefault(True)
             Dim trimOffsets As Boolean = SerializationHelpers.GetBool(obj, "trim_offsets").GetValueOrDefault(True)
             Dim useRegex As Boolean = SerializationHelpers.GetBool(obj, "use_regex").GetValueOrDefault(True)
             Return New ByteLevelDecoder(addPrefix, trimOffsets, useRegex)
         End Function
 
-        Private Shared Function BuildMetaspaceDecoder(obj As JsonObject) As MetaspaceDecoder
+        Private Shared Function BuildMetaspaceDecoder(obj As JsonElement) As MetaspaceDecoder
             Dim replacement As String = SerializationHelpers.GetString(obj, "replacement")
             If String.IsNullOrEmpty(replacement) Then Throw New ArgumentException("missing field `replacement`")
             Dim scheme As PrependScheme = PrependScheme.Always
@@ -662,13 +665,13 @@ Namespace Serialization
             Return New MetaspaceDecoder(replacement(0), scheme, split)
         End Function
 
-        Private Shared Function BuildDecoderSequence(obj As JsonObject) As DecoderSequence
-            Dim arrNode As JsonNode = SerializationHelpers.GetNode(obj, "decoders")
-            If arrNode Is Nothing OrElse TypeOf arrNode IsNot JsonArray Then
+        Private Shared Function BuildDecoderSequence(obj As JsonElement) As DecoderSequence
+            Dim arrNode As JsonElement? = SerializationHelpers.GetProperty(obj, "decoders")
+            If Not arrNode.HasValue OrElse arrNode.Value.ValueKind <> JsonValueKind.Array Then
                 Throw New ArgumentException("missing field `decoders`")
             End If
             Dim items As New List(Of IDecoder)()
-            For Each item As JsonNode In DirectCast(arrNode, JsonArray)
+            For Each item As JsonElement In arrNode.Value.EnumerateArray()
                 Dim dec As IDecoder = FromDecoder(item)
                 If dec Is Nothing Then
                     Throw New ArgumentException("data did not match any variant of untagged enum DecoderUntagged")
@@ -678,12 +681,12 @@ Namespace Serialization
             Return New DecoderSequence(items)
         End Function
 
-        Private Shared Function BuildReplaceDecoder(obj As JsonObject) As ReplaceDecoder
-            Dim patternNode As JsonNode = SerializationHelpers.GetNode(obj, "pattern")
+        Private Shared Function BuildReplaceDecoder(obj As JsonElement) As ReplaceDecoder
+            Dim patternNode As JsonElement? = SerializationHelpers.GetProperty(obj, "pattern")
             Dim kind As String = "String"
             Dim pattern As String = ""
-            If patternNode IsNot Nothing AndAlso TypeOf patternNode Is JsonObject Then
-                Dim pObj As JsonObject = DirectCast(patternNode, JsonObject)
+            If patternNode.HasValue AndAlso patternNode.Value.ValueKind = JsonValueKind.Object Then
+                Dim pObj As JsonElement = patternNode.Value
                 If IsPresent(pObj, "Regex") Then
                     kind = "Regex"
                     pattern = SerializationHelpers.GetString(pObj, "Regex")
@@ -696,7 +699,7 @@ Namespace Serialization
             Return New ReplaceDecoder(kind, pattern, content)
         End Function
 
-        Private Shared Function ParseCharContent(obj As JsonObject) As Char
+        Private Shared Function ParseCharContent(obj As JsonElement) As Char
             Dim s As String = SerializationHelpers.GetString(obj, "content")
             If String.IsNullOrEmpty(s) Then Return " "c
             Return s(0)
@@ -706,31 +709,29 @@ Namespace Serialization
         ' Helpers
         ' ------------------------------------------------------------------
 
-        Private Shared Function IsPresent(obj As JsonObject, key As String) As Boolean
-            Dim n As JsonNode = Nothing
-            Return obj IsNot Nothing AndAlso obj.TryGetPropertyValue(key, n) AndAlso n IsNot Nothing
+        Private Shared Function IsPresent(obj As JsonElement, key As String) As Boolean
+            Dim n As JsonElement
+            Return obj.ValueKind = JsonValueKind.Object AndAlso obj.TryGetProperty(key, n) AndAlso n.ValueKind <> JsonValueKind.Null
         End Function
 
         ''' <summary>Parses a vocab object (token string to id).</summary>
-        Public Shared Function ParseVocab(node As JsonNode) As Dictionary(Of String, Integer)
+        Public Shared Function ParseVocab(prop As JsonElement?) As Dictionary(Of String, Integer)
             Dim result As New Dictionary(Of String, Integer)()
-            If node Is Nothing OrElse TypeOf node IsNot JsonObject Then Return result
-            Dim obj As JsonObject = DirectCast(node, JsonObject)
-            For Each kv As KeyValuePair(Of String, JsonNode) In obj
+            If Not prop.HasValue Then Return result
+            Dim obj As JsonElement = prop.Value
+            If obj.ValueKind <> JsonValueKind.Object Then Return result
+            For Each kv As JsonProperty In obj.EnumerateObject()
                 Dim id As Integer
-                If kv.Value IsNot Nothing AndAlso TypeOf kv.Value Is JsonValue Then
-                    Try
-                        id = kv.Value.GetValue(Of Integer)()
-                        result(kv.Key) = id
+                If kv.Value.ValueKind = JsonValueKind.Number Then
+                    If kv.Value.TryGetInt32(id) Then
+                        result(kv.Name) = id
                         Continue For
-                    Catch
-                    End Try
-                    Try
-                        Dim l As Long = kv.Value.GetValue(Of Long)()
-                        result(kv.Key) = CInt(l)
+                    End If
+                    Dim l As Long
+                    If kv.Value.TryGetInt64(l) Then
+                        result(kv.Name) = CInt(l)
                         Continue For
-                    Catch
-                    End Try
+                    End If
                 End If
             Next
             Return result
@@ -740,18 +741,18 @@ Namespace Serialization
         ''' Parses a merges array, accepting both space-joined strings (<c>["a b", ...]</c>) and
         ''' nested arrays (<c>[["a","b"], ...]</c>).
         ''' </summary>
-        Public Shared Function ParseMerges(node As JsonNode) As List(Of String)
+        Public Shared Function ParseMerges(prop As JsonElement?) As List(Of String)
             Dim result As New List(Of String)()
-            If node Is Nothing OrElse TypeOf node IsNot JsonArray Then Return result
-            For Each item As JsonNode In DirectCast(node, JsonArray)
-                If item Is Nothing Then Continue For
-                If TypeOf item Is JsonArray Then
-                    Dim pair As JsonArray = DirectCast(item, JsonArray)
-                    If pair.Count >= 2 Then
-                        result.Add(pair(0).GetValue(Of String)() & " " & pair(1).GetValue(Of String)())
+            If Not prop.HasValue Then Return result
+            Dim arr As JsonElement = prop.Value
+            If arr.ValueKind <> JsonValueKind.Array Then Return result
+            For Each item As JsonElement In arr.EnumerateArray()
+                If item.ValueKind = JsonValueKind.Array Then
+                    If item.GetArrayLength() >= 2 Then
+                        result.Add(item(0).GetString() & " " & item(1).GetString())
                     End If
-                ElseIf TypeOf item Is JsonValue Then
-                    result.Add(item.GetValue(Of String)())
+                ElseIf item.ValueKind = JsonValueKind.String Then
+                    result.Add(item.GetString())
                 End If
             Next
             Return result
