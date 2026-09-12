@@ -60,7 +60,7 @@
             <!-- 关于 -->
             <ui:FASettingsExpander Header="关于" Description="项目主页与版权" IconSource="Link">
                 <StackPanel Spacing="8">
-                    <TextBlock Text="TokenFolderView · 版本 1.1.0" FontSize="16" FontWeight="SemiBold"/>
+                    <TextBlock Text="TokenFolderView · 版本 1.2.0" FontSize="16" FontWeight="SemiBold"/>
                     <Button x:Name="BtnHomepage"
                             Content="https://github.com/Nukepayload2/TokenFolderView/"
                             HorizontalAlignment="Left"

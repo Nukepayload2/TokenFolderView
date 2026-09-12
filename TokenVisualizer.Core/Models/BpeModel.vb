@@ -367,16 +367,14 @@ Namespace Models
         ''' disabled (capacity &lt;= 0). Statistics never change cache behavior or tokenization.
         ''' </summary>
         Public Sub EnableCacheStats()
-            If _cache IsNot Nothing Then
-                _cache.Value.EnableStats()
-            End If
+            Dim cache As Cache(Of String, CacheValue) = ResolveWordCache()
+            If cache IsNot Nothing Then cache.EnableStats()
         End Sub
 
         ''' <summary>Zeros the current thread's cache statistics counters.</summary>
         Public Sub ResetCacheStats()
-            If _cache IsNot Nothing Then
-                _cache.Value.ResetStats()
-            End If
+            Dim cache As Cache(Of String, CacheValue) = ResolveWordCache()
+            If cache IsNot Nothing Then cache.ResetStats()
         End Sub
 
         ''' <summary>
@@ -385,17 +383,20 @@ Namespace Models
         ''' this reflects only the calling thread's activity (the benchmark is single-threaded).
         ''' </summary>
         Public Function GetCacheStats() As CacheStats
-            If _cache Is Nothing Then Return New CacheStats()
-            Return _cache.Value.GetStats()
+            Dim cache As Cache(Of String, CacheValue) = ResolveWordCache()
+            If cache Is Nothing Then Return New CacheStats()
+            Return cache.GetStats()
         End Function
 
         ''' <summary>
         ''' Drops the per-thread L1 word caches, freeing their memory on a client while preserving
-        ''' the shared L2 (the cross-scan warmth layer). MUST be called only when no
-        ''' <c>EncodeCount</c>/<c>CountTokens</c> is in flight (e.g. after a scan's workers all
-        ''' finish, or on idle) — disposing a <see cref="ThreadLocal"/> racing another thread's
-        ''' <c>Value</c> access is unsafe. Each thread lazily re-creates its L1 on the next access
-        ''' and re-warms from L2 via the lookaside path.
+        ''' the shared L2 (the cross-scan warmth layer). Callers should still prefer to call it when
+        ''' no <c>EncodeCount</c>/<c>CountTokens</c> is in flight (e.g. after a scan's workers all
+        ''' finish, or on idle), but a concurrent reader is now safe: disposing this instance clears
+        ''' the other live threads' slots, and such a reader resolves the replacement instance
+        ''' through <see cref="ResolveWordCache"/> (or falls back to its cache-less path) instead of
+        ''' throwing <see cref="ObjectDisposedException"/>. Each thread lazily re-creates its L1 on
+        ''' the next access and re-warms from L2 via the lookaside path.
         ''' </summary>
         ''' <param name="dropShared">When <c>True</c>, also clears the shared L2, freeing its memory
         ''' too (a fully-idle client).</param>
@@ -413,6 +414,52 @@ Namespace Models
                 Next
             End If
         End Sub
+
+        ''' <summary>
+        ''' Maximum attempts <see cref="ResolveWordCache"/> makes before giving up and letting the
+        ''' caller take its cache-less path.
+        ''' </summary>
+        Private Const WordCacheResolveAttempts As Integer = 4
+
+        ''' <summary>
+        ''' Resolves the calling thread's L1 word cache, tolerating a concurrent
+        ''' <see cref="CompactWordCache"/>.
+        '''
+        ''' <see cref="CompactWordCache"/> disposes the whole <see cref="ThreadLocal(Of T)"/> instance
+        ''' and immediately installs a replacement, and <c>Dispose</c> actively clears the slots of the
+        ''' other LIVE threads, so a reader that read the old instance just before the swap
+        ''' deterministically gets an <see cref="ObjectDisposedException"/> out of <c>.Value</c>
+        ''' (measured: 1000/1000 for each of three forced interleavings; of 84.9 M natural-race reads,
+        ''' the 4 M after the dispose flag were 100% ODE — never a silent stale value, and never a
+        ''' re-created value). A rarer slot-clear race makes <c>.Value</c> return <c>Nothing</c>
+        ''' instead (23 hits in 68.09 M reads under 16 readers x 8000 compactions), which the callers
+        ''' would then dereference. Both cases are handled alike here: treat the attempt as "my
+        ''' instance was swapped out", yield briefly (never <c>Sleep</c> — this is a per-word hot
+        ''' path) and retry with a FRESH READ OF THE FIELD, so the retry lands on the replacement
+        ''' instance and lazily re-creates this thread's L1.
+        '''
+        ''' Exhausting the attempts returns <c>Nothing</c>; the caller then takes its cache-less path
+        ''' (no lookup, no insert, no skip). A retry therefore can never change a result — it only
+        ''' decides whether the cache is consulted, so such a word is simply merged the slow way.
+        ''' </summary>
+        ''' <returns>The calling thread's L1 cache, or <c>Nothing</c> when caching is disabled or no
+        ''' attempt found a usable instance.</returns>
+        Private Function ResolveWordCache() As Cache(Of String, CacheValue)
+            For attempt As Integer = 1 To WordCacheResolveAttempts
+                ' Re-read the field on every attempt: the instance seen last time may have been
+                ' disposed and replaced in between, and only the replacement is usable.
+                Dim threadLocal As ThreadLocal(Of Cache(Of String, CacheValue)) = _cache
+                If threadLocal Is Nothing Then Return Nothing
+                Try
+                    Dim cache As Cache(Of String, CacheValue) = threadLocal.Value
+                    If cache IsNot Nothing Then Return cache
+                Catch ex As ObjectDisposedException
+                    ' Swapped out between the field read and this access; retry below.
+                End Try
+                Thread.Yield()
+            Next
+            Return Nothing
+        End Function
 
         ''' <summary>Maps a token to its vocabulary id, or <c>Nothing</c> if absent.</summary>
         Public Function TokenToId(token As String) As Integer? Implements IModel.TokenToId
@@ -518,15 +565,20 @@ Namespace Models
             Dim symbols As List(Of (Integer, Integer)) = Nothing
 
             Dim useCache As Boolean = (_cache IsNot Nothing) AndAlso (Not _dropout.HasValue OrElse _dropout.Value = 0.0)
+            Dim wordCache As Cache(Of String, CacheValue) = Nothing
             If useCache Then
-                Dim cache As Cache(Of String, CacheValue) = _cache.Value
-                If _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
+                ' Resolve the L1 once per word and use the SAME instance for the hit lookup and the
+                ' miss insert: resolving twice could land the insert in the replacement instance
+                ' while the lookup saw the old one. Nothing = caching was disabled or the L1 was
+                ' being compacted away (see ResolveWordCache) → the cache-less path below.
+                wordCache = ResolveWordCache()
+                If wordCache IsNot Nothing AndAlso _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
                     ' Words longer than the cache-eligibility limit bypass the cache entirely:
                     ' no lookup, no insert, but still merged normally so the result is identical.
-                    cache.RecordSkip()
+                    wordCache.RecordSkip()
                     symbols = MergeWord(word)
-                Else
-                    Dim cv As CacheValue = cache.GetValue(word)
+                ElseIf wordCache IsNot Nothing Then
+                    Dim cv As CacheValue = wordCache.GetValue(word)
                     If cv.Count > 0 Then
                         ' Cache hit.
                         If cv.Count = 1 Then
@@ -545,12 +597,14 @@ Namespace Models
 
             If symbols Is Nothing Then
                 symbols = MergeWord(word)
-                If useCache Then
-                    Dim cache As Cache(Of String, CacheValue) = _cache.Value
+                If wordCache IsNot Nothing Then
+                    ' Insert into the very instance the lookup above used (or the replacement, on a
+                    ' first miss): resolvable only when caching is on and the L1 was not compacted
+                    ' away underneath this call.
                     If symbols.Count = 1 Then
-                        cache.Insert(word, New CacheValue(1, symbols(0), Nothing))
+                        wordCache.Insert(word, New CacheValue(1, symbols(0), Nothing))
                     ElseIf symbols.Count > 1 Then
-                        cache.Insert(word, New CacheValue(symbols.Count, Nothing, symbols))
+                        wordCache.Insert(word, New CacheValue(symbols.Count, Nothing, symbols))
                     End If
                     ' symbols.Count = 0 (every scalar silently omitted, no unk/byteFallback):
                     ' not cached; GetValue would read Count = 0 as a miss and re-merge, which is
@@ -598,15 +652,19 @@ Namespace Models
             Dim symbols As List(Of (Integer, Integer)) = Nothing
 
             Dim useCache As Boolean = (_cache IsNot Nothing) AndAlso (Not _dropout.HasValue OrElse _dropout.Value = 0.0)
+            Dim wordCache As Cache(Of String, CacheValue) = Nothing
             If useCache Then
-                Dim cache As Cache(Of String, CacheValue) = _cache.Value
-                If _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
+                ' Resolve the L1 once per word and use the SAME instance for the hit lookup and the
+                ' miss insert (see ResolveWordCache); Nothing = the cache is disabled or was being
+                ' compacted away, and the cache-less path below runs instead.
+                wordCache = ResolveWordCache()
+                If wordCache IsNot Nothing AndAlso _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
                     ' Words longer than the cache-eligibility limit bypass the cache entirely:
                     ' no lookup, no insert, but still merged normally (identical result).
-                    cache.RecordSkip()
+                    wordCache.RecordSkip()
                     symbols = MergeWord(word, _symbolScratch.Value)
-                Else
-                    Dim cv As CacheValue = cache.GetValue(word)
+                ElseIf wordCache IsNot Nothing Then
+                    Dim cv As CacheValue = wordCache.GetValue(word)
                     If cv.Count > 0 Then
                         ' Cache hit: the cached value carries the merged symbol count directly,
                         ' so the count is O(1) and needs no List(Of (Integer,Integer)) dereference
@@ -618,12 +676,12 @@ Namespace Models
 
             If symbols Is Nothing Then
                 symbols = MergeWord(word, _symbolScratch.Value)
-                If useCache Then
-                    Dim cache As Cache(Of String, CacheValue) = _cache.Value
+                If wordCache IsNot Nothing Then
+                    ' Insert into the very instance the lookup above used.
                     If symbols.Count = 1 Then
-                        cache.Insert(word, New CacheValue(1, symbols(0), Nothing))
+                        wordCache.Insert(word, New CacheValue(1, symbols(0), Nothing))
                     ElseIf symbols.Count > 1 Then
-                        cache.Insert(word, New CacheValue(symbols.Count, Nothing, symbols))
+                        wordCache.Insert(word, New CacheValue(symbols.Count, Nothing, symbols))
                     End If
                 End If
             End If
@@ -651,67 +709,73 @@ Namespace Models
             If _ignoreMerges Then Return CountTokens(word.ToString())
             Dim useCache As Boolean = (_cache IsNot Nothing) AndAlso (Not _dropout.HasValue OrElse _dropout.Value = 0.0)
             If useCache Then
-                Dim cache As Cache(Of String, CacheValue) = _cache.Value
-                If _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
-                    ' Words longer than the cache-eligibility limit bypass the cache entirely:
-                    ' record a skip and merge normally (identical result, no insert), exactly like
-                    ' CountTokens' max-word-length branch.
-                    cache.RecordSkip()
-                    Return MergeWord(word.ToString(), _symbolScratch.Value).Count
-                End If
-                Dim cv As CacheValue = cache.GetValueMemory(word)
-                If cv.Count > 0 Then
-                    ' Cache hit via memory alternate lookup: zero String allocation (M9 target).
-                    Return cv.Count
-                End If
-                ' L1 miss: consult the shared L2 before merging. A word already merged by any
-                ' other worker / earlier scan hits here (locked read), so the expensive BPE merge
-                ' runs once globally, not once per thread that sees the word. The L2 is lock-striped:
-                ' the shard comes from the word's hash (the String form and memory form hash
-                ' identically — see StringMemoryAlternateComparer — so the later insert lands on the
-                ' same shard) and only that shard's lock is taken, so workers hashing to different
-                ' shards never contend. An L2 hit inserts into this thread's L1 so subsequent
-                ' lookups stay lock-free.
-                If _sharedCaches IsNot Nothing Then
-                    Dim shard As Integer = String.GetHashCode(word.Span) And _sharedShardMask
-                    Dim sharedValue As CacheValue
-                    SyncLock _sharedLocks(shard)
-                        sharedValue = _sharedCaches(shard).GetValueMemory(word)
-                    End SyncLock
-                    If sharedValue.Count > 0 Then
-                        cache.Insert(word.ToString(), sharedValue)
-                        Return sharedValue.Count
+                ' Resolve the L1 once and use the SAME instance for every lookup and insert below
+                ' (see ResolveWordCache); Nothing = caching is disabled, or the L1 was compacted
+                ' away underneath this call, and the cache-less tail below runs instead.
+                Dim cache As Cache(Of String, CacheValue) = ResolveWordCache()
+                If cache IsNot Nothing Then
+                    If _maxWordLength.HasValue AndAlso word.Length > _maxWordLength.Value Then
+                        ' Words longer than the cache-eligibility limit bypass the cache entirely:
+                        ' record a skip and merge normally (identical result, no insert), exactly like
+                        ' CountTokens' max-word-length branch.
+                        cache.RecordSkip()
+                        Return MergeWord(word.ToString(), _symbolScratch.Value).Count
                     End If
-                End If
-                ' L1 + L2 miss: materialize the String once, merge, insert into L1 and L2
-                ' (CountTokens' miss tail, plus the shared write-through).
-                Dim materialized As String = word.ToString()
-                Dim symbols As List(Of (Integer, Integer)) = MergeWord(materialized, _symbolScratch.Value)
-                If symbols.Count = 1 Then
-                    Dim singleValue As CacheValue = New CacheValue(1, symbols(0), Nothing)
-                    cache.Insert(materialized, singleValue)
+                    Dim cv As CacheValue = cache.GetValueMemory(word)
+                    If cv.Count > 0 Then
+                        ' Cache hit via memory alternate lookup: zero String allocation (M9 target).
+                        Return cv.Count
+                    End If
+                    ' L1 miss: consult the shared L2 before merging. A word already merged by any
+                    ' other worker / earlier scan hits here (locked read), so the expensive BPE merge
+                    ' runs once globally, not once per thread that sees the word. The L2 is lock-striped:
+                    ' the shard comes from the word's hash (the String form and memory form hash
+                    ' identically — see StringMemoryAlternateComparer — so the later insert lands on the
+                    ' same shard) and only that shard's lock is taken, so workers hashing to different
+                    ' shards never contend. An L2 hit inserts into this thread's L1 so subsequent
+                    ' lookups stay lock-free.
                     If _sharedCaches IsNot Nothing Then
-                        ' materialized.GetHashCode() == String.GetHashCode(materialized.AsSpan()),
-                        ' so the write-through lands on the same shard as the L2 lookup above.
-                        Dim shard As Integer = materialized.GetHashCode() And _sharedShardMask
+                        Dim shard As Integer = String.GetHashCode(word.Span) And _sharedShardMask
+                        Dim sharedValue As CacheValue
                         SyncLock _sharedLocks(shard)
-                            _sharedCaches(shard).Insert(materialized, singleValue)
+                            sharedValue = _sharedCaches(shard).GetValueMemory(word)
                         End SyncLock
+                        If sharedValue.Count > 0 Then
+                            cache.Insert(word.ToString(), sharedValue)
+                            Return sharedValue.Count
+                        End If
                     End If
-                ElseIf symbols.Count > 1 Then
-                    Dim manyValue As CacheValue = New CacheValue(symbols.Count, Nothing, symbols)
-                    cache.Insert(materialized, manyValue)
-                    If _sharedCaches IsNot Nothing Then
-                        ' Same shard as the L2 lookup: String hash == memory hash (M9 invariant).
-                        Dim shard As Integer = materialized.GetHashCode() And _sharedShardMask
-                        SyncLock _sharedLocks(shard)
-                            _sharedCaches(shard).Insert(materialized, manyValue)
-                        End SyncLock
+                    ' L1 + L2 miss: materialize the String once, merge, insert into L1 and L2
+                    ' (CountTokens' miss tail, plus the shared write-through).
+                    Dim materialized As String = word.ToString()
+                    Dim symbols As List(Of (Integer, Integer)) = MergeWord(materialized, _symbolScratch.Value)
+                    If symbols.Count = 1 Then
+                        Dim singleValue As CacheValue = New CacheValue(1, symbols(0), Nothing)
+                        cache.Insert(materialized, singleValue)
+                        If _sharedCaches IsNot Nothing Then
+                            ' materialized.GetHashCode() == String.GetHashCode(materialized.AsSpan()),
+                            ' so the write-through lands on the same shard as the L2 lookup above.
+                            Dim shard As Integer = materialized.GetHashCode() And _sharedShardMask
+                            SyncLock _sharedLocks(shard)
+                                _sharedCaches(shard).Insert(materialized, singleValue)
+                            End SyncLock
+                        End If
+                    ElseIf symbols.Count > 1 Then
+                        Dim manyValue As CacheValue = New CacheValue(symbols.Count, Nothing, symbols)
+                        cache.Insert(materialized, manyValue)
+                        If _sharedCaches IsNot Nothing Then
+                            ' Same shard as the L2 lookup: String hash == memory hash (M9 invariant).
+                            Dim shard As Integer = materialized.GetHashCode() And _sharedShardMask
+                            SyncLock _sharedLocks(shard)
+                                _sharedCaches(shard).Insert(materialized, manyValue)
+                            End SyncLock
+                        End If
                     End If
+                    Return symbols.Count
                 End If
-                Return symbols.Count
             End If
-            ' No cache (capacity <= 0 or dropout): delegate to the String path.
+            ' No cache (capacity <= 0 or dropout), or the L1 could not be resolved: delegate to the
+            ' String path. The result is identical either way — only the caching differs.
             Return CountTokens(word.ToString())
         End Function
 

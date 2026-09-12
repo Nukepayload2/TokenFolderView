@@ -62,7 +62,7 @@ dotnet publish TokenVisualizer -c Release -r osx-arm64
 
 ### 1. 词元统计
 
-- 点击 **打开文件夹** 选择要扫描的目录；扫描完成后左侧树显示每个文件 / 文件夹的 token 计数，底部状态栏显示总计、扫描 / 跳过文件数。
+- 点击 **打开文件夹** 选择要扫描的目录；扫描完成后左侧树显示每个文件 / 文件夹的 token 计数，底部状态栏显示总计、扫描 / 跳过文件数。打开文件夹后，文件变化会在约 1 秒后自动增量刷新。
 - 点选任意文件，右侧以等宽字体逐 token 着色展示切分结果（不同颜色区分不同 token）。
 - 顶部标题栏搜索框可按名称过滤文件 / 文件夹；**重新扫描** 可在修改过滤设置后重扫。
 - 支持粘贴文本进行词元统计
@@ -70,7 +70,7 @@ dotnet publish TokenVisualizer -c Release -r osx-arm64
 ### 2. 设置
 
 - **分词器**：管理 tokenizer 模型——添加（选择 tokenizer.json 与 tokenizer_config.json）、设为当前使用、删除（内置 deepseek 不可删）。
-- **扫描**：最大文件大小（MB，默认 10，超过跳过）、是否跳过二进制文件（默认开启）、文件夹黑名单（每行一个，默认含 `bin`、`obj`、`node_modules`、`.git` 等）。
+- **扫描**：最大文件大小（MB，默认 10，超过跳过）、是否跳过二进制文件（默认开启）、文件变化时自动刷新（默认开启）、文件夹黑名单（每行一个，默认含 `bin`、`obj`、`node_modules`、`.git` 等）。
 - **外观**：主题（跟随系统 / 浅色 / 深色）。
 
 所有设置持久化在系统的 LocalApplicationData 目录下的 `TokenVisualizer\settings.json`：
