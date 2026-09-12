@@ -24,6 +24,10 @@ Namespace Views
         End Sub
 
         Private Sub SettingsPage_Loaded() Handles Me.Loaded
+            ' Re-entering the page re-runs ApplySettingsToUi, whose control assignments raise the
+            ' value-changed handlers below; without the guard each of them would rewrite the whole
+            ' settings file from this page's copy.
+            _loading = True
             _settings = SettingsService.Load()
             ApplySettingsToUi()
             _loading = False
@@ -36,6 +40,8 @@ Namespace Views
             NumMaxSize.Value = maxSize
 
             TglCheckBinary.IsChecked = _settings.CheckBinary
+
+            TglAutoRefresh.IsChecked = _settings.AutoRefreshOnFileChanges
 
             TxtBlacklist.Text = String.Join(vbLf, _settings.BlacklistedFolderNames)
 
@@ -52,14 +58,17 @@ Namespace Views
 
         Private Sub NumMaxSize_ValueChanged(sender As FANumberBox, e As FANumberBoxValueChangedEventArgs) Handles NumMaxSize.ValueChanged
             If _loading OrElse _settings Is Nothing Then Return
-            _settings.MaxFileSizeMb = NumMaxSize.Value
-            SettingsService.Save(_settings)
+            _settings = SettingsService.Update(Sub(s) s.MaxFileSizeMb = NumMaxSize.Value)
         End Sub
 
         Private Sub TglCheckBinary_IsCheckedChanged(sender As Object, e As RoutedEventArgs) Handles TglCheckBinary.IsCheckedChanged
             If _loading OrElse _settings Is Nothing Then Return
-            _settings.CheckBinary = TglCheckBinary.IsChecked.GetValueOrDefault(True)
-            SettingsService.Save(_settings)
+            _settings = SettingsService.Update(Sub(s) s.CheckBinary = TglCheckBinary.IsChecked.GetValueOrDefault(True))
+        End Sub
+
+        Private Sub TglAutoRefresh_IsCheckedChanged(sender As Object, e As RoutedEventArgs) Handles TglAutoRefresh.IsCheckedChanged
+            If _loading OrElse _settings Is Nothing Then Return
+            _settings = SettingsService.Update(Sub(s) s.AutoRefreshOnFileChanges = TglAutoRefresh.IsChecked.GetValueOrDefault(True))
         End Sub
 
         Private Sub TxtBlacklist_TextChanged(sender As Object, e As TextChangedEventArgs) Handles TxtBlacklist.TextChanged
@@ -78,17 +87,16 @@ Namespace Views
                 Dim name As String = line.Trim()
                 If name.Length > 0 Then names.Add(name)
             Next
-            _settings.BlacklistedFolderNames = names
-            SettingsService.Save(_settings)
+            _settings = SettingsService.Update(Sub(s) s.BlacklistedFolderNames = names)
         End Sub
 
         Private Sub BtnResetBlacklist_Click() Handles BtnResetBlacklist.Click
             If _settings Is Nothing Then Return
-            _settings.BlacklistedFolderNames = New List(Of String) From {"bin", "obj", "node_modules", ".vs", ".git", "dist", "target"}
+            Dim defaults As New List(Of String) From {"bin", "obj", "node_modules", ".vs", ".git", "dist", "target"}
             _loading = True
-            TxtBlacklist.Text = String.Join(vbLf, _settings.BlacklistedFolderNames)
+            TxtBlacklist.Text = String.Join(vbLf, defaults)
             _loading = False
-            SettingsService.Save(_settings)
+            _settings = SettingsService.Update(Sub(s) s.BlacklistedFolderNames = defaults)
         End Sub
 
         ' ------------------------------------------------------------------
@@ -105,8 +113,7 @@ Namespace Views
                 Case Else : themeName = "System"
             End Select
             App.ApplyThemeName(themeName)
-            _settings.ThemeName = themeName
-            SettingsService.Save(_settings)
+            _settings = SettingsService.Update(Sub(s) s.ThemeName = themeName)
         End Sub
 
         Private Shared Function GetSelectedTag(cbo As ComboBox) As String

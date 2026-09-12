@@ -52,6 +52,13 @@ Namespace Services
         ''' <summary>True while a scan is running (drives the status bar + page cancel button).</summary>
         Public Property IsScanning As Boolean
 
+        ''' <summary>
+        ''' True once the tree has been patched by an incremental refresh after the last whole-tree
+        ''' scan. The scan's elapsed time then belongs to a different tree, so it must not be turned
+        ''' into a speed ("tokens/s") of the current one.
+        ''' </summary>
+        Public Property IncrementalRefreshed As Boolean
+
         ''' <summary>The folder path of the most recent scan (used by the rescan button).</summary>
         Public Property CurrentScanPath As String
 

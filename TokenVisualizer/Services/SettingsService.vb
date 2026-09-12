@@ -20,6 +20,9 @@ Namespace Services
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                          "TokenVisualizer", "settings.json")
 
+        ''' <summary>Serialises the read-modify-write cycles of <see cref="Update"/>.</summary>
+        Private Shared ReadOnly _updateLock As New Object()
+
         ''' <summary>Loads settings, or returns a default instance if the file is missing/corrupt.</summary>
         Public Shared Function Load() As AppSettings
             Try
@@ -31,8 +34,32 @@ Namespace Services
             Return New AppSettings()
         End Function
 
-        ''' <summary>Persists settings as indented JSON with relaxed escaping for non-ASCII text.</summary>
-        Public Shared Sub Save(appSettings As AppSettings)
+        ''' <summary>
+        ''' Applies <paramref name="apply"/> to the settings currently on disk, persists the result and
+        ''' returns the updated instance for the caller to keep as its cache.
+        ''' The whole cycle runs under a lock and always starts from a fresh <see cref="Load"/>, so a
+        ''' caller can never write a stale copy of the settings back over the changes made by another
+        ''' caller: the file is rewritten in full, one key list for all callers.
+        ''' </summary>
+        Public Shared Function Update(apply As Action(Of AppSettings)) As AppSettings
+            If apply Is Nothing Then Throw New ArgumentNullException(NameOf(apply))
+            SyncLock _updateLock
+                Dim appSettings As AppSettings = Load()
+                apply(appSettings)
+                Save(appSettings)
+                Return appSettings
+            End SyncLock
+        End Function
+
+        ''' <summary>
+        ''' Persists settings as indented JSON with relaxed escaping for non-ASCII text.
+        ''' The file is replaced atomically (sibling temp file + rename) because readers such as
+        ''' <see cref="Load"/> do not take the lock: a plain write could be observed half-written and
+        ''' Load would silently fall back to the defaults for it. Failures are swallowed - settings
+        ''' must never crash the app - and then leave the previous file in place.
+        ''' </summary>
+        Private Shared Sub Save(appSettings As AppSettings)
+            Dim tempPath As String = Nothing
             Try
                 Dim dir As String = Path.GetDirectoryName(SettingsPath)
                 If Not String.IsNullOrEmpty(dir) AndAlso Not Directory.Exists(dir) Then
@@ -51,6 +78,7 @@ Namespace Services
 
                 root("MaxFileSizeMb") = JsonValue.Create(appSettings.MaxFileSizeMb)
                 root("CheckBinary") = JsonValue.Create(appSettings.CheckBinary)
+                root("AutoRefreshOnFileChanges") = JsonValue.Create(appSettings.AutoRefreshOnFileChanges)
                 root("ThemeName") = JsonValue.Create(If(appSettings.ThemeName, ""))
                 root("ActiveTokenizerIndex") = JsonValue.Create(appSettings.ActiveTokenizerIndex)
 
@@ -71,8 +99,20 @@ Namespace Services
                     .WriteIndented = True,
                     .Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
                 }
-                File.WriteAllText(SettingsPath, root.ToJsonString(options))
+                ' .tmp stays next to the real file so that the rename is a same-volume move, and it is
+                ' removed on every failure path as well (File.Delete on a missing file is a no-op).
+                tempPath = SettingsPath & ".tmp"
+                File.WriteAllText(tempPath, root.ToJsonString(options))
+                File.Move(tempPath, SettingsPath, overwrite:=True)
+                tempPath = Nothing
             Catch
+            Finally
+                If tempPath IsNot Nothing Then
+                    Try
+                        File.Delete(tempPath)
+                    Catch
+                    End Try
+                End If
             End Try
         End Sub
 
@@ -104,6 +144,13 @@ Namespace Services
                 v = TryGetProperty(root, "CheckBinary")
                 If v.HasValue AndAlso IsBool(v.Value) Then
                     settings.CheckBinary = v.Value.GetBoolean()
+                End If
+
+                ' The guard is deliberate: a missing key or a value that is not a Boolean leaves the
+                ' property at its initial value, which is True - "on unless explicitly turned off".
+                v = TryGetProperty(root, "AutoRefreshOnFileChanges")
+                If v.HasValue AndAlso IsBool(v.Value) Then
+                    settings.AutoRefreshOnFileChanges = v.Value.GetBoolean()
                 End If
 
                 v = TryGetProperty(root, "ThemeName")
@@ -195,6 +242,12 @@ Namespace Services
 
         ''' <summary>When True, the head of each candidate file is sniffed for binary content.</summary>
         Public Property CheckBinary As Boolean = True
+
+        ''' <summary>
+        ''' When True, the folder that is open is watched for file changes and the tree is refreshed
+        ''' incrementally instead of being scanned again from scratch.
+        ''' </summary>
+        Public Property AutoRefreshOnFileChanges As Boolean = True
 
         ''' <summary>UI theme: "System", "Light" or "Dark".</summary>
         Public Property ThemeName As String = "System"

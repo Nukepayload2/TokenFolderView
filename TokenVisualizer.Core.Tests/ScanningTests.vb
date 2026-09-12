@@ -1,5 +1,6 @@
 Imports System.Buffers
 Imports System.Collections.Generic
+Imports System.Collections.Specialized
 Imports System.Text
 Imports Tokenizers.Scanning
 
@@ -50,6 +51,36 @@ Namespace TokenVisualizer.Core.Tests
             Assert.IsTrue(ScanFilter.ShouldSkipFile("gen.cs", 20 * 1024 * 1024, options))
             Assert.IsFalse(ScanFilter.ShouldSkipFile("src/gen.cs", 100, options))
             Assert.IsFalse(ScanFilter.ShouldSkipFile("binaries/b.dat", 100, options), "folder 'binaries' must not match 'bin'")
+        End Sub
+
+        <TestMethod>
+        Public Sub ShouldSkipPathChecksEverySegmentIncludingTheLast()
+            Dim blacklist As IReadOnlyList(Of String) = New List(Of String) From {"bin", "OBJ", ".git"}
+            Assert.IsTrue(ScanFilter.ShouldSkipPath("bin", blacklist), "a single segment is a folder name for a path")
+            Assert.IsTrue(ScanFilter.ShouldSkipPath("src/bin", blacklist))
+            Assert.IsTrue(ScanFilter.ShouldSkipPath("src\bin", blacklist), "backslashes separate segments too")
+            Assert.IsTrue(ScanFilter.ShouldSkipPath("src/.git/objects", blacklist))
+            Assert.IsTrue(ScanFilter.ShouldSkipPath("src/OBJ/debug", blacklist), "case-insensitive")
+            Assert.IsFalse(ScanFilter.ShouldSkipPath("src", blacklist))
+            Assert.IsFalse(ScanFilter.ShouldSkipPath("binaries", blacklist), "a name is matched whole")
+        End Sub
+
+        <TestMethod>
+        Public Sub ShouldSkipPathSparsNothingUnlikeShouldSkipFile()
+            ' ShouldSkipFile treats the last segment as the file name and spares it.
+            Dim options As New ScanOptions()
+            Assert.IsFalse(ScanFilter.ShouldSkipFile("bin", 100, options))
+            Assert.IsTrue(ScanFilter.ShouldSkipPath("bin", options.FolderBlacklist))
+        End Sub
+
+        <TestMethod>
+        Public Sub ShouldSkipPathHandlesEmptyPathsAndBlacklists()
+            Dim blacklist As IReadOnlyList(Of String) = New List(Of String) From {"bin"}
+            Assert.IsFalse(ScanFilter.ShouldSkipPath("", blacklist))
+            Assert.IsFalse(ScanFilter.ShouldSkipPath(Nothing, blacklist))
+            Assert.IsFalse(ScanFilter.ShouldSkipPath("//", blacklist))
+            Assert.IsFalse(ScanFilter.ShouldSkipPath("src/bin", New List(Of String)()))
+            Assert.IsFalse(ScanFilter.ShouldSkipPath("src/bin", Nothing))
         End Sub
 
         <TestMethod>
@@ -284,6 +315,54 @@ Namespace TokenVisualizer.Core.Tests
 
             Assert.AreEqual("dir.txt", root.Children(0).Name)
             Assert.AreEqual("folder", root.Children(1).Name)
+        End Sub
+
+    End Class
+
+    <TestClass>
+    Public Class ScanTreeNodeTests
+
+        <TestMethod>
+        Public Sub ChildrenNotifyCollectionChangedOnAddAndRemove()
+            Dim root As New ScanTreeNode("root", "C:\root", True)
+            Dim actions As New List(Of NotifyCollectionChangedAction)()
+            AddHandler root.Children.CollectionChanged,
+                Sub(sender As Object, e As NotifyCollectionChangedEventArgs) actions.Add(e.Action)
+
+            Dim fileNode As New ScanTreeNode("a.txt", "C:\root\a.txt", False)
+            root.AddChild(fileNode)
+            Assert.HasCount(1, actions)
+            Assert.AreEqual(NotifyCollectionChangedAction.Add, actions(0))
+            Assert.AreEqual(0, root.Children.IndexOf(fileNode))
+
+            root.Children.RemoveAt(0)
+            Assert.HasCount(2, actions)
+            Assert.AreEqual(NotifyCollectionChangedAction.Remove, actions(1), "removing must not raise a Reset")
+            Assert.HasCount(0, root.Children)
+        End Sub
+
+        <TestMethod>
+        Public Sub BuildTreeOutputIsStableUnderReaggregation()
+            Dim files As New List(Of (relativePath As String, length As Long, tokenCount As Integer))() From {
+                ("a.txt", 10L, 5),
+                ("sub/b.txt", 20L, 7),
+                ("sub/deep/c.txt", 30L, 9)
+            }
+            Dim root As ScanTreeNode = FolderScanner.BuildTree("root", "C:\root", files)
+            Dim subDir As ScanTreeNode = root.Children.First(Function(c) c.IsDirectory)
+
+            ' BuildTree already aggregates, so folding again must not move a single number.
+            ScanTreeEditor.Reaggregate(root)
+            Assert.AreEqual(21L, root.TokenCount)
+            Assert.AreEqual(3L, root.FileCount)
+            Assert.AreEqual(60L, root.FileSize)
+            Assert.AreEqual(16L, subDir.TokenCount)
+
+            ScanTreeEditor.Reaggregate(root)
+            Assert.AreEqual(21L, root.TokenCount)
+            Assert.AreEqual(3L, root.FileCount)
+            Assert.AreEqual(60L, root.FileSize)
+            Assert.AreEqual(16L, subDir.TokenCount)
         End Sub
 
     End Class

@@ -1,5 +1,5 @@
 Imports System
-Imports System.Collections.Generic
+Imports System.Collections.ObjectModel
 Imports System.ComponentModel
 
 Namespace Scanning
@@ -21,8 +21,18 @@ Namespace Scanning
         ''' <summary>True for a directory node, False for a file node.</summary>
         Public Property IsDirectory As Boolean
 
-        ''' <summary>Child directories and files (directory nodes only; always empty for file nodes).</summary>
-        Public ReadOnly Property Children As List(Of ScanTreeNode) = New List(Of ScanTreeNode)()
+        ''' <summary>
+        ''' Child directories and files (directory nodes only; always empty for file nodes), kept in
+        ''' <see cref="String.CompareOrdinal"/>-by-name order (directories and files mixed).
+        ''' </summary>
+        ''' <remarks>
+        ''' An <see cref="ObservableCollection(Of T)"/> so a tree bound to a <c>TreeView</c> can be
+        ''' updated incrementally: <c>Insert</c> and <c>Remove</c> only touch the affected item
+        ''' containers, so expanded nodes and the selection survive, whereas <c>Clear</c> / <c>Move</c>
+        ''' raise a Reset that recreates every container and therefore loses both. Incremental updates
+        ''' must only ever insert or remove.
+        ''' </remarks>
+        Public ReadOnly Property Children As ObservableCollection(Of ScanTreeNode) = New ObservableCollection(Of ScanTreeNode)()
 
         Private _tokenCount As Long
         Private _fileCount As Long
@@ -87,7 +97,8 @@ Namespace Scanning
         ''' <summary>
         ''' Adds a child node and folds its counts into this node. Used while the tree is being
         ''' assembled; <see cref="FolderScanner.BuildTree"/> additionally runs a post-order
-        ''' aggregation pass so directory counts always reflect their full subtree.
+        ''' aggregation pass (<see cref="ScanTreeEditor.Reaggregate"/>) so directory counts always
+        ''' reflect their full subtree.
         ''' </summary>
         Public Sub AddChild(node As ScanTreeNode)
             If node Is Nothing Then Throw New ArgumentNullException(NameOf(node))

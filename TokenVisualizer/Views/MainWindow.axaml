@@ -3,6 +3,7 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:ui="using:FluentAvalonia.UI.Controls"
+        xmlns:chrome="using:Avalonia.Controls.Chrome"
         mc:Ignorable="d" d:DesignWidth="1200" d:DesignHeight="800"
         x:Class="TokenVisualizer.Views.MainWindow"
         Title="词元文件夹视图"
@@ -12,7 +13,8 @@
 
     <Grid RowDefinitions="Auto,*,Auto">
         <!-- Row 0: extended title bar (drag region only; the window Title is the sole title) -->
-        <Border x:Name="TitleBarBorder" Height="48" Padding="0,0,140,0" Background="{DynamicResource ApplicationPageBackgroundThemeBrush}"/>
+        <Border x:Name="TitleBarBorder" Height="48" Padding="0,0,140,0" Background="{DynamicResource ApplicationPageBackgroundThemeBrush}"
+                chrome:WindowDecorationProperties.ElementRole="TitleBar"/>
         <!-- Row 1: navigation -->
         <ui:FANavigationView Grid.Row="1" x:Name="NavView"
                              AlwaysShowHeader="False" PaneDisplayMode="Left" IsSettingsVisible="True"

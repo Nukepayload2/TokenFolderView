@@ -89,9 +89,26 @@ Namespace Scanning
             Dim consume As Func(Of Task) = Async Function()
                 Dim enumerator = pipeline.Reader.ReadAllAsync(ct).GetAsyncEnumerator()
                 While Await enumerator.MoveNextAsync()
-                    ProcessFile(enumerator.Current.relativePath,
-                                enumerator.Current.fullPath,
-                                enumerator.Current.length, results)
+                    ' Counting is inlined here on purpose: this is the per-file hot path, so it pays
+                    ' exactly one call (CountFile) and maps the status to the progress counters
+                    ' locally instead of going through a second helper. CountFile itself never
+                    ' touches ScanProgress, which keeps the two concerns apart.
+                    Dim result As FileCountResult = CountFile(enumerator.Current.fullPath, enumerator.Current.length)
+                    Select Case result.Status
+                        Case FileCountStatus.Counted
+                            results.Add((enumerator.Current.relativePath, result.Length, CInt(result.TokenCount)))
+                            ScanProgress.IncrementFilesScanned()
+                            ScanProgress.AddTotalTokens(result.TokenCount)
+                        Case FileCountStatus.SkippedSize, FileCountStatus.SkippedBinary
+                            ScanProgress.IncrementFilesSkipped()
+                        Case FileCountStatus.Missing, FileCountStatus.Error
+                            ' A file that vanished between enumeration and reading used to throw
+                            ' inside ProcessFile and was therefore counted as an error; keep that.
+                            ScanProgress.IncrementFilesWithErrors()
+                        Case Else
+                            ' Unknown status: treat it as an error rather than silently dropping it.
+                            ScanProgress.IncrementFilesWithErrors()
+                    End Select
                 End While
                 Await enumerator.DisposeAsync()
             End Function
@@ -169,28 +186,34 @@ Namespace Scanning
                 current.AddChild(fileNode)
             Next
 
-            AggregateNode(root)
-            SortChildren(root)
+            ScanTreeEditor.Reaggregate(root)
+            SortChildrenOfUnboundTree(root)
             Return root
         End Function
 
         ' ------------------------------------------------------------------
 
         ''' <summary>
-        ''' Handles a single file, opening it exactly once. A short head probe is read first and
-        ''' checked for binary content (when enabled); text files then keep reading the rest of the
-        ''' file on the same handle and are token-counted, so a counted file pays a single open.
-        ''' Binary files are skipped after paying only the head read. Any read/decode/count failure
-        ''' increments the error counter instead of aborting the scan.
+        ''' Counts the tokens of a single file and reports what happened as a
+        ''' <see cref="FileCountResult"/> instead of throwing. Opens the file exactly once: a short
+        ''' head probe is read first and checked for binary content (when enabled); text files then
+        ''' keep reading the rest of the file on the same handle, so a counted file pays a single
+        ''' open. Binary and oversized files are skipped after paying only the head read (or nothing
+        ''' at all), and any read/decode/count failure becomes a status rather than an exception so
+        ''' one unreadable file never aborts a scan.
         ''' </summary>
-        Private Sub ProcessFile(relativePath As String,
-                                fullPath As String,
-                                length As Long,
-                                results As ConcurrentBag(Of (relativePath As String, length As Long, tokenCount As Integer)))
-            If ScanFilter.ShouldSkipFileSize(length, _options.MaxFileSizeBytes) Then
-                ScanProgress.IncrementFilesSkipped()
-                Return
-            End If
+        ''' <param name="fullPath">Absolute path of the file to read.</param>
+        ''' <param name="length">File size in bytes, as observed while enumerating it.</param>
+        ''' <remarks>
+        ''' This method deliberately does not touch <see cref="ScanProgress"/>: the caller owns the
+        ''' counters (see the inlined mapping in <see cref="ScanAsync"/>), which keeps the per-file
+        ''' hot path at exactly one call. Also used by the incremental refresh path, which needs the
+        ''' status without disturbing the whole-scan counters.
+        ''' </remarks>
+        Public Function CountFile(fullPath As String, length As Long) As FileCountResult
+            ' This check must stay ahead of every CInt(length) below: narrowing a length beyond
+            ' Integer.MaxValue would misbehave (a huge file must be skipped, not overflowed).
+            If ScanFilter.ShouldSkipFileSize(length, _options.MaxFileSizeBytes) Then Return FileCountResult.SkippedSize
 
             Dim headLen As Integer = CInt(Math.Min(length, BinaryHeadBytes))
             Dim probe As Byte() = ArrayPool(Of Byte).Shared.Rent(headLen)
@@ -209,23 +232,26 @@ Namespace Scanning
                     End If
                 End Using
 
-                If isBinary Then
-                    ScanProgress.IncrementFilesSkipped()
-                    Return
-                End If
+                If isBinary Then Return FileCountResult.SkippedBinary
 
                 Dim text As String = Encoding.UTF8.GetString(buffer, 0, bytesRead)
-                Dim tokenCount As Integer = _tokenizer.EncodeCount(text)
-                results.Add((relativePath, length, tokenCount))
-                ScanProgress.IncrementFilesScanned()
-                ScanProgress.AddTotalTokens(tokenCount)
+                Return FileCountResult.Counted(_tokenizer.EncodeCount(text), length)
+            Catch ex As FileNotFoundException
+                ' The file (or its directory) went away between enumeration and this read. The
+                ' incremental refresh path deletes the node for this status; a whole-tree scan
+                ' counts it as an error, exactly as it did when this threw.
+                Return FileCountResult.Missing
+            Catch ex As DirectoryNotFoundException
+                Return FileCountResult.Missing
             Catch ex As Exception
-                ScanProgress.IncrementFilesWithErrors()
+                ' Possibly transient (e.g. the file is locked right now), so the caller must not
+                ' treat this as "the file is gone".
+                Return FileCountResult.Error
             Finally
                 ArrayPool(Of Byte).Shared.Return(probe)
                 If buffer IsNot Nothing Then ArrayPool(Of Byte).Shared.Return(buffer)
             End Try
-        End Sub
+        End Function
 
         ''' <summary>
         ''' Reads up to <paramref name="count"/> bytes from <paramref name="fs"/> into
@@ -268,32 +294,23 @@ Namespace Scanning
             Next
         End Function
 
-        ''' <summary>Post-order pass that folds descendant counts into each directory node.</summary>
-        Private Shared Function AggregateNode(node As ScanTreeNode) As (tokens As Long, files As Long, size As Long)
-            If Not node.IsDirectory Then
-                Return (node.TokenCount, node.FileCount, node.FileSize)
-            End If
-
-            Dim tokens As Long = 0
-            Dim fileCount As Long = 0
-            Dim size As Long = 0
-            For Each child As ScanTreeNode In node.Children
-                Dim agg = AggregateNode(child)
-                tokens += agg.tokens
-                fileCount += agg.files
-                size += agg.size
-            Next
-            node.TokenCount = tokens
-            node.FileCount = fileCount
-            node.FileSize = size
-            Return (tokens, fileCount, size)
-        End Function
-
         ''' <summary>Recursively sorts each node's children by name for a deterministic ordering.</summary>
-        Private Shared Sub SortChildren(node As ScanTreeNode)
-            node.Children.Sort(Function(a As ScanTreeNode, b As ScanTreeNode) String.CompareOrdinal(a.Name, b.Name))
+        ''' <remarks>
+        ''' DANGER: sorting is done by rebuilding each child collection (Clear + Add), which raises a
+        ''' Reset on every list. It is only safe while the tree is still unbound, i.e. during
+        ''' <see cref="BuildTree"/> right after assembly. Calling it on a tree that is bound to a
+        ''' <c>TreeView</c> recreates every item container, so all expanded nodes and the selection are
+        ''' lost - incremental updates must insert/remove instead (see <see cref="ScanTreeEditor"/>).
+        ''' </remarks>
+        Private Shared Sub SortChildrenOfUnboundTree(node As ScanTreeNode)
+            Dim ordered As List(Of ScanTreeNode) =
+                node.Children.OrderBy(Function(child As ScanTreeNode) child.Name, StringComparer.Ordinal).ToList()
+            node.Children.Clear()
+            For Each child As ScanTreeNode In ordered
+                node.Children.Add(child)
+            Next
             For Each child As ScanTreeNode In node.Children
-                If child.IsDirectory Then SortChildren(child)
+                If child.IsDirectory Then SortChildrenOfUnboundTree(child)
             Next
         End Sub
 

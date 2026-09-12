@@ -20,8 +20,14 @@ Namespace Services
         Public Sub New()
             _settings = SettingsService.Load()
             If _settings.Tokenizers Is Nothing Then _settings.Tokenizers = New List(Of TokenizerSettings)()
-            If _settings.Tokenizers.Count = 0 AndAlso EnsureDefaultRegistered(_settings) Then
-                SettingsService.Save(_settings)
+            ' The bundled path is probed first so that a first run without a bundled tokenizer still
+            ' writes nothing, exactly like the previous "save only when a default was added" flow.
+            If _settings.Tokenizers.Count = 0 AndAlso ResolveBundledTokenizerPath() IsNot Nothing Then
+                _settings = SettingsService.Update(
+                    Sub(s)
+                        If s.Tokenizers Is Nothing Then s.Tokenizers = New List(Of TokenizerSettings)()
+                        EnsureDefaultRegistered(s)
+                    End Sub)
             End If
         End Sub
 
@@ -89,9 +95,25 @@ Namespace Services
             If def Is Nothing OrElse Not def.IsBundled Then Return False
             Dim bundledPath As String = ResolveBundledTokenizerPath()
             If String.IsNullOrEmpty(bundledPath) Then Return False
+            Dim configPath As String = Path.Combine(Path.GetDirectoryName(bundledPath), "tokenizer_config.json")
+
+            ' The definition the caller is about to load from is repaired in place first, ...
             def.TokenizerJsonPath = bundledPath
-            def.TokenizerConfigJsonPath = Path.Combine(Path.GetDirectoryName(bundledPath), "tokenizer_config.json")
-            SettingsService.Save(_settings)
+            def.TokenizerConfigJsonPath = configPath
+
+            ' ... then the same repair is applied to a freshly loaded copy, which replaces this
+            ' registry's settings so that later reads see the repaired paths too. The bundled entry
+            ' is unique (EnsureDefaultRegistered adds at most one and user entries are not bundled).
+            _settings = SettingsService.Update(
+                Sub(s)
+                    If s.Tokenizers Is Nothing Then Return
+                    For Each item As TokenizerSettings In s.Tokenizers
+                        If item IsNot Nothing AndAlso item.IsBundled Then
+                            item.TokenizerJsonPath = bundledPath
+                            item.TokenizerConfigJsonPath = configPath
+                        End If
+                    Next
+                End Sub)
             Return True
         End Function
 
@@ -107,14 +129,18 @@ Namespace Services
         ''' <summary>Adds a user tokenizer definition, persists it, and returns its index.</summary>
         Public Function Register(name As String, tokenizerJson As String, configJson As String) As Integer
             SyncLock _lock
-                _settings.Tokenizers.Add(New TokenizerSettings With {
-                    .Name = name,
-                    .TokenizerJsonPath = tokenizerJson,
-                    .TokenizerConfigJsonPath = If(configJson, ""),
-                    .IsBundled = False
-                })
-                Dim index As Integer = _settings.Tokenizers.Count - 1
-                SettingsService.Save(_settings)
+                Dim index As Integer = -1
+                _settings = SettingsService.Update(
+                    Sub(s)
+                        If s.Tokenizers Is Nothing Then s.Tokenizers = New List(Of TokenizerSettings)()
+                        s.Tokenizers.Add(New TokenizerSettings With {
+                            .Name = name,
+                            .TokenizerJsonPath = tokenizerJson,
+                            .TokenizerConfigJsonPath = If(configJson, ""),
+                            .IsBundled = False
+                        })
+                        index = s.Tokenizers.Count - 1
+                    End Sub)
                 InvalidateCache()
                 Return index
             End SyncLock
@@ -125,11 +151,14 @@ Namespace Services
             SyncLock _lock
                 If index < 0 OrElse index >= _settings.Tokenizers.Count Then Return
                 If _settings.Tokenizers(index).IsBundled Then Return
-                _settings.Tokenizers.RemoveAt(index)
-                If _settings.ActiveTokenizerIndex >= _settings.Tokenizers.Count Then
-                    _settings.ActiveTokenizerIndex = Math.Max(0, _settings.Tokenizers.Count - 1)
-                End If
-                SettingsService.Save(_settings)
+                _settings = SettingsService.Update(
+                    Sub(s)
+                        If s.Tokenizers Is Nothing OrElse index >= s.Tokenizers.Count Then Return
+                        s.Tokenizers.RemoveAt(index)
+                        If s.ActiveTokenizerIndex >= s.Tokenizers.Count Then
+                            s.ActiveTokenizerIndex = Math.Max(0, s.Tokenizers.Count - 1)
+                        End If
+                    End Sub)
                 InvalidateCache()
             End SyncLock
         End Sub
@@ -138,8 +167,7 @@ Namespace Services
         Public Sub SetActive(index As Integer)
             SyncLock _lock
                 If index < 0 OrElse index >= _settings.Tokenizers.Count Then Return
-                _settings.ActiveTokenizerIndex = index
-                SettingsService.Save(_settings)
+                _settings = SettingsService.Update(Sub(s) s.ActiveTokenizerIndex = index)
                 InvalidateCache()
             End SyncLock
         End Sub

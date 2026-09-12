@@ -2,7 +2,6 @@ Imports System.Collections.Generic
 Imports System.Threading.Tasks
 Imports Avalonia
 Imports Avalonia.Controls
-Imports Avalonia.Input
 Imports Avalonia.Media
 Imports Avalonia.Threading
 Imports Avalonia.VisualTree
@@ -30,9 +29,13 @@ Namespace Views
             _statusTimer.Start()
         End Sub
 
-        Private Sub TitleBarBorder_PointerPressed(sender As Object, e As PointerPressedEventArgs) Handles TitleBarBorder.PointerPressed
-            If e.GetCurrentPoint(Me).Properties.IsLeftButtonPressed Then
-                BeginMoveDrag(e)
+        ''' <summary>
+        ''' Stops watching for file changes before the window goes away, so that neither a watcher
+        ''' callback nor a refresh keeps running against a page that is no longer shown.
+        ''' </summary>
+        Private Sub Window_Closing(sender As Object, e As WindowClosingEventArgs) Handles Me.Closing
+            If _explorerPage IsNot Nothing Then
+                _explorerPage.StopWatching()
             End If
         End Sub
 
@@ -200,6 +203,9 @@ Namespace Views
         ''' </summary>
         Private Shared Function BuildSpeedSuffix(progress As ScanProgress, root As ScanTreeNode) As String
             If progress Is Nothing Then Return ""
+            ' An incremental refresh changed the tree without restarting the scan stopwatch, so the
+            ' two no longer describe the same work: any speed derived from them would be invented.
+            If AppState.Current.IncrementalRefreshed Then Return ""
             Dim elapsed As Double = progress.Elapsed.TotalSeconds
             If elapsed <= 0 Then Return ""
             Dim tokensPerSec As Double = root.TokenCount / elapsed

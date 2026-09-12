@@ -30,6 +30,8 @@
 
                     <ToggleSwitch x:Name="TglCheckBinary" OnContent="跳过二进制文件" OffContent="不跳过二进制文件"/>
 
+                    <ToggleSwitch x:Name="TglAutoRefresh" OnContent="文件变化时自动刷新" OffContent="不自动刷新"/>
+
                     <StackPanel Spacing="6">
                         <Grid ColumnDefinitions="*,Auto">
                             <TextBlock Text="文件夹黑名单（每行一个）" Opacity="0.8" VerticalAlignment="Center"/>

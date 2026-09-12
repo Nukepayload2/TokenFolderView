@@ -38,11 +38,30 @@ Namespace Scanning
             If ShouldSkipFileSize(length, options.MaxFileSizeBytes) Then Return True
             If String.IsNullOrEmpty(relativePath) Then Return False
 
-            Dim normalized As String = relativePath.Replace("\"c, "/"c)
-            Dim segments As String() = normalized.Split("/"c)
+            Dim segments As String() = relativePath.Replace("\"c, "/"c).Split("/"c)
             ' Every segment except the last is a folder part; the last is the file name.
-            For i As Integer = 0 To segments.Length - 2
-                If ShouldSkipFolder(segments(i), options.FolderBlacklist) Then Return True
+            Return AnySegmentBlacklisted(segments, segments.Length - 1, options.FolderBlacklist)
+        End Function
+
+        ''' <summary>
+        ''' True when any segment of a relative directory path is blacklisted (case-insensitive). Used
+        ''' for directory events, whose last segment is a folder name too - unlike
+        ''' <see cref="ShouldSkipFile"/>, which deliberately spares the file name.
+        ''' </summary>
+        Public Shared Function ShouldSkipPath(relativePath As String, blacklist As IReadOnlyList(Of String)) As Boolean
+            If String.IsNullOrEmpty(relativePath) Then Return False
+            Dim segments As String() = relativePath.Replace("\"c, "/"c).Split("/"c)
+            Return AnySegmentBlacklisted(segments, segments.Length, blacklist)
+        End Function
+
+        ''' <summary>
+        ''' True when one of the first <paramref name="count"/> segments is blacklisted. Callers pass
+        ''' <c>segments.Length - 1</c> for a file path (the trailing segment is the file name) and
+        ''' <c>segments.Length</c> for a directory path.
+        ''' </summary>
+        Private Shared Function AnySegmentBlacklisted(segments As String(), count As Integer, blacklist As IReadOnlyList(Of String)) As Boolean
+            For i As Integer = 0 To count - 1
+                If ShouldSkipFolder(segments(i), blacklist) Then Return True
             Next
             Return False
         End Function

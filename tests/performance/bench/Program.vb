@@ -2,6 +2,7 @@
 ' Measures EncodeCount throughput on the deepseek tokenizer and prints a
 ' machine-parseable "DOTNET|..." line that tests/performance/bench.ps1 consumes.
 ' Mirrors tests/performance/bench_ref.py exactly so the inputs are byte-identical.
+' With --scan <dir> it instead runs the FolderScanner end-to-end pass (see RunScanMode).
 Imports System.Collections.Generic
 Imports System.Diagnostics
 Imports System.IO
@@ -10,6 +11,7 @@ Imports System.Text
 Imports Tokenizers
 Imports Tokenizers.Internal
 Imports Tokenizers.Models
+Imports Tokenizers.Scanning
 
 Module Program
 
@@ -38,6 +40,15 @@ Module Program
         Dim repeat As Integer = GetIntArg(args, "--repeat", 0)
         Dim iterations As Integer = GetIntArg(args, "--iterations", 3)
 
+        ' --scan <dir> selects the FolderScanner instrument instead of the EncodeCount
+        ' measurement. A bare --scan (no directory) is a usage error rather than a silent
+        ' fallback into the EncodeCount mode.
+        Dim scanPath As String = GetArg(args, "--scan", "")
+        If scanPath.Length = 0 AndAlso HasArg(args, "--scan") Then
+            Console.Error.WriteLine("DOTNET|error|--scan requires a directory argument")
+            Return 2
+        End If
+
         ' Optional BPE word-cache overrides for the capacity x max-word sweep (task #38).
         ' --cache-capacity N: 0/1000/10000/32000 (Nothing = model default 10000).
         ' --cache-max-word  N: 0 = unlimited; >0 = cache-eligibility word length limit.
@@ -55,6 +66,8 @@ Module Program
             Console.Error.WriteLine("DOTNET|error|tokenizer file not found")
             Return 2
         End If
+
+        If scanPath.Length > 0 Then Return RunScanMode(args, tokenizerPath, scanPath)
 
         ' ---- Build the benchmark text (byte-identical to tests/performance/bench_ref.py) ----
         Dim text As String
@@ -117,6 +130,117 @@ Module Program
         Console.WriteLine(
             $"dotnet: {inputMb:F2} MB in {elapsedMs:F1} ms -> {mbps:F1} MB/s, {tps:F0} tokens/s ({tokenCount} tokens)  [warmup={warmTokens}]  cache: hits={stats.Hits} misses={stats.Misses} skips={stats.Skips} evictions={stats.Evictions}")
         Return 0
+    End Function
+
+    ' ------------------------------------------------------------------
+    ' Folder-scan mode (--scan <dir>): dev-only instrument over FolderScanner.
+    '
+    ' It MUST stay a pure delegator: it never walks the directory itself, never
+    ' filters, and never adjusts a count. Every number below is read back from
+    ' ScanProgress or from the returned root node, so a pre-change and a
+    ' post-change binary measure exactly the same pipeline under exactly the same
+    ' fixed options (default blacklist / size limit / binary detection), which is
+    ' what makes a before/after comparison meaningful.
+    '
+    ' Per iteration it prints one DOTNET|scan|... line; after the last iteration it
+    ' prints one DOTNET|scan_median|... line with the medians and the observed range.
+    ' ------------------------------------------------------------------
+    Private Function RunScanMode(args As String(), tokenizerPath As String, scanPath As String) As Integer
+        Dim iterations As Integer = GetIntArg(args, "--iterations", 5)
+        If iterations < 1 Then iterations = 5
+
+        If Not Directory.Exists(scanPath) Then
+            Console.Error.WriteLine("DOTNET|error|scan directory not found: " & scanPath)
+            Return 2
+        End If
+
+        Dim tokenizer As Tokenizer
+        Try
+            tokenizer = Tokenizer.Load(tokenizerPath)
+        Catch ex As Exception
+            Console.Error.WriteLine("DOTNET|error|failed to load tokenizer: " & ex.Message)
+            Return 3
+        End Try
+
+        Dim elapsedMs As New List(Of Double)(iterations)
+        Dim tokensPerSec As New List(Of Double)(iterations)
+        Dim mbPerSec As New List(Of Double)(iterations)
+
+        ' Every iteration must observe the same workload; a mismatch means the tree changed
+        ' under the instrument (or a count is unstable) and the runs must not be compared.
+        Dim firstTokens As Long = -1
+        Dim firstFiles As Long = -1
+        Dim firstSkipped As Long = -1
+        Dim firstErrors As Long = -1
+        Dim firstBytes As Long = -1
+        Dim consistent As Boolean = True
+
+        For i As Integer = 1 To iterations
+            ' Fresh default options and a fresh scanner per iteration: the comparison relies on
+            ' the blacklist / size limit / binary detection staying exactly at their defaults.
+            Dim options As New ScanOptions()
+            Dim scanner As New FolderScanner(tokenizer, options)
+            Dim root As ScanTreeNode = scanner.ScanAsync(scanPath).GetAwaiter().GetResult()
+
+            Dim tokens As Long = root.TokenCount
+            Dim files As Long = root.FileCount
+            Dim bytes As Long = root.FileSize
+            Dim skipped As Long = scanner.ScanProgress.ReadFilesSkipped()
+            Dim errors As Long = scanner.ScanProgress.ReadFilesWithErrors()
+            Dim progressTokens As Long = scanner.ScanProgress.ReadTotalTokens()
+            Dim ms As Double = scanner.ScanProgress.Elapsed.TotalMilliseconds
+            Dim sec As Double = ms / 1000.0
+            Dim tps As Double = If(sec > 0.0, tokens / sec, 0.0)
+            Dim mbps As Double = If(sec > 0.0, bytes / (1024.0 * 1024.0) / sec, 0.0)
+
+            elapsedMs.Add(ms)
+            tokensPerSec.Add(tps)
+            mbPerSec.Add(mbps)
+
+            If i = 1 Then
+                firstTokens = tokens
+                firstFiles = files
+                firstSkipped = skipped
+                firstErrors = errors
+                firstBytes = bytes
+            ElseIf tokens <> firstTokens OrElse files <> firstFiles OrElse skipped <> firstSkipped OrElse
+                   errors <> firstErrors OrElse bytes <> firstBytes Then
+                consistent = False
+            End If
+            ' The tree total and the live counter must agree; a divergence means the scan
+            ' dropped or double-counted a file.
+            If progressTokens <> tokens Then consistent = False
+
+            Console.WriteLine(
+                $"DOTNET|scan|iter={i}|tokens={tokens}|progress_tokens={progressTokens}|files={files}" &
+                $"|skipped={skipped}|errors={errors}|bytes={bytes}|elapsed_ms={ms:F1}" &
+                $"|tokens_per_s={tps:F0}|mb_per_s={mbps:F2}")
+        Next
+
+        Dim medMs As Double = Median(elapsedMs)
+        Dim medTps As Double = Median(tokensPerSec)
+        Dim medMbps As Double = Median(mbPerSec)
+
+        Console.WriteLine(
+            $"DOTNET|scan_median|dir={scanPath}|iterations={iterations}|tokens={firstTokens}" &
+            $"|files={firstFiles}|skipped={firstSkipped}|errors={firstErrors}|bytes={firstBytes}" &
+            $"|elapsed_ms={medMs:F1}|tokens_per_s={medTps:F0}|mb_per_s={medMbps:F2}" &
+            $"|elapsed_ms_min={elapsedMs.Min():F1}|elapsed_ms_max={elapsedMs.Max():F1}" &
+            $"|tokens_per_s_min={tokensPerSec.Min():F0}|tokens_per_s_max={tokensPerSec.Max():F0}" &
+            $"|consistent={If(consistent, "true", "false")}")
+        Console.WriteLine(
+            $"scan: {firstFiles} files, {firstTokens} tokens, {firstBytes} bytes in {medMs:F1} ms " &
+            $"(median of {iterations}) -> {medTps:F0} tokens/s, {medMbps:F2} MB/s; " &
+            $"skipped={firstSkipped} errors={firstErrors} consistent={If(consistent, "true", "false")}")
+        Return 0
+    End Function
+
+    ''' <summary>Median of a non-empty sequence (the mean of the two middle values for an even count).</summary>
+    Private Function Median(values As List(Of Double)) As Double
+        Dim sorted As List(Of Double) = values.OrderBy(Function(v As Double) v).ToList()
+        Dim mid As Integer = sorted.Count \ 2
+        If sorted.Count Mod 2 = 1 Then Return sorted(mid)
+        Return (sorted(mid - 1) + sorted(mid)) / 2.0
     End Function
 
     ' ------------------------------------------------------------------
@@ -189,6 +313,14 @@ Module Program
             End If
         Next
         Return defaultValue
+    End Function
+
+    ''' <summary>True when <paramref name="key"/> appears anywhere in the argument list.</summary>
+    Private Function HasArg(args As String(), key As String) As Boolean
+        For Each arg As String In args
+            If String.Equals(arg, key, StringComparison.OrdinalIgnoreCase) Then Return True
+        Next
+        Return False
     End Function
 
     Private Function GetIntArg(args As String(), key As String, defaultValue As Integer) As Integer
