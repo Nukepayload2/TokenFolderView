@@ -70,7 +70,7 @@ dotnet publish TokenVisualizer -c Release -r osx-arm64
 ### 2. 设置
 
 - **分词器**：管理 tokenizer 模型——添加（选择 tokenizer.json 与 tokenizer_config.json）、设为当前使用、删除（内置 deepseek 不可删）。
-- **扫描**：最大文件大小（MB，默认 10，超过跳过）、是否跳过二进制文件（默认开启）、文件变化时自动刷新（默认开启）、文件夹黑名单（每行一个，默认含 `bin`、`obj`、`node_modules`、`.git` 等）。
+- **扫描**：最大文件大小（MB，默认 10，超过跳过）、是否跳过二进制文件（默认开启）、文件变化时自动刷新（默认开启）、保留缓存（默认关闭）、文件编码（默认 UTF-8，可选 ANSI；只影响从磁盘读取的文件，以 UTF-8 BOM 字节 `EF BB BF` 开头的文件恒按 UTF-8 解码、不受该设置控制；选 ANSI 读 UTF-8 中文文件时的后果取决于「跳过二进制文件」开关：开关默认开启，判定门会按所选编码复检字节，多数文件因凑不成合法的 ANSI 序列被当作二进制整批跳过，端到端的净效果是静默漏计；关掉开关后这些文件几乎全部按 ANSI 解成乱码计入，token 数约为真实值的 2 倍（总量 1.81–2.08 倍、逐文件最高 3.5 倍；该膨胀出自绕过判定门的分量层实测，不是端到端结果）；纯 ASCII 文件两种编码字节相同，不受影响；因此只在确实要统计 GBK/ANSI 文件时才选 ANSI）、文件夹黑名单（每行一个，默认含 `bin`、`obj`、`node_modules`、`.git` 等）。
 - **外观**：主题（跟随系统 / 浅色 / 深色）。
 
 所有设置持久化在系统的 LocalApplicationData 目录下的 `TokenVisualizer\settings.json`：

@@ -125,11 +125,11 @@ Namespace Scanning
             Await producer
 
             ' All encoding workers are drained — no EncodeCount is in flight, so it is safe to drop
-            ' the per-thread L1 word caches (freeing their memory on a client). The shared L2
-            ' survives to warm the next scan, so a follow-up scan re-warms each worker's L1 from L2
-            ' instead of starting cold.
+            ' the per-thread L1 word caches (freeing their memory on a client). The shared L2 is
+            ' dropped too unless the scan asked to keep it; when kept, a follow-up scan re-warms each
+            ' worker's L1 from L2 instead of starting cold.
             Dim bpe As Models.BpeModel = TryCast(_tokenizer.Model, Models.BpeModel)
-            If bpe IsNot Nothing Then bpe.CompactWordCache()
+            If bpe IsNot Nothing Then bpe.CompactWordCache(dropShared:=Not _options.RetainWordCache)
 
             ' 3. Pure tree construction.
             Dim rootName As String = Path.GetFileName(rootPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
@@ -224,7 +224,8 @@ Namespace Scanning
                 Using fs As New FileStream(fullPath, FileMode.Open, FileAccess.Read,
                                            FileShare.ReadWrite Or FileShare.Delete, 4096, FileOptions.SequentialScan)
                     bytesRead = ReadAtMost(fs, probe, 0, headLen)
-                    isBinary = _options.CheckBinary AndAlso BinaryDetector.IsBinary(probe.AsMemory(0, bytesRead))
+                    isBinary = _options.CheckBinary AndAlso
+                               BinaryDetector.IsBinary(probe.AsMemory(0, bytesRead), _options.TextEncoding)
                     If Not isBinary Then
                         buffer = ArrayPool(Of Byte).Shared.Rent(CInt(length))
                         Array.Copy(probe, 0, buffer, 0, bytesRead)
@@ -234,7 +235,7 @@ Namespace Scanning
 
                 If isBinary Then Return FileCountResult.SkippedBinary
 
-                Dim text As String = Encoding.UTF8.GetString(buffer, 0, bytesRead)
+                Dim text As String = FileEncoding.Decode(buffer, bytesRead, _options.TextEncoding)
                 Return FileCountResult.Counted(_tokenizer.EncodeCount(text), length)
             Catch ex As FileNotFoundException
                 ' The file (or its directory) went away between enumeration and this read. The

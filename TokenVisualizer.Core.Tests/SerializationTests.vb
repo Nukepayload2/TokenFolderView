@@ -119,9 +119,9 @@ Namespace TokenVisualizer.Core.Tests
         >
         Public Sub DeepSeek_FromFile_LoadsCorrectCounts()
             ' NOTE: this is an explicit integration test that reads the real tokenizer.json.
-            Dim path As String = "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+            Dim path As String = BundledTokenizerPath
             If Not IO.File.Exists(path) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
 

@@ -1,4 +1,4 @@
-<UserControl xmlns="https://github.com/avaloniaui"
+﻿<UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -18,7 +18,7 @@
             </ui:FASettingsExpander>
 
             <!-- 扫描 -->
-            <ui:FASettingsExpander Header="扫描" Description="控制扫描的过滤规则、文件大小上限与二进制检测" IconSource="FolderOpen">
+            <ui:FASettingsExpander Header="扫描" Description="控制扫描的过滤规则、大小上限、二进制检测、自动刷新、词缓存保留与文件编码" IconSource="FolderOpen">
                 <StackPanel Spacing="14">
                     <StackPanel Spacing="6">
                         <TextBlock Text="最大文件大小" Opacity="0.8"/>
@@ -31,6 +31,16 @@
                     <ToggleSwitch x:Name="TglCheckBinary" OnContent="跳过二进制文件" OffContent="不跳过二进制文件"/>
 
                     <ToggleSwitch x:Name="TglAutoRefresh" OnContent="文件变化时自动刷新" OffContent="不自动刷新"/>
+
+                    <ToggleSwitch x:Name="TglRetainCache" OnContent="保留缓存" OffContent="不保留缓存"/>
+
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="文件编码" Opacity="0.8"/>
+                        <ComboBox x:Name="CboFileEncoding" MinWidth="180">
+                            <ComboBoxItem Content="UTF-8" Tag="UTF-8"/>
+                            <ComboBoxItem Content="ANSI" Tag="ANSI"/>
+                        </ComboBox>
+                    </StackPanel>
 
                     <StackPanel Spacing="6">
                         <Grid ColumnDefinitions="*,Auto">

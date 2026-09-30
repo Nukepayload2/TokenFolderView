@@ -386,9 +386,9 @@ Namespace TokenVisualizer.Core.Tests
         ''' </summary>
         <TestMethod>
         Public Sub DeepSeekRealFile_EncodeCount_MatchesEncode_R9()
-            Dim path As String = "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+            Dim path As String = BundledTokenizerPath
             If Not IO.File.Exists(path) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
             Dim tokenizer As Tokenizer = Tokenizer.FromFile(path)
@@ -493,9 +493,9 @@ Namespace TokenVisualizer.Core.Tests
         ''' </summary>
         <TestMethod>
         Public Sub M2_DeepSeekRealFile_EncodeCount_MatchesEncode_AndProfileConsistent()
-            Dim path As String = "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+            Dim path As String = BundledTokenizerPath
             If Not IO.File.Exists(path) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
             Dim tokenizer As Tokenizer = Tokenizer.FromFile(path)
@@ -548,9 +548,9 @@ Namespace TokenVisualizer.Core.Tests
         ''' </summary>
         <TestMethod>
         Public Sub M3_DeepSeek_NoTrackExtract_CountMatchesEncode_AndIsNoTrack()
-            Dim path As String = "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+            Dim path As String = BundledTokenizerPath
             If Not IO.File.Exists(path) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
             Dim tokenizer As Tokenizer = Tokenizer.FromFile(path)
@@ -686,7 +686,7 @@ Namespace TokenVisualizer.Core.Tests
             ' Pipeline-level on the real DeepSeek tokenizer: the M2 range-driven path builds each
             ' piece's mapped string and feeds CountTokens (with the shared scratch); the total must
             ' equal the fully materialized Encode length.
-            Dim path As String = "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+            Dim path As String = BundledTokenizerPath
             If IO.File.Exists(path) Then
                 Dim tokenizer As Tokenizer = Tokenizer.FromFile(path)
                 For Each t As String In M2TextBattery()
@@ -694,7 +694,7 @@ Namespace TokenVisualizer.Core.Tests
                         $"M5 deepseek EncodeCount parity for '{t}'")
                 Next
             Else
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
             End If
         End Sub
 
@@ -1036,9 +1036,9 @@ Namespace TokenVisualizer.Core.Tests
         ''' </summary>
         <TestMethod>
         Public Sub M11_MergedAddedWalk_MatchesTrackedOnRealSpecialTokens()
-            Dim path As String = "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+            Dim path As String = BundledTokenizerPath
             If Not IO.File.Exists(path) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
             Dim tokenizer As Tokenizer = Tokenizer.FromFile(path)

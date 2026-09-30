@@ -17,8 +17,7 @@ Namespace TokenVisualizer.Core.Tests
     <TestClass>
     Public NotInheritable Class GoldenVectorTests
 
-        Private Const DeepSeekPath As String =
-            "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+        Private ReadOnly DeepSeekPath As String = BundledTokenizerPath
 
         ''' <summary>
         ''' Byte-offset alignment gates: gpt2 (the task's pipeline 1) plus the real DeepSeek config.
@@ -84,7 +83,7 @@ Namespace TokenVisualizer.Core.Tests
         <TestMethod>
         Public Sub DeepSeek_MatchPythonReference_FromRealFile()
             If Not IO.File.Exists(DeepSeekPath) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
 

@@ -363,6 +363,24 @@ Namespace Models
         End Property
 
         ''' <summary>
+        ''' Total number of entries held by the shared L2 word cache, or 0 when it is disabled
+        ''' (capacity &lt;= 0). Diagnostic / test use only: it takes every shard lock in turn, so it
+        ''' must not be called from the tokenization hot path.
+        ''' </summary>
+        Public ReadOnly Property SharedWordCacheEntryCount As Integer
+            Get
+                If _sharedCaches Is Nothing Then Return 0
+                Dim total As Integer = 0
+                For i As Integer = 0 To _sharedCaches.Length - 1
+                    SyncLock _sharedLocks(i)
+                        total += _sharedCaches(i).Count
+                    End SyncLock
+                Next
+                Return total
+            End Get
+        End Property
+
+        ''' <summary>
         ''' Turns on cache statistics for the current thread's word cache. A no-op when the cache is
         ''' disabled (capacity &lt;= 0). Statistics never change cache behavior or tokenization.
         ''' </summary>

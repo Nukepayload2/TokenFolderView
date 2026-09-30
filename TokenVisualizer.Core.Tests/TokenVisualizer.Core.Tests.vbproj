@@ -19,4 +19,12 @@
     <Import Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
   </ItemGroup>
 
+  <!-- The real-tokenizer regression gates read deepseek-v4-flash/tokenizer.json; copying it next to
+       the test assembly keeps paths machine-independent (resolved from AppContext.BaseDirectory). -->
+  <ItemGroup>
+    <Content Include="..\deepseek-v4-flash\*.json"
+             Link="deepseek-v4-flash\%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

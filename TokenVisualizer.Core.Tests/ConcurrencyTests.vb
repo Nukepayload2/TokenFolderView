@@ -20,8 +20,7 @@ Namespace TokenVisualizer.Core.Tests
     <TestClass>
     Public NotInheritable Class ConcurrencyTests
 
-        Private Const DeepSeekPath As String =
-            "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+        Private ReadOnly DeepSeekPath As String = BundledTokenizerPath
 
         ''' <summary>A batch of varied texts that exercises many distinct cache keys.</summary>
         Private Shared Function BuildTexts() As List(Of String)
@@ -473,7 +472,7 @@ Namespace TokenVisualizer.Core.Tests
         <TestMethod>
         Public Sub DeepSeekBpe_ConcurrentEncodeCount_MatchesSerial()
             If Not IO.File.Exists(DeepSeekPath) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
             Dim tokenizer As Tokenizer = Tokenizer.FromFile(DeepSeekPath)

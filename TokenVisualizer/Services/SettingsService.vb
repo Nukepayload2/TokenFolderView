@@ -79,6 +79,8 @@ Namespace Services
                 root("MaxFileSizeMb") = JsonValue.Create(appSettings.MaxFileSizeMb)
                 root("CheckBinary") = JsonValue.Create(appSettings.CheckBinary)
                 root("AutoRefreshOnFileChanges") = JsonValue.Create(appSettings.AutoRefreshOnFileChanges)
+                root("RetainWordCache") = JsonValue.Create(appSettings.RetainWordCache)
+                root("FileEncoding") = JsonValue.Create(If(appSettings.FileEncoding, ""))
                 root("ThemeName") = JsonValue.Create(If(appSettings.ThemeName, ""))
                 root("ActiveTokenizerIndex") = JsonValue.Create(appSettings.ActiveTokenizerIndex)
 
@@ -151,6 +153,16 @@ Namespace Services
                 v = TryGetProperty(root, "AutoRefreshOnFileChanges")
                 If v.HasValue AndAlso IsBool(v.Value) Then
                     settings.AutoRefreshOnFileChanges = v.Value.GetBoolean()
+                End If
+
+                v = TryGetProperty(root, "RetainWordCache")
+                If v.HasValue AndAlso IsBool(v.Value) Then
+                    settings.RetainWordCache = v.Value.GetBoolean()
+                End If
+
+                v = TryGetProperty(root, "FileEncoding")
+                If v.HasValue AndAlso v.Value.ValueKind = JsonValueKind.String Then
+                    settings.FileEncoding = v.Value.GetString()
                 End If
 
                 v = TryGetProperty(root, "ThemeName")
@@ -248,6 +260,17 @@ Namespace Services
         ''' incrementally instead of being scanned again from scratch.
         ''' </summary>
         Public Property AutoRefreshOnFileChanges As Boolean = True
+
+        ''' <summary>When False (the default) the shared BPE word cache is dropped when a scan ends, freeing its memory; when True it survives to warm the next scan.</summary>
+        Public Property RetainWordCache As Boolean = False
+
+        ''' <summary>
+        ''' How file bytes are decoded when they are read from disk: "UTF-8" (the default) or "ANSI"
+        ''' (the system ANSI code page). A persisted choice, turned into an encoding by
+        ''' <c>Tokenizers.Scanning.FileEncoding.Resolve</c>; files that start with a UTF-8 BOM always
+        ''' decode as UTF-8 whatever is set here.
+        ''' </summary>
+        Public Property FileEncoding As String = "UTF-8"
 
         ''' <summary>UI theme: "System", "Light" or "Dark".</summary>
         Public Property ThemeName As String = "System"

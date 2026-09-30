@@ -7,15 +7,14 @@ Namespace TokenVisualizer.Core.Tests
     <TestClass>
     Public NotInheritable Class ProfileCountStagesTests
 
-        Private Const DeepSeekPath As String =
-            "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+        Private ReadOnly DeepSeekPath As String = BundledTokenizerPath
 
         <TestMethod>
         Public Sub ProfileCountStages_AgreesWithEncodeCount()
             ' The diagnostic profile method mirrors EncodeCountCore; its token count must match the
             ' real EncodeCount so the two never drift apart. All read-only (tokenizer.json + in-memory).
             If Not File.Exists(DeepSeekPath) Then
-                Assert.Inconclusive("deepseek tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
 

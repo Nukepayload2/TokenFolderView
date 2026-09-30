@@ -5,6 +5,7 @@ Imports Avalonia.Interactivity
 Imports Avalonia.Styling
 Imports Avalonia.Threading
 Imports FluentAvalonia.UI.Controls
+Imports Tokenizers.Scanning
 Imports TokenVisualizer.Services
 
 Namespace Views
@@ -43,6 +44,19 @@ Namespace Views
 
             TglAutoRefresh.IsChecked = _settings.AutoRefreshOnFileChanges
 
+            TglRetainCache.IsChecked = _settings.RetainWordCache
+
+            ' Which code page "ANSI" means is only known on this machine, so the label is filled here;
+            ' this runs while _loading still guards the handlers, so relabelling cannot write settings.
+            Dim ansi As Global.System.Text.Encoding = FileEncoding.Resolve("ANSI")
+            Dim ansiItem As ComboBoxItem = DirectCast(CboFileEncoding.Items(1), ComboBoxItem)
+            ansiItem.Content = $"ANSI（系统代码页 CP{ansi.CodePage}）"
+
+            Select Case _settings.FileEncoding
+                Case "ANSI" : CboFileEncoding.SelectedIndex = 1
+                Case Else : CboFileEncoding.SelectedIndex = 0
+            End Select
+
             TxtBlacklist.Text = String.Join(vbLf, _settings.BlacklistedFolderNames)
 
             Select Case _settings.ThemeName
@@ -69,6 +83,23 @@ Namespace Views
         Private Sub TglAutoRefresh_IsCheckedChanged(sender As Object, e As RoutedEventArgs) Handles TglAutoRefresh.IsCheckedChanged
             If _loading OrElse _settings Is Nothing Then Return
             _settings = SettingsService.Update(Sub(s) s.AutoRefreshOnFileChanges = TglAutoRefresh.IsChecked.GetValueOrDefault(True))
+        End Sub
+
+        Private Sub TglRetainCache_IsCheckedChanged(sender As Object, e As RoutedEventArgs) Handles TglRetainCache.IsCheckedChanged
+            If _loading OrElse _settings Is Nothing Then Return
+            ' An unset switch must mean the documented default (off), so the fallback is False.
+            _settings = SettingsService.Update(Sub(s) s.RetainWordCache = TglRetainCache.IsChecked.GetValueOrDefault(False))
+        End Sub
+
+        Private Sub CboFileEncoding_SelectionChanged(sender As Object, e As SelectionChangedEventArgs) Handles CboFileEncoding.SelectionChanged
+            If _loading OrElse _settings Is Nothing Then Return
+            Dim tag As String = GetSelectedTag(CboFileEncoding)
+            Dim fileEncoding As String = "UTF-8"
+            Select Case tag
+                Case "ANSI" : fileEncoding = "ANSI"
+                Case Else : fileEncoding = "UTF-8"
+            End Select
+            _settings = SettingsService.Update(Sub(s) s.FileEncoding = fileEncoding)
         End Sub
 
         Private Sub TxtBlacklist_TextChanged(sender As Object, e As TextChangedEventArgs) Handles TxtBlacklist.TextChanged

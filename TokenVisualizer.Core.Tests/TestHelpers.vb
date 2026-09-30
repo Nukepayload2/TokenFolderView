@@ -10,6 +10,14 @@ Namespace TokenVisualizer.Core.Tests
     Friend Module TestHelpers
 
         ''' <summary>
+        ''' Absolute path to the real bundled tokenizer.json. Resolved from AppContext.BaseDirectory
+        ''' because the vbproj copies deepseek-v4-flash\*.json into the test output at build time,
+        ''' so the file is always next to the test assembly on every machine.
+        ''' </summary>
+        Public ReadOnly Property BundledTokenizerPath As String =
+            Global.System.IO.Path.Combine(AppContext.BaseDirectory, "deepseek-v4-flash", "tokenizer.json")
+
+        ''' <summary>
         ''' Serializes a JsonNode without escaping non-ASCII (mirrors serde_json's behavior), so
         ''' byte-exact comparisons in the serialization tests use raw UTF-8.
         ''' </summary>

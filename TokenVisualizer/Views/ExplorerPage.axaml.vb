@@ -255,15 +255,18 @@ Namespace Views
 
         ''' <summary>
         ''' Builds the scanner options from the persisted settings (folder blacklist, max file size,
-        ''' binary detection). Settings live in <see cref="AppSettings"/>; ScanOptions is the
-        ''' scanner's per-scan value snapshot, so each scan reads the latest saved values.
+        ''' binary detection, file encoding, word cache retention). Settings live in
+        ''' <see cref="AppSettings"/>; ScanOptions is the scanner's per-scan value snapshot, so each scan
+        ''' reads the latest saved values - and resolves the encoding choice exactly once for them all.
         ''' </summary>
         Private Shared Function BuildScanOptions() As ScanOptions
             Dim settings = SettingsService.Load()
             Return New ScanOptions With {
                 .FolderBlacklist = settings.BlacklistedFolderNames,
                 .MaxFileSizeBytes = CLng(settings.MaxFileSizeMb * 1024 * 1024),
-                .CheckBinary = settings.CheckBinary
+                .CheckBinary = settings.CheckBinary,
+                .RetainWordCache = settings.RetainWordCache,
+                .TextEncoding = FileEncoding.Resolve(settings.FileEncoding)
             }
         End Function
 
@@ -998,7 +1001,7 @@ Namespace Views
             TokenLines.ResetScroll()
 
             Try
-                Dim lines = Await Task.Run(Function() BuildLines(node.FullPath, tokenizer))
+                Dim lines = Await Task.Run(Function() BuildLines(node.FullPath, tokenizer, _scanOptions.TextEncoding))
                 If gen <> _loadGeneration Then Return ' stale load, superseded by a newer selection
 
                 TokenLines.ItemsSource = lines
@@ -1014,10 +1017,12 @@ Namespace Views
         ''' Heavy work for the colored view, run off the UI thread. Only cheap integer structures are
         ''' built here (decoded text, token spans, per-line records); the per-line run tuples and
         ''' Avalonia inlines are computed lazily on the UI thread by <see cref="TokenLine"/> when a
-        ''' virtualized container is materialized.
+        ''' virtualized container is materialized. The bytes are decoded by the same rule the scan
+        ''' counted them with, so the view can never disagree with the numbers next to it.
         ''' </summary>
         Private Shared Function BuildLines(fullPath As String,
-                                           tokenizer As Tokenizer) As List(Of TokenLine)
+                                           tokenizer As Tokenizer,
+                                           encoding As Global.System.Text.Encoding) As List(Of TokenLine)
             Dim fi As New FileInfo(fullPath)
             Dim length = fi.Length
             If length > Integer.MaxValue Then
@@ -1028,10 +1033,9 @@ Namespace Views
             Try
                 Dim bytesRead = ReadFilePrefix(fullPath, buffer, CInt(length))
 
-                ' Lenient decode: valid UTF-8 yields the exact text; invalid bytes become U+FFFD.
-                ' This is behaviourally identical to a strict decode with a lenient fallback, but
-                ' never throws (a strict decoder would allocate a DecoderFallbackException).
-                Dim text As String = Encoding.UTF8.GetString(buffer, 0, bytesRead)
+                ' One shared decode rule with FolderScanner.CountFile (UTF-8 BOM wins, otherwise the
+                ' user's choice decides), which is what keeps tree count == view count.
+                Dim text As String = FileEncoding.Decode(buffer, bytesRead, encoding)
 
                 Dim spans = tokenizer.EncodeWithSpans(text)
                 Return TokenizedTextView.BuildLines(text, spans)

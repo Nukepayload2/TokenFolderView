@@ -252,9 +252,9 @@ Namespace TokenVisualizer.Core.Tests
         <TestMethod>
         Public Sub EncodeCount_MatchesEncodeFastLength()
             ' Reads the real tokenizer.json (matching the other integration tests' convention).
-            Dim path As String = "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+            Dim path As String = BundledTokenizerPath
             If Not IO.File.Exists(path) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
             End If
             Dim tokenizer As Tokenizer = Tokenizer.FromFile(path)
             Dim texts As String() = {

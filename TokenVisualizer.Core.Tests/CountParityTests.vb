@@ -23,8 +23,7 @@ Namespace TokenVisualizer.Core.Tests
     <TestClass>
     Public NotInheritable Class CountParityTests
 
-        Private Const DeepSeekPath As String =
-            "C:\Users\james\Projects\TokenVisualizer\deepseek-v4-flash\tokenizer.json"
+        Private ReadOnly DeepSeekPath As String = BundledTokenizerPath
 
         ' ------------------------------------------------------------------
         ' BPE model-level CountTokens == Tokenize(...).Count unit tests.
@@ -179,7 +178,7 @@ Namespace TokenVisualizer.Core.Tests
         <TestMethod>
         Public Sub DeepSeekRealFile_EncodeCount_MatchesEncode()
             If Not IO.File.Exists(DeepSeekPath) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
             Dim tokenizer As Tokenizer = Tokenizer.FromFile(DeepSeekPath)
@@ -313,7 +312,7 @@ Namespace TokenVisualizer.Core.Tests
         <TestMethod>
         Public Sub DeepSeekRealFile_EncodeCount_FastPath_AllocatesLessThanEncodeFast()
             If Not IO.File.Exists(DeepSeekPath) Then
-                Assert.Inconclusive("deepseek-v4-flash/tokenizer.json not present")
+                Assert.Fail("deepseek-v4-flash/tokenizer.json was not copied to the test output directory; check the Content item in TokenVisualizer.Core.Tests.vbproj")
                 Return
             End If
             Dim tokenizer As Tokenizer = Tokenizer.FromFile(DeepSeekPath)
